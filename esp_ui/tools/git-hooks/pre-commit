@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: block real credentials from entering git history.
+#
+# Three rules:
+#   1. main/secrets.h must NEVER be committed (it's the local-only creds file).
+#   2. main/secrets.h.template must only define placeholder values.
+#   3. No other tracked file may #define APP_WIFI_SSID / APP_WIFI_PASSWORD with
+#      a non-empty value, and no file may contain CONFIG_*WIFI_(SSID|PASSWORD)="...".
+#
+# Bypass with `git commit --no-verify` ONLY if you're certain a flagged line is
+# a false positive. If you add new credential macros to the codebase, extend
+# the regexes below to cover them.
+
+set -u
+
+violations=()
+report() { violations+=("$*"); }
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+ALLOWED_PLACEHOLDER_RE='^(your-ssid-here|your-wifi-password-here)$'
+DEFINE_RE='^[[:space:]]*#define[[:space:]]+(APP_WIFI_(SSID|PASSWORD))[[:space:]]+"([^"]*)"'
+SDKCONFIG_RE='CONFIG_[A-Z_]*WIFI_(SSID|PASSWORD)="([^"]+)"'
+
+while IFS= read -r path; do
+    [ -z "$path" ] && continue
+
+    # Rule 1.
+    if [ "$path" = "main/secrets.h" ]; then
+        report "REFUSING: main/secrets.h must never be committed (gitignored, local-only)."
+        continue
+    fi
+
+    is_template=0
+    [ "$path" = "main/secrets.h.template" ] && is_template=1
+
+    content=$(git show ":$path" 2>/dev/null) || continue
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ $DEFINE_RE ]]; then
+            macro="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[3]}"
+            # Empty values are harmless.
+            if [ -z "$value" ]; then continue; fi
+
+            if [ "$is_template" = 1 ]; then
+                if [[ ! "$value" =~ $ALLOWED_PLACEHOLDER_RE ]]; then
+                    report "secrets.h.template lost its placeholder for $macro: $line"
+                fi
+            else
+                report "credential #define in $path ($macro): $line"
+            fi
+        fi
+
+        if [[ "$line" =~ $SDKCONFIG_RE ]]; then
+            report "sdkconfig-style credential in $path: $line"
+        fi
+    done <<< "$content"
+done <<< "$staged"
+
+if [ ${#violations[@]} -gt 0 ]; then
+    echo "pre-commit: REFUSING to commit — possible credential leak" >&2
+    for v in "${violations[@]}"; do
+        echo "  - $v" >&2
+    done
+    echo "" >&2
+    echo "Real credentials belong in main/secrets.h (gitignored)." >&2
+    echo "If you're certain a flagged line is fine, bypass with --no-verify." >&2
+    exit 1
+fi
+
+exit 0

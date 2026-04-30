@@ -25,6 +25,14 @@ The first build will download managed components from the ESP Component Registry
 
 WiFi password and other secrets live ONLY in `main/secrets.h`, which is gitignored. The committed `main/secrets.h.template` is a placeholder model — the build fails until you copy it to `secrets.h` and fill in real values. Never commit `secrets.h`. Never put real credentials in `sdkconfig.defaults` or any committed file.
 
+A `pre-commit` git hook at `tools/git-hooks/pre-commit` enforces this: it blocks commits that include `main/secrets.h`, that mutate `main/secrets.h.template` to remove its placeholders, or that introduce credential `#define`s anywhere else. To activate the hook on a fresh clone:
+
+```bash
+git config --local core.hooksPath tools/git-hooks
+```
+
+(Already set on the original clone. Bypass on a known false-positive with `git commit --no-verify`.)
+
 ## Project layout
 
 ```
