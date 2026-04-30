@@ -31,6 +31,17 @@ secrets.h
 *.env
 .env.local
 
+# Personal dev tooling — environment-specific (hardcoded local paths,
+# Microsoft-laptop conventions, etc.). Kept out of the public repo.
+.mcp.json
+eim_config.toml
+mcp_tee.py
+mcpstart.ps1
+repro_*.py
+sdkconfig.ci
+sitehook/
+verify_hook.py
+
 # Python bytecode (sitehook etc.)
 __pycache__/
 *.pyc

@@ -78,4 +78,4 @@ See `C:\Users\samallon\.claude\plans\fluffy-singing-moth.md` for the full projec
 
 ## License
 
-TBD (suggest MIT for the personal-account public repo).
+MIT — see [LICENSE](LICENSE).
