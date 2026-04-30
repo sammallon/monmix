@@ -1,0 +1,36 @@
+# ESP-IDF build output
+build/
+
+# Managed components (resolved by idf.py reconfigure from idf_component.yml)
+managed_components/
+
+# Generated sdkconfig (sdkconfig.defaults is the committed source of truth)
+sdkconfig
+sdkconfig.old
+
+# MCP debug log
+mcp_tee.log
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local Claude Code session data
+.claude/
+
+# Credentials — NEVER commit. Real values live in main/secrets.h
+# (a copy of main/secrets.h.template, gitignored below).
+main/secrets.h
+secrets.h
+*.env
+.env.local
+
+# Python bytecode (sitehook etc.)
+__pycache__/
+*.pyc

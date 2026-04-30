@@ -1,0 +1,28 @@
+dependencies:
+  idf:
+    version: ">=6.0.1"
+
+  # LVGL + Espressif port (handles display flush, touch input, PPA acceleration).
+  espressif/esp_lvgl_port:
+    version: "^2.0.0"
+
+  # MIPI-DSI panel driver. The CrowPanel Advanced 10.1" ships with either
+  # ILI9881C or JD9365 — confirm via silk/schematic at unbox and swap if needed.
+  espressif/esp_lcd_ili9881c:
+    version: "*"
+  # espressif/esp_lcd_jd9365:
+  #   version: "*"
+
+  # Capacitive touch controller (GT911) over I2C.
+  espressif/esp_lcd_touch_gt911:
+    version: "*"
+
+  # WebSocket client (used by app_ms_client_ws.c).
+  espressif/esp_websocket_client:
+    version: "*"
+
+  # Wi-Fi via the on-board ESP32-C6 co-processor.
+  espressif/esp_wifi_remote:
+    version: "*"
+  espressif/esp_hosted:
+    version: "*"

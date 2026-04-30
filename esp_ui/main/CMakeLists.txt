@@ -1,0 +1,18 @@
+idf_component_register(
+    SRCS
+        "esp_ui_main.c"
+        "app_state.c"
+        "app_wifi.c"
+        "app_ms_client_ws.c"
+        "app_display.c"
+        "app_ui.c"
+    INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        nvs_flash
+        esp_event
+        esp_netif
+        esp_wifi
+        esp_http_client
+        json
+)
