@@ -57,11 +57,11 @@ esp_ui/
 
 ## Mixing Station
 
-Reference URLs for development:
+Reference URLs for development. Mixing Station's HTTP/WebSocket port is configurable in its app settings — substitute whatever port you've bound it to (the firmware reads it from `APP_MS_PORT` in `main/secrets.h`):
 
-- App base:        `http://<MS_HOST>:8080/`
-- REST API docs:   `http://<MS_HOST>:8080/#/rest-api`
-- Data explorer:   `http://<MS_HOST>:8080/#/data-explorer` ← use this to discover exact channel paths
+- App base:        `http://<MS_HOST>:<MS_PORT>/`
+- REST API docs:   `http://<MS_HOST>:<MS_PORT>/#/rest-api`
+- Data explorer:   `http://<MS_HOST>:<MS_PORT>/#/data-explorer` ← use this to discover exact channel paths
 
 The actual subscription/REST paths used by `app_ms_client_ws.c` are placeholders pending verification against the data-explorer (search the source for `TODO(unbox)`).
 
