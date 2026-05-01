@@ -34,12 +34,14 @@ static const char *TAG = "app_ui";
 #define FADER_BOX_PAD       8
 #define SLIDER_W            28
 // Slider is centered in the box. Vertical budget within the 484 px inner
-// area, top-to-bottom: name label (~20) + slider (340, centered) + mute
-// button (32 at bottom-mid offset -28) + value label (~20 at bottom).
-// 340 keeps the slider's bottom edge clear of the mute button — at 380 the
-// slider knob (when level=0, knob at bottom of track) was hidden under the
-// mute button.
-#define SLIDER_H            340
+// area, top-to-bottom: name label (~20) + slider (centered) + mute button
+// (32 at bottom-mid offset -28) + value label (~20 at bottom). The LVGL
+// slider knob is bigger than the math math (the styled thumb extends past
+// the track by more than its bare radius), so even SLIDER_H=320 left the
+// knob kissing the MUTE button at value=0. 300 leaves an unambiguous
+// gap; we lose 20 px of slider travel which is invisible at the 0–100
+// integer scale we display.
+#define SLIDER_H            300
 #define MUTE_BTN_W          50
 #define MUTE_BTN_H          32
 #define DOT_SIZE            12
@@ -139,22 +141,31 @@ static void on_slider_released(lv_event_t *e)
     send_level_now(idx, (float)v / 100.0f);
 }
 
-static void on_mute_toggled(lv_event_t *e)
+static void on_mute_clicked(lv_event_t *e)
 {
     size_t    idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
     lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
-    bool      muted = lv_obj_has_state(btn, LV_STATE_CHECKED);
+
+    // Read canonical state from app_state and toggle. We don't set
+    // LV_OBJ_FLAG_CHECKABLE on the button (that fires on press and a
+    // drag-off-then-release would still toggle), so we drive the visual
+    // CHECKED state ourselves on each click.
+    app_channel_t ch;
+    if (!app_state_get(idx, &ch)) return;
+    bool new_mute = !ch.mute;
 
     int ch_id = app_state_id_for_idx(idx);
     APP_LOGD_I("app_ui", "mute idx=%u ch=%d -> %d",
-               (unsigned) idx, ch_id, (int) muted);
+               (unsigned) idx, ch_id, (int) new_mute);
     if (s_ms && s_ms->set_mute && ch_id >= 0) {
-        s_ms->set_mute(ch_id, muted);
+        s_ms->set_mute(ch_id, new_mute);
     }
-    // Update local state without notifying — the UI already reflects it.
-    // The MS broadcast echo will arrive shortly and reconfirm via the dirty
-    // sweep; that's the canonical state.
-    app_state_set_mute(idx, muted, false);
+    app_state_set_mute(idx, new_mute, false);
+
+    // Optimistic UI: flip the visual immediately so the press feels live.
+    // The MS broadcast echo will hit apply_pending shortly and reconfirm.
+    if (new_mute) lv_obj_add_state   (btn, LV_STATE_CHECKED);
+    else          lv_obj_remove_state(btn, LV_STATE_CHECKED);
 }
 
 // Inbound updates from the WS task are coalesced via a per-channel dirty
@@ -274,7 +285,10 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     s_widgets[idx].slider = slider;
 
     lv_obj_t *btn_mute = lv_button_create(box);
-    lv_obj_add_flag(btn_mute, LV_OBJ_FLAG_CHECKABLE);
+    // Note: NOT LV_OBJ_FLAG_CHECKABLE — that auto-toggles on press, which
+    // then fires VALUE_CHANGED even if the finger drags off before release.
+    // We track checked state ourselves and listen for LV_EVENT_CLICKED,
+    // which only fires on press-and-release-on-widget (drag-off cancels).
     lv_obj_set_size(btn_mute, MUTE_BTN_W, MUTE_BTN_H);
     lv_obj_align(btn_mute, LV_ALIGN_BOTTOM_MID, 0, -28);
     // Visible "muted" state — saturated red so a glance distinguishes the
@@ -284,7 +298,7 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_t *btn_label = lv_label_create(btn_mute);
     lv_label_set_text(btn_label, "MUTE");
     lv_obj_center(btn_label);
-    lv_obj_add_event_cb(btn_mute, on_mute_toggled, LV_EVENT_VALUE_CHANGED,
+    lv_obj_add_event_cb(btn_mute, on_mute_clicked, LV_EVENT_CLICKED,
                         (void *)(uintptr_t)idx);
     s_widgets[idx].btn_mute = btn_mute;
     if (ch.mute) lv_obj_add_state(btn_mute, LV_STATE_CHECKED);
