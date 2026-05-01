@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "esp_ui_main.c"
+        "app_config.c"
         "app_state.c"
         "app_wifi.c"
         "app_ms_client_ws.c"

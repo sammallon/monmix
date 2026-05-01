@@ -45,12 +45,13 @@ esp_ui/
 │   ├── idf_component.yml        managed-component dependencies
 │   ├── secrets.h.template       template for local main/secrets.h (gitignored)
 │   ├── esp_ui_main.c            entry point
+│   ├── app_config.[ch]          NVS-backed per-musician channel selection (M2)
 │   ├── app_state.[ch]           channel data (mutex-guarded)
 │   ├── app_wifi.[ch]            esp_wifi_remote + retry helper
 │   ├── app_ms_client.h          backend-agnostic MS client interface
 │   ├── app_ms_client_ws.c       REST + WebSocket implementation (M1)
 │   ├── app_display.[ch]         panel + touch + LVGL bring-up
-│   ├── app_ui.[ch]              LVGL fader screen
+│   ├── app_ui.[ch]              LVGL paged fader screen (M2)
 │   └── pytest_esp_ui.py         host-side smoke tests
 └── README.md
 ```
@@ -66,10 +67,19 @@ Reference URLs for development. Mixing Station's HTTP/WebSocket port is configur
 
 `app_ms_client_ws.c` opens one WS to the test instance and (on each connect) subscribes per-tracked-channel to `ch.<N>.levelData.0.lvl` (norm 0..1) and `ch.<N>.cfg.name`. Sets are sent as `POST /console/data/set/...` envelopes through the same socket. Protocol verified via `repro_ms_probe*.py` (gitignored).
 
+## Channel selection (M2)
+
+The list of MS channels the device tracks is stored in NVS under namespace `monmix`, key `chan_ids` (a blob of `int32_t[]` MS channel IDs, 0-indexed). On first boot the firmware seeds NVS with a 12-channel default (IDs 0–11). To pick a different set:
+
+- **Quick way**: edit the `s_default_ids[]` array in `main/app_config.c`, then run `idf.py erase-flash flash` once. Subsequent boots will pick up the new defaults.
+- **Reset to defaults**: `idf.py erase-flash` clears NVS; the next boot reseeds from `s_default_ids[]`.
+
+An on-device editor lands in M4 (BLE/SoftAP provisioning).
+
 ## Milestones
 
-- **M1** (in progress): end-to-end vertical slice — 3 hard-coded faders read & write live over WiFi.
-- **M2**: paged UI, persisted channel selection.
+- **M1** (done): end-to-end vertical slice — 3 hard-coded faders read & write live over WiFi.
+- **M2** (in progress): paged UI (`lv_tileview` + page indicator) and NVS-persisted channel selection.
 - **M2.5**: postmortem logging to SD card (FATFS + coredump + WS/REST frame log) so off-bench failures are recoverable.
 - **M3**: UX polish (mute/solo, color tags, low-light theme, meters).
 - **M4**: BLE/SoftAP provisioning.

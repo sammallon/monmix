@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define APP_STATE_MAX_CHANNELS 3
+#include "app_config.h"
 
 typedef struct {
     int   id;
@@ -13,7 +13,9 @@ typedef struct {
 
 typedef void (*app_state_on_change_t)(size_t idx, void *ctx);
 
-void   app_state_init(void);
+// Seed app_state with the channel ID list owned by app_config. count must
+// not exceed APP_CONFIG_MAX_CHANNELS — caller is expected to clamp.
+void   app_state_init(const int *ids, size_t count);
 size_t app_state_count(void);
 
 bool app_state_get(size_t idx, app_channel_t *out);

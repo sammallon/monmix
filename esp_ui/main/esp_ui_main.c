@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "app_config.h"
 #include "app_display.h"
 #include "app_ms_client.h"
 #include "app_state.h"
@@ -19,7 +20,10 @@ void app_main(void)
         nvs_flash_init();
     }
 
-    app_state_init();
+    app_config_init();
+    size_t      ch_count = 0;
+    const int  *ch_ids   = app_config_channel_ids(&ch_count);
+    app_state_init(ch_ids, ch_count);
 
     // Display + UI come up first — the screen should light up immediately,
     // not wait on WiFi/MS. Status line shows progress thereafter.

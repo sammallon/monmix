@@ -6,32 +6,34 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-// MS paths are 0-indexed: ch.0 corresponds to "CH 01" in the MS UI.
-static const int s_initial_ids[APP_STATE_MAX_CHANNELS] = {0, 1, 2};
-
-static app_channel_t        s_channels[APP_STATE_MAX_CHANNELS];
+static app_channel_t        s_channels[APP_CONFIG_MAX_CHANNELS];
+static size_t               s_count;
 static SemaphoreHandle_t    s_mutex;
 static app_state_on_change_t s_on_change;
 static void                 *s_on_change_ctx;
 
-void app_state_init(void)
+void app_state_init(const int *ids, size_t count)
 {
+    if (count > APP_CONFIG_MAX_CHANNELS) count = APP_CONFIG_MAX_CHANNELS;
+    s_count = count;
     s_mutex = xSemaphoreCreateMutex();
-    for (size_t i = 0; i < APP_STATE_MAX_CHANNELS; ++i) {
-        s_channels[i].id = s_initial_ids[i];
-        snprintf(s_channels[i].name, sizeof(s_channels[i].name), "ch %d", s_initial_ids[i]);
+    for (size_t i = 0; i < s_count; ++i) {
+        s_channels[i].id = ids[i];
+        // MS paths are 0-indexed: ch.0 displays as "CH 01" in the MS UI.
+        // Show "ch N+1" placeholder until the scribble strip name arrives.
+        snprintf(s_channels[i].name, sizeof(s_channels[i].name), "ch %d", ids[i] + 1);
         s_channels[i].level = 0.0f;
     }
 }
 
 size_t app_state_count(void)
 {
-    return APP_STATE_MAX_CHANNELS;
+    return s_count;
 }
 
 bool app_state_get(size_t idx, app_channel_t *out)
 {
-    if (idx >= APP_STATE_MAX_CHANNELS || !out) return false;
+    if (idx >= s_count || !out) return false;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_channels[idx];
     xSemaphoreGive(s_mutex);
@@ -40,7 +42,7 @@ bool app_state_get(size_t idx, app_channel_t *out)
 
 void app_state_set_level(size_t idx, float level, bool notify)
 {
-    if (idx >= APP_STATE_MAX_CHANNELS) return;
+    if (idx >= s_count) return;
     if (level < 0.0f) level = 0.0f;
     if (level > 1.0f) level = 1.0f;
 
@@ -55,7 +57,7 @@ void app_state_set_level(size_t idx, float level, bool notify)
 
 void app_state_set_name(size_t idx, const char *name, bool notify)
 {
-    if (idx >= APP_STATE_MAX_CHANNELS || !name) return;
+    if (idx >= s_count || !name) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(s_channels[idx].name, name, sizeof(s_channels[idx].name) - 1);
     s_channels[idx].name[sizeof(s_channels[idx].name) - 1] = '\0';
@@ -68,7 +70,7 @@ void app_state_set_name(size_t idx, const char *name, bool notify)
 
 int app_state_idx_for_id(int ms_channel_id)
 {
-    for (size_t i = 0; i < APP_STATE_MAX_CHANNELS; ++i) {
+    for (size_t i = 0; i < s_count; ++i) {
         if (s_channels[i].id == ms_channel_id) return (int)i;
     }
     return -1;
@@ -76,7 +78,7 @@ int app_state_idx_for_id(int ms_channel_id)
 
 int app_state_id_for_idx(size_t idx)
 {
-    if (idx >= APP_STATE_MAX_CHANNELS) return -1;
+    if (idx >= s_count) return -1;
     return s_channels[idx].id;
 }
 
