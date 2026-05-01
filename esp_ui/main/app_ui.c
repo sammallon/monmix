@@ -1294,7 +1294,18 @@ static void start_clock_once(void)
     setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
     tzset();
 
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    // Two-server SNTP setup: slot 0 is reserved for the DHCP-supplied NTP
+    // server (option 42, gated by CONFIG_LWIP_DHCP_GET_NTP_SRV); slot 1 is
+    // a US-pool static fallback for networks that don't advertise an NTP
+    // server in DHCP. The static slot is also used when a static IP is
+    // configured (no DHCP, no option 42). Renew on every new IP so a lease
+    // change picks up a fresh DHCP-supplied server.
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+        2, ESP_SNTP_SERVER_LIST("0.us.pool.ntp.org", "0.us.pool.ntp.org"));
+    cfg.server_from_dhcp           = true;
+    cfg.renew_servers_after_new_IP = true;
+    cfg.index_of_first_server      = 1;
+    cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
     esp_netif_sntp_init(&cfg);
 
     if (!s_clock_timer) {

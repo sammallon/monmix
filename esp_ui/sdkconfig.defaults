@@ -97,3 +97,11 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # next boot, app_coredump_flush_to_sd() copies it to the microSD card and
 # erases the partition. Decode host-side with `espcoredump.py info_corefile`.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
+# Pull NTP server hint from DHCP option 42 when the network offers one.
+# app_ui's clock prefers the DHCP-supplied server and falls back to the
+# static pool entries when the lease has none (see start_clock_once).
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+# Two SNTP slots: slot 0 is reserved for the DHCP-supplied server, slot 1
+# is the static fallback. Bumped from default 1 so both can coexist.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
