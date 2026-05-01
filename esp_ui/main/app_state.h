@@ -8,7 +8,8 @@
 typedef struct {
     int   id;
     char  name[32];
-    float level;
+    float level;       // 0..1 normalised — what the slider tracks
+    float level_db;    // dB value from MS — used by the dB readout
     bool  mute;
 } app_channel_t;
 
@@ -21,6 +22,7 @@ size_t app_state_count(void);
 
 bool app_state_get(size_t idx, app_channel_t *out);
 void app_state_set_level(size_t idx, float level, bool notify);
+void app_state_set_level_db(size_t idx, float db, bool notify);
 void app_state_set_name(size_t idx, const char *name, bool notify);
 void app_state_set_mute(size_t idx, bool mute, bool notify);
 

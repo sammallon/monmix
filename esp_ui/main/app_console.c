@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "app_logd.h"
+#include "app_prefs.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
 
@@ -359,6 +360,94 @@ static int cmd_touch(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `level-format [norm|db]` — query/set how the per-fader value label is
+// rendered. Persisted to /sdcard/monmix-prefs.json.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_level_format(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("level-format: %s\n",
+               app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB ? "db" : "norm");
+        return 0;
+    }
+    if (strcmp(argv[1], "norm") == 0) {
+        app_prefs_set_level_format(APP_LEVEL_FORMAT_NORM);
+        printf("level-format: norm\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "db") == 0) {
+        app_prefs_set_level_format(APP_LEVEL_FORMAT_DB);
+        printf("level-format: db\n");
+        return 0;
+    }
+    printf("usage: level-format [norm|db]\n");
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `signal-indicator [none|signal-present|meter]` — query/set the per-fader
+// activity overlay. Persisted to /sdcard/monmix-prefs.json.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_signal_indicator(int argc, char **argv)
+{
+    if (argc < 2) {
+        const char *cur =
+            (app_prefs_get_signal_indicator() == APP_SIGNAL_INDICATOR_NONE)  ? "none" :
+            (app_prefs_get_signal_indicator() == APP_SIGNAL_INDICATOR_METER) ? "meter" :
+                                                                                "signal-present";
+        printf("signal-indicator: %s\n", cur);
+        return 0;
+    }
+    if (strcmp(argv[1], "none") == 0) {
+        app_prefs_set_signal_indicator(APP_SIGNAL_INDICATOR_NONE);
+        printf("signal-indicator: none\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "signal-present") == 0) {
+        app_prefs_set_signal_indicator(APP_SIGNAL_INDICATOR_PRESENT);
+        printf("signal-indicator: signal-present\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "meter") == 0) {
+        app_prefs_set_signal_indicator(APP_SIGNAL_INDICATOR_METER);
+        printf("signal-indicator: meter\n");
+        return 0;
+    }
+    printf("usage: signal-indicator [none|signal-present|meter]\n");
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `set-color <ch_id> <0..7|-1>` — paint a colored stripe on the channel's
+// scribble strip. Index -1 clears the override (channel renders without
+// an accent). Persisted to /sdcard/monmix-prefs.json.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_set_color(int argc, char **argv)
+{
+    if (argc < 3) {
+        printf("usage: set-color <ch_id> <0..7|-1>\n");
+        return 1;
+    }
+    int ch_id = atoi(argv[1]);
+    int idx   = atoi(argv[2]);
+    if (ch_id < 0) {
+        printf("set-color: bad channel id %d\n", ch_id);
+        return 1;
+    }
+    if (idx < -1 || idx > 7) {
+        printf("set-color: index must be -1..7\n");
+        return 1;
+    }
+    app_prefs_set_channel_color(ch_id, idx);
+    if (idx < 0) printf("set-color: ch=%d cleared\n", ch_id);
+    else         printf("set-color: ch=%d -> %d\n", ch_id, idx);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -395,6 +484,9 @@ void app_console_init(void)
         { .command = "coredump-b64", .help = "base64-print the flash coredump partition",     .func = cmd_coredump_b64 },
         { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI",   .func = cmd_screenshot   },
         { .command = "touch",        .help = "<x> <y> [tap|down|up] — synthetic LVGL touch",  .func = cmd_touch        },
+        { .command = "level-format", .help = "query/set fader value readout: norm | db",      .func = cmd_level_format },
+        { .command = "signal-indicator", .help = "query/set: none | signal-present | meter",  .func = cmd_signal_indicator },
+        { .command = "set-color",    .help = "<ch_id> <0..7|-1> — set/clear channel color",   .func = cmd_set_color    },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {

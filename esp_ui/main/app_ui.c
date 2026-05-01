@@ -1,5 +1,6 @@
 #include "app_ui.h"
 #include "app_logd.h"
+#include "app_prefs.h"
 #include "app_state.h"
 
 #include <stdio.h>
@@ -52,7 +53,27 @@ typedef struct {
     lv_obj_t *label_name;
     lv_obj_t *label_val;
     lv_obj_t *btn_mute;
+    lv_obj_t *signal_dot;
 } fader_widgets_t;
+
+#define SIGNAL_DOT_SIZE     10
+#define DEFAULT_SLIDER_HEX  0x4080E0   // medium blue when no per-channel color set
+
+// 8-color palette for the per-channel color tag — see app_prefs / set-color.
+// Roughly evenly spaced around the hue wheel; chose hex values that read
+// well on both the default (light box) and the future low-light theme.
+// Applied to the slider's filled indicator + knob, so the channel's
+// identity is visible at a glance from across the stage.
+static const uint32_t COLOR_PALETTE[8] = {
+    0xE04040,  // red
+    0xE09040,  // orange
+    0xE0D040,  // yellow
+    0x40C040,  // green
+    0x40C0E0,  // cyan
+    0x4080E0,  // blue
+    0xC060E0,  // purple
+    0xE060A0,  // pink
+};
 
 static fader_widgets_t          s_widgets[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t                *s_status_label;
@@ -126,8 +147,15 @@ static void on_slider_changed(lv_event_t *e)
         send_level_now(idx, level);
     }
 
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", v);
+    // Mid-drag the dB hasn't echoed back yet, so use the slider's
+    // immediate value for the readout. The post-drag MS broadcast
+    // updates app_state.level_db and apply_pending takes over.
+    char buf[12];
+    if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
+        snprintf(buf, sizeof(buf), "...");
+    } else {
+        snprintf(buf, sizeof(buf), "%d", v);
+    }
     lv_label_set_text(s_widgets[idx].label_val, buf);
 }
 
@@ -203,13 +231,49 @@ static void apply_pending(void *unused)
         // LV_ANIM_OFF: network echoes can arrive every ~10ms during a drag;
         // queueing/cancelling 200ms animations on each one trashes LVGL.
         lv_slider_set_value(s_widgets[i].slider, v, LV_ANIM_OFF);
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", v);
+        char buf[12];
+        if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
+            // MS reports min ≈ -138 dB on the Si Expression 2; display "-INF"
+            // there since the channel is effectively off. Above the floor we
+            // round to the nearest dB — a half-dB step is finer than the
+            // mixer's quantization, no need for decimals on a glance-readout.
+            if (ch.level_db <= -138.0f) {
+                snprintf(buf, sizeof(buf), "-INF");
+            } else {
+                snprintf(buf, sizeof(buf), "%.0f dB", ch.level_db);
+            }
+        } else {
+            snprintf(buf, sizeof(buf), "%d", v);
+        }
         lv_label_set_text(s_widgets[i].label_val, buf);
         lv_label_set_text(s_widgets[i].label_name, ch.name);
         if (s_widgets[i].btn_mute) {
             if (ch.mute) lv_obj_add_state   (s_widgets[i].btn_mute, LV_STATE_CHECKED);
             else         lv_obj_remove_state(s_widgets[i].btn_mute, LV_STATE_CHECKED);
+        }
+        if (s_widgets[i].slider) {
+            int color_idx = app_prefs_get_channel_color(ch.id);
+            uint32_t hex = (color_idx >= 0 && color_idx < 8)
+                               ? COLOR_PALETTE[color_idx]
+                               : DEFAULT_SLIDER_HEX;
+            lv_color_t bar_color  = lv_color_hex(hex);
+            // Darken the knob ~24% so it reads as a separate piece on top
+            // of the filled bar. lvl is 0..255 with 255 being fully black.
+            lv_color_t knob_color = lv_color_darken(bar_color, 60);
+            lv_obj_set_style_bg_color(s_widgets[i].slider, bar_color,  LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(s_widgets[i].slider, knob_color, LV_PART_KNOB);
+        }
+        if (s_widgets[i].signal_dot) {
+            app_signal_indicator_t mode = app_prefs_get_signal_indicator();
+            bool show = (mode != APP_SIGNAL_INDICATOR_NONE) &&
+                        !ch.mute && ch.level > 0.01f;
+            if (show) {
+                lv_obj_set_style_bg_color(s_widgets[i].signal_dot,
+                                          lv_color_hex(0x40C040), 0);
+                lv_obj_remove_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
+            }
         }
     }
 }
@@ -229,6 +293,26 @@ static void on_state_change(size_t idx, void *ctx)
         if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
             s_sweep_queued = false;
             // Best effort — the next state change retries.
+        }
+    }
+    lvgl_port_unlock();
+}
+
+// Pref changes (level format, channel colors, signal indicator) affect the
+// rendering of every fader, so we mark all channels dirty and queue a single
+// sweep — same plumbing as the per-channel state changes.
+static void on_prefs_change(void *ctx)
+{
+    (void)ctx;
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
+    if (s_sweep_queued) return;
+
+    if (!lvgl_port_lock(100)) return;
+    if (!s_sweep_queued) {
+        s_sweep_queued = true;
+        if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
+            s_sweep_queued = false;
         }
     }
     lvgl_port_unlock();
@@ -272,6 +356,22 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
     s_widgets[idx].label_name = name;
+
+    // Signal-present indicator — small round dot centered below the name
+    // label and above the slider. Visible only when mode != none AND the
+    // channel is actively passing audio (!mute && level > 0). Without live
+    // meter data from MS (offline test instance) this is a "configured
+    // to pass audio" indicator, not strict audio presence — useful for
+    // the "do I have a cable problem?" question.
+    lv_obj_t *dot = lv_obj_create(box);
+    lv_obj_set_size(dot, SIGNAL_DOT_SIZE, SIGNAL_DOT_SIZE);
+    lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_set_style_pad_all(dot, 0, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    s_widgets[idx].signal_dot = dot;
 
     lv_obj_t *slider = lv_slider_create(box);
     lv_slider_set_range(slider, 0, 100);
@@ -403,6 +503,7 @@ void app_ui_init(const ms_client_iface_t *ms)
     }
 
     app_state_register_on_change(on_state_change, NULL);
+    app_prefs_register_on_change(on_prefs_change, NULL);
 
     lvgl_port_unlock();
 

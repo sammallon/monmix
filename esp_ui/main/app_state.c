@@ -22,8 +22,9 @@ void app_state_init(const int *ids, size_t count)
         // MS paths are 0-indexed: ch.0 displays as "CH 01" in the MS UI.
         // Show "ch N+1" placeholder until the scribble strip name arrives.
         snprintf(s_channels[i].name, sizeof(s_channels[i].name), "ch %d", ids[i] + 1);
-        s_channels[i].level = 0.0f;
-        s_channels[i].mute  = false;
+        s_channels[i].level    = 0.0f;
+        s_channels[i].level_db = -200.0f;   // sentinel: "below floor" until MS reports
+        s_channels[i].mute     = false;
     }
 }
 
@@ -49,6 +50,18 @@ void app_state_set_level(size_t idx, float level, bool notify)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_channels[idx].level = level;
+    xSemaphoreGive(s_mutex);
+
+    if (notify && s_on_change) {
+        s_on_change(idx, s_on_change_ctx);
+    }
+}
+
+void app_state_set_level_db(size_t idx, float db, bool notify)
+{
+    if (idx >= s_count) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_channels[idx].level_db = db;
     xSemaphoreGive(s_mutex);
 
     if (notify && s_on_change) {

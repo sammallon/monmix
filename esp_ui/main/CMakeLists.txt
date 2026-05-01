@@ -12,6 +12,7 @@ idf_component_register(
         "app_console.c"
         "app_logd.c"
         "app_touch_inject.c"
+        "app_prefs.c"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES

@@ -104,6 +104,9 @@ The firmware runs an `esp_console` REPL on UART0 (`monmix> ` prompt). Connect wi
 | `coredump-b64` | this repo | Same framing, but reads the flash `coredump` partition directly — useful when SD never mounted and the dump is still in flash. |
 | `screenshot` | this repo | Captures the LVGL screen as RGB565, deflate-compresses (≈80× ratio on solid-color UIs), base64-streams it. Decoded by `tools/fetch_screenshot.py` to PNG. |
 | `touch <x> <y> [tap\|down\|up]` | this repo | Drives a virtual LVGL pointer indev. Coordinates are LVGL logical pixels — the same frame as the `screenshot` PNG, so what you see is what you tap. |
+| `level-format [norm\|db]` | this repo | Switch the per-fader value readout between 0–100 and dB. Persisted in `/sdcard/monmix-prefs.json`. |
+| `signal-indicator [none\|signal-present\|meter]` | this repo | Toggle the per-channel green-dot indicator. Persisted in prefs. |
+| `set-color <ch_id> <0..7\|-1>` | this repo | Paint a colored stripe on the channel's scribble strip from an 8-color palette. `-1` clears. Local-only — does NOT touch MS's `cfg.color`. Persisted in prefs. |
 | `log-trace [on\|off]` | this repo | Query or toggle the disk-logger's TRACE gate. Persisted in NVS; survives reboots. |
 | `help` | esp_console | Lists all of the above. |
 
@@ -156,7 +159,7 @@ Pull a log file with `python tools/fetch_b64.py COM3 /sdcard/monmix-NNNN.log out
 - **M2.5a** (done): microSD bring-up + coredump persisted to `/sdcard/coredump-NNNN.elf` on boot.
 - **M2.5b**: "did we crash since last power-on?" indicator surfaced in the UI.
 - **M2.5c** (done): rolling WS/wifi/UI event log to SD (`/sdcard/monmix-NNNN.log`) with a runtime trace toggle. Built after the 2026-05-01 SDIO-storm incident showed M2.5a alone misses non-panic failure modes.
-- **M3**: UX polish (mute/solo, color tags, low-light theme, meters).
+- **M3** (done): per-channel mute, dB readout (with `-INF` at floor), local SD-stored channel color tags, signal-present indicator, low-light dark theme. Plus the dev-loop tooling (UART REPL, `screenshot`+`touch`) that landed alongside.
 - **M4**: BLE/SoftAP provisioning.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).
 - **M6**: 3D-printed mic-stand enclosure.

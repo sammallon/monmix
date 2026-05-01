@@ -170,6 +170,14 @@ static void on_connected_subscribe_all(void)
                  "ch.%d.levelData.%d.lvl", ch_id, APP_MS_MIX_BUS);
         subscribe_path(dotted, "norm");
 
+        // Same level node, different alias + format → MS sends dB. We need
+        // both because norm drives the slider linearly and dB drives the
+        // user-facing readout (with non-linear MS-specific mapping that we
+        // can't compute locally).
+        snprintf(dotted, sizeof(dotted),
+                 "ch.%d.levelData.%d.level", ch_id, APP_MS_MIX_BUS);
+        subscribe_path(dotted, "val");
+
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", ch_id);
         subscribe_path(dotted, "val");
 
@@ -211,25 +219,28 @@ static void handle_broadcast(const char *json, size_t len)
 
     cJSON *jvalue = cJSON_GetObjectItem(jbody, "value");
 
-    int ch = 0, mix = 0;
-    if (sscanf(dotted, "ch.%d.levelData.%d.lvl", &ch, &mix) == 2 &&
-        mix == APP_MS_MIX_BUS && cJSON_IsNumber(jvalue)) {
+    // Single-pass dispatch on the trailing key. sscanf with `== N` checks
+    // ONLY confirm that the %d conversions filled — the rest of the format
+    // string can still mismatch and sscanf returns the same count, so a
+    // path like `levelData.0.level` would falsely match
+    // `levelData.%d.lvl`. Matching the prefix once and switching on the
+    // suffix avoids that whole class of bug.
+    int  ch = 0, mix = 0;
+    char suffix[16] = {0};
+    if (sscanf(dotted, "ch.%d.levelData.%d.%15s", &ch, &mix, suffix) == 3 &&
+        mix == APP_MS_MIX_BUS) {
         int idx = app_state_idx_for_id(ch);
         if (idx >= 0) {
-            app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
-        }
-        cJSON_Delete(root);
-        return;
-    }
-
-    if (sscanf(dotted, "ch.%d.levelData.%d.on", &ch, &mix) == 2 &&
-        mix == APP_MS_MIX_BUS && cJSON_IsBool(jvalue)) {
-        int idx = app_state_idx_for_id(ch);
-        if (idx >= 0) {
-            // MS `.on` true = audible, false = muted. Flip to our user-facing
-            // mute boolean (true = "this channel is silenced").
-            bool ms_on = cJSON_IsTrue(jvalue);
-            app_state_set_mute((size_t)idx, !ms_on, true);
+            if (strcmp(suffix, "lvl") == 0 && cJSON_IsNumber(jvalue)) {
+                app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
+            } else if (strcmp(suffix, "level") == 0 && cJSON_IsNumber(jvalue)) {
+                app_state_set_level_db((size_t)idx, (float)jvalue->valuedouble, true);
+            } else if (strcmp(suffix, "on") == 0 && cJSON_IsBool(jvalue)) {
+                // MS `.on` true = audible, false = muted. Flip to our
+                // user-facing boolean (true = "this channel is silenced").
+                bool ms_on = cJSON_IsTrue(jvalue);
+                app_state_set_mute((size_t)idx, !ms_on, true);
+            }
         }
         cJSON_Delete(root);
         return;

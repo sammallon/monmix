@@ -7,6 +7,7 @@
 #include "app_display.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
+#include "app_prefs.h"
 #include "app_state.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
@@ -59,6 +60,10 @@ void app_main(void)
     // Disk-log starts here — once SD is up, every subsequent step gets
     // its WiFi/WS/UI events recorded. No-op if SD didn't mount.
     app_logd_init();
+
+    // Local UI preferences (level format, channel colors, signal indicator).
+    // Loads /sdcard/monmix-prefs.json or starts at defaults if SD missing.
+    app_prefs_init();
 
     // Display + UI come up next — the screen should light up before we
     // start waiting on WiFi association.

@@ -273,6 +273,17 @@ bool app_display_init(void)
     // applies the inverse transform to touch coordinates automatically.
     lvgl_port_lock(0);
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
+    // Low-light stage theme: dark mode = true. Backgrounds become near-black
+    // and the boxes become dark grey instead of white. Primary blue keeps
+    // the slider track visible at a glance; secondary darker so unmuted
+    // mute buttons read as inert.
+    lv_theme_t *theme = lv_theme_default_init(
+        disp,
+        lv_palette_main(LV_PALETTE_BLUE),
+        lv_palette_main(LV_PALETTE_GREY),
+        /* dark */ true,
+        LV_FONT_DEFAULT);
+    lv_display_set_theme(disp, theme);
     lvgl_port_unlock();
 
     const lvgl_port_touch_cfg_t touch_cfg = { .disp = disp, .handle = tp };
