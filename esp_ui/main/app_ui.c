@@ -703,40 +703,55 @@ static void build_settings_overlay(void)
                             (void *)(uintptr_t) i);
     }
 
-    // Section: Channel Colors — 6 rows × 2 columns
+    // Section: Channels — 3 columns × N rows in a scrollable container so
+    // the same layout works at 12 channels (default) and at the Si Expression
+    // 2's full 60-channel count. Row is just [name] + [swatch] for now;
+    // selection checkbox will be added with the channel-selection feature.
     lv_obj_t *col_label = lv_label_create(ov);
-    lv_label_set_text(col_label, "Channel Colors");
+    lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 176);
 
-    const int col_w     = 460;
-    const int row_h     = 50;
-    const int swatch_sz = 32;
+    lv_obj_t *list = lv_obj_create(ov);
+    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 220);
+    lv_obj_set_pos(list, 0, 200);
+    lv_obj_set_style_pad_all(list, 6, 0);
+    lv_obj_set_style_pad_row(list, 4, 0);
+
+    const int cols      = 3;
+    const int row_h     = 32;
+    const int row_gap   = 4;
+    const int col_gap   = 8;
+    const int row_w     = (SCREEN_W - 32 - 2 * 6 - (cols - 1) * col_gap) / cols;
+    const int swatch_sz = 22;
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) {
         app_channel_t ch;
         if (!app_state_get(i, &ch)) continue;
-        int col = (int)(i / 6);
-        int row = (int)(i % 6);
-        int x = 8 + col * (col_w + 16);
-        int y = 210 + row * row_h;
+        int col = (int)(i % cols);
+        int row = (int)(i / cols);
+        int x = col * (row_w + col_gap);
+        int y = row * (row_h + row_gap);
 
-        lv_obj_t *row_obj = lv_obj_create(ov);
-        lv_obj_set_size(row_obj, col_w, row_h - 6);
+        lv_obj_t *row_obj = lv_obj_create(list);
+        lv_obj_set_size(row_obj, row_w, row_h);
         lv_obj_set_pos(row_obj, x, y);
-        lv_obj_set_style_radius(row_obj, 6, 0);
-        lv_obj_set_style_pad_all(row_obj, 8, 0);
+        lv_obj_set_style_radius(row_obj, 4, 0);
+        lv_obj_set_style_pad_all(row_obj, 4, 0);
         lv_obj_clear_flag(row_obj, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *name = lv_label_create(row_obj);
         lv_label_set_text(name, ch.name);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name, row_w - swatch_sz - 16);
         lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
 
         lv_obj_t *swatch = lv_obj_create(row_obj);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
         lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
-        lv_obj_set_style_radius(swatch, 6, 0);
+        lv_obj_set_style_radius(swatch, 4, 0);
         lv_obj_set_style_border_width(swatch, 1, 0);
         lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
+        lv_obj_set_style_pad_all(swatch, 0, 0);
         lv_obj_clear_flag(swatch, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(swatch, on_swatch_clicked, LV_EVENT_CLICKED,
