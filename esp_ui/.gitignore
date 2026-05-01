@@ -15,6 +15,10 @@ mcp_tee.log
 *_capture.txt
 coredump-*.elf
 
+# Local forensic records of on-device incidents — kept for personal
+# reference but never pushed (may include local IPs / network details).
+forensics/
+
 # Editor / IDE
 .vscode/
 .idea/
