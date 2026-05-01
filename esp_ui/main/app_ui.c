@@ -16,6 +16,7 @@
 #include "esp_lvgl_port.h"
 #include "esp_netif_sntp.h"
 #include "esp_sntp.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 
@@ -144,8 +145,13 @@ static lv_obj_t *s_ms_port_value;
 static void settings_open(void);
 static void settings_close(void);
 static void on_gear_clicked(lv_event_t *e);
+static void on_reboot_clicked(lv_event_t *e);
 static void picker_open(size_t channel_idx);
 static void picker_close(void);
+
+// Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
+// is called on the Yes path; Cancel just hides the popup.
+static lv_obj_t *s_reboot_confirm;
 static void wifi_panel_open(void);
 static void wifi_panel_close(void);
 static void wifi_panel_refresh(void);
@@ -795,6 +801,18 @@ static void build_settings_overlay(void)
     lv_obj_center(close_lbl);
     lv_obj_add_event_cb(close_btn, on_close_clicked, LV_EVENT_CLICKED, NULL);
 
+    // Reboot button — top-left corner of the settings overlay. Red bg so
+    // the user reads it as a destructive action; tap opens a confirmation
+    // dialog before actually calling esp_restart().
+    lv_obj_t *reboot_btn = lv_button_create(ov);
+    lv_obj_set_size(reboot_btn, 110, 36);
+    lv_obj_align(reboot_btn, LV_ALIGN_TOP_LEFT, 0, -4);
+    lv_obj_set_style_bg_color(reboot_btn, lv_color_hex(0xC04040), 0);
+    lv_obj_t *reboot_lbl = lv_label_create(reboot_btn);
+    lv_label_set_text(reboot_lbl, LV_SYMBOL_REFRESH " Reboot");
+    lv_obj_center(reboot_lbl);
+    lv_obj_add_event_cb(reboot_btn, on_reboot_clicked, LV_EVENT_CLICKED, NULL);
+
     // Section: Level Format
     lv_obj_t *lvl_label = lv_label_create(ov);
     lv_label_set_text(lvl_label, "Level Format");
@@ -936,6 +954,70 @@ static void settings_close(void)
     if (s_settings_overlay) {
         lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reboot confirmation — modal popup that gates the destructive action
+// behind a deliberate second tap. esp_restart never returns; the LVGL
+// task is killed by the chip reset.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void on_reboot_yes(lv_event_t *e)
+{
+    (void) e;
+    ESP_LOGW(TAG, "user-initiated reboot");
+    esp_restart();
+}
+
+static void on_reboot_no(lv_event_t *e)
+{
+    (void) e;
+    if (s_reboot_confirm) {
+        lv_obj_add_flag(s_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void build_reboot_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 420, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_reboot_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg, "Reboot the device now?");
+    lv_obj_align(msg, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 140, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_reboot_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 140, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xC04040), 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes);
+    lv_label_set_text(yes_lbl, LV_SYMBOL_REFRESH " Reboot");
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes, on_reboot_yes, LV_EVENT_CLICKED, NULL);
+}
+
+static void on_reboot_clicked(lv_event_t *e)
+{
+    (void) e;
+    if (!s_reboot_confirm) build_reboot_confirm();
+    lv_obj_remove_flag(s_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_reboot_confirm);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
