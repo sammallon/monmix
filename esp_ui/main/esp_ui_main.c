@@ -28,6 +28,19 @@ void app_main(void)
     const int  *ch_ids   = app_config_channel_ids(&ch_count);
     app_state_init(ch_ids, ch_count);
 
+    // First: bring up the UART REPL. It only depends on UART0 (live since
+    // boot) and esp_partition (SPI flash, separate peripheral from SDMMC) —
+    // none of the SDMMC-singleton constraints apply. Doing this first means
+    // any subsequent panic during wifi/SD/display bring-up still leaves a
+    // recoverable path: the next boot's console comes up almost immediately
+    // and `coredump-b64` streams the flash partition out over UART.
+    //
+    // ESP-Hosted's diagnostic commands (`crash`, `reboot`, `mem-dump`, …)
+    // get registered later, during esp_wifi_init() inside the radio bring-up
+    // below. They land in the same global esp_console registry our REPL is
+    // walking, so they appear retroactively without a restart.
+    app_console_init();
+
     // Phase 1 of WiFi: bring up the radio transport (esp_wifi_init triggers
     // ESP-Hosted's SDIO bus to the C6 and sdmmc_host_init() runs once). This
     // returns immediately — it does NOT wait for an SSID. We need the host
@@ -61,11 +74,4 @@ void app_main(void)
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up.
     ms->start();
-
-    // Last: bring up the UART REPL. esp_hosted has registered its diagnostic
-    // commands (`crash`, `reboot`, `mem-dump`, …) but never starts a REPL
-    // unless CONFIG_ESP_HOSTED_CLI_NEW_INSTANCE is set, which it isn't. We
-    // start one ourselves so those commands and our own (`ls`, `cat-b64`)
-    // become reachable over UART0.
-    app_console_init();
 }
