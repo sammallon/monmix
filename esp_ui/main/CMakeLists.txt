@@ -28,4 +28,5 @@ idf_component_register(
         espcoredump
         console
         mbedtls
+        esp_rom
 )

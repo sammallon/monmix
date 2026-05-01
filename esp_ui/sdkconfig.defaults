@@ -71,6 +71,25 @@ CONFIG_LV_USE_PERF_MONITOR=n
 CONFIG_LV_USE_MEM_MONITOR=n
 CONFIG_LV_MEM_CUSTOM=y
 
+# Snapshot / screenshot support — backs the `screenshot` console command in
+# app_console.c. Costs a few KB of code; allocs a per-call PSRAM buffer
+# (~1.2 MB at 1024×600 RGB565) which is freed after the b64 stream.
+CONFIG_LV_USE_SNAPSHOT=y
+
+# Bump console UART to 921600 — at 115200 a full-screen screenshot takes
+# ~140 s to base64-stream off-device, which kills the dev-loop. 921600 is
+# rock-solid on the CH340K bridge and brings it to ~18 s (or ~2 s with
+# zlib compression). Affects log output + console REPL only; flashing
+# baud (460800) is independent and unchanged. Host-side scripts
+# (repro_*.py, tools/fetch_b64.py, tools/fetch_screenshot.py) match.
+#
+# Disabling UART_DEFAULT and enabling UART_CUSTOM is required because the
+# DEFAULT path hardcodes baud=115200 (Kconfig prompt is gated behind the
+# CUSTOM choice).
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
 # Compiler: optimize for performance. UI + WS hot path benefits.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 

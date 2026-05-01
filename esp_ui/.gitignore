@@ -10,12 +10,15 @@ sdkconfig.old
 
 # Session-scoped log captures (build_log.txt, flash_log.txt, serial_log.txt,
 # serial_capture.txt, console_capture.txt), coredumps pulled off-device,
-# and runtime monmix-NNNN.log files fetched via tools/fetch_b64.py.
+# runtime monmix-NNNN.log files fetched via tools/fetch_b64.py, and
+# screenshots fetched via tools/fetch_screenshot.py.
 mcp_tee.log
 *_log.txt
 *_capture.txt
 coredump-*.elf
 monmix-*.log
+screenshot.png
+screenshot-*.png
 
 # Local forensic records of on-device incidents — kept for personal
 # reference but never pushed (may include local IPs / network details).

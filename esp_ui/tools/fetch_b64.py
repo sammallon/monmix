@@ -37,7 +37,7 @@ def open_port(port, timeout=10):
         try:
             ser = serial.Serial()
             ser.port     = port
-            ser.baudrate = 115200
+            ser.baudrate = 921600   # match CONFIG_ESP_CONSOLE_UART_BAUDRATE
             ser.timeout  = 0.05
             ser.dtr      = False
             ser.rts      = False

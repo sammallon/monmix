@@ -8,9 +8,14 @@
 #include "esp_console.h"
 #include "esp_core_dump.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_lvgl_port.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
+#include "lvgl.h"
 #include "mbedtls/base64.h"
+#include "miniz.h"
 
 #include "app_logd.h"
 #include "app_storage.h"
@@ -158,6 +163,159 @@ static int cmd_coredump_b64(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `screenshot` — capture the current LVGL screen as RGB565, prefix a small
+// magic+dimensions header, and base64-stream the lot through the same
+// BEGIN/END markers as cat-b64. Decoded host-side by tools/fetch_screenshot.py.
+// Useful for closed-loop UI verification: take, send touch, take again, diff.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void emit_b64_line(const uint8_t *src, size_t n)
+{
+    uint8_t out[80];
+    size_t  olen = 0;
+    if (mbedtls_base64_encode(out, sizeof(out), &olen, src, n) == 0) {
+        fwrite(out, 1, olen, stdout);
+        fputc('\n', stdout);
+    }
+}
+
+static int cmd_screenshot(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+
+    // The default LVGL draw-buffer allocator pulls from DMA-capable internal
+    // RAM (so the PPA can hit it during normal flush). At 1024×600×2 bytes =
+    // 1.2 MB that's bigger than the entire internal pool. Snapshots don't
+    // need DMA-capable memory — we route the allocation to PSRAM ourselves
+    // and feed the buffer through lv_snapshot_take_to_draw_buf.
+    const uint32_t snap_w = 1024;
+    const uint32_t snap_h = 600;
+    const size_t   snap_pixels_size = snap_w * snap_h * 2;       // RGB565
+    const size_t   snap_alloc_size  = snap_pixels_size + 256;    // alignment slack
+    uint8_t *snap_raw = heap_caps_aligned_alloc(64, snap_alloc_size,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!snap_raw) {
+        printf("screenshot: PSRAM alloc failed (need %u bytes)\n",
+               (unsigned) snap_alloc_size);
+        return 1;
+    }
+
+    lv_draw_buf_t db;
+    lv_draw_buf_init(&db, snap_w, snap_h, LV_COLOR_FORMAT_RGB565,
+                     0 /* auto stride */, snap_raw, snap_alloc_size);
+
+    if (!lvgl_port_lock(2000)) {
+        free(snap_raw);
+        printf("screenshot: lvgl_port_lock timeout\n");
+        return 1;
+    }
+    lv_obj_t   *scr = lv_screen_active();
+    lv_result_t r   = scr
+        ? lv_snapshot_take_to_draw_buf(scr, LV_COLOR_FORMAT_RGB565, &db)
+        : LV_RESULT_INVALID;
+    lvgl_port_unlock();
+    if (r != LV_RESULT_OK) {
+        free(snap_raw);
+        printf("screenshot: snapshot failed (scr=%p result=%d)\n", scr, (int) r);
+        return 1;
+    }
+
+    // From here on, treat &db like the buffer that lv_snapshot_take used to
+    // return — same fields. The free at the end is on snap_raw, not via
+    // lv_draw_buf_destroy (we own the underlying allocation).
+    lv_draw_buf_t *buf = &db;
+
+    // Compress pixels with deflate via the ROM miniz. Mostly-solid-color UI
+    // screens compress 5–10× — at 1024×600 RGB565 that's roughly 1.2 MB →
+    // 150 KB, cutting the b64 transfer at 921600 baud from ~17 s to ~2 s.
+    size_t   src_len = buf->data_size;
+    size_t   cap     = src_len + 256;   // worst-case over-estimate
+    uint8_t *cbuf    = malloc(cap);
+    if (!cbuf) {
+        free(snap_raw);
+        printf("screenshot: out of memory for compress buffer\n");
+        return 1;
+    }
+    // tdefl_compress_mem_to_mem internally callocs a tdefl_compressor, but
+    // ROM-resident miniz is built with MINIZ_NO_MALLOC and that allocator
+    // path is broken (returns NULL → function returns 0 = "deflate failed").
+    // Pre-allocate the compressor ourselves in PSRAM and drive
+    // tdefl_compress directly. Per the header, the tdefl API "does not
+    // dynamically allocate memory" — once the compressor struct exists,
+    // everything works in user-provided buffers.
+    tdefl_compressor *comp = malloc(sizeof(*comp));
+    if (!comp) {
+        free(cbuf);
+        free(snap_raw);
+        printf("screenshot: tdefl_compressor alloc failed (need %u bytes)\n",
+               (unsigned) sizeof(*comp));
+        return 1;
+    }
+    int64_t t0 = esp_timer_get_time();
+    tdefl_init(comp, NULL, NULL,
+               TDEFL_WRITE_ZLIB_HEADER | TDEFL_DEFAULT_MAX_PROBES);
+    size_t       in_size  = src_len;
+    size_t       out_size = cap;
+    tdefl_status st = tdefl_compress(comp, buf->data, &in_size,
+                                     cbuf, &out_size, TDEFL_FINISH);
+    int64_t t_compress_us = esp_timer_get_time() - t0;
+    free(comp);
+    if (st != TDEFL_STATUS_DONE) {
+        printf("screenshot: deflate failed (status=%d in_consumed=%u out_used=%u)\n",
+               (int) st, (unsigned) in_size, (unsigned) out_size);
+        free(cbuf);
+        free(snap_raw);
+        return 1;
+    }
+    size_t comp_len = out_size;
+    // Stats line printed BEFORE the BEGIN marker so the host can pick up
+    // device-side timings and compute the full compression accounting.
+    printf("screenshot-stats: src=%u comp=%u ratio=%.1f%% compress_us=%lld\n",
+           (unsigned) src_len, (unsigned) comp_len,
+           100.0 * (double) comp_len / (double) src_len,
+           (long long) t_compress_us);
+
+    // 36-byte header, multiple of 3 for clean base64. The host parses it,
+    // then zlib-decompresses the rest of the payload.
+    struct __attribute__((packed)) {
+        char     magic[8];           // "MMSCRN\0\0"
+        uint32_t w;
+        uint32_t h;
+        uint32_t stride;
+        uint32_t format;             // lv_color_format_t (RGB565 = 0x12)
+        uint32_t uncompressed_size;
+        uint32_t compressed_size;
+        uint32_t flags;              // bit 0 = zlib-compressed payload
+    } hdr;
+    memcpy(hdr.magic, "MMSCRN\0\0", 8);
+    hdr.w                 = buf->header.w;
+    hdr.h                 = buf->header.h;
+    hdr.stride            = buf->header.stride;
+    hdr.format            = (uint32_t) buf->header.cf;
+    hdr.uncompressed_size = (uint32_t) src_len;
+    hdr.compressed_size   = (uint32_t) comp_len;
+    hdr.flags             = 1;
+
+    size_t total = sizeof(hdr) + comp_len;
+    printf("===BEGIN BASE64 screenshot SIZE %u ===\n", (unsigned) total);
+
+    emit_b64_line((const uint8_t *)&hdr, sizeof(hdr));
+
+    size_t off = 0;
+    while (off < comp_len) {
+        size_t n = comp_len - off;
+        if (n > 57) n = 57;
+        emit_b64_line(cbuf + off, n);
+        off += n;
+    }
+
+    free(cbuf);
+    free(snap_raw);
+    printf("===END BASE64===\n");
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -189,10 +347,11 @@ static int cmd_log_trace(int argc, char **argv)
 void app_console_init(void)
 {
     static const esp_console_cmd_t cmds[] = {
-        { .command = "ls",           .help = "list files in a directory (default /sdcard)", .func = cmd_ls           },
-        { .command = "cat-b64",      .help = "base64-print a file framed with markers",     .func = cmd_cat_b64      },
-        { .command = "coredump-b64", .help = "base64-print the flash coredump partition",   .func = cmd_coredump_b64 },
-        { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace  },
+        { .command = "ls",           .help = "list files in a directory (default /sdcard)",   .func = cmd_ls           },
+        { .command = "cat-b64",      .help = "base64-print a file framed with markers",       .func = cmd_cat_b64      },
+        { .command = "coredump-b64", .help = "base64-print the flash coredump partition",     .func = cmd_coredump_b64 },
+        { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI",   .func = cmd_screenshot   },
+        { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -202,6 +361,11 @@ void app_console_init(void)
     esp_console_repl_config_t  repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     repl_config.prompt   = "monmix> ";
     repl_config.max_cmdline_length = 256;
+    // Default REPL stack is 4 KB. The `screenshot` command runs LVGL's
+    // render path on the REPL task and that overflows it (Guru Meditation:
+    // stack-protection fault inside lv_snapshot_take_to_draw_buf). 16 KB
+    // is comfortable for LVGL render + miniz compress + base64 emit.
+    repl_config.task_stack_size = 16 * 1024;
 
     esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
