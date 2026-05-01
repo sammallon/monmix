@@ -93,9 +93,18 @@ static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
 static lv_obj_t *s_theme_buttons[2]; // dark / light
 
+// Color-picker popup. One instance, reused for whichever channel last tapped
+// a swatch in the settings overlay. s_picker_target_idx remembers which
+// channel index to apply the selection to.
+static lv_obj_t *s_picker_popup;
+static lv_obj_t *s_picker_title;
+static size_t   s_picker_target_idx;
+
 static void settings_open(void);
 static void settings_close(void);
 static void on_gear_clicked(lv_event_t *e);
+static void picker_open(size_t channel_idx);
+static void picker_close(void);
 
 // Rate-limit outbound SETs per channel so a fast drag doesn't flood MS
 // (each SET produces a broadcast echo, doubling on-wire traffic). 50 ms
@@ -594,27 +603,40 @@ static void on_theme_clicked(lv_event_t *e)
     update_radio_visuals(s_theme_buttons, 2, (size_t) which);
 }
 
-// Tap a swatch → cycle to the next palette index (-1 = no color, 0..7 =
-// palette entries). Applies via app_prefs which fires on_prefs_change and
-// the dirty sweep, recolouring the slider in real time.
+// Tap a swatch → open the color-picker popup for that channel. The popup
+// applies the choice via app_prefs (which fires the dirty sweep, recolouring
+// the slider in real time) and refreshes the swatch visual on close.
 static void on_swatch_clicked(lv_event_t *e)
 {
     size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
-    int    cur = -1;
-    int    ch_id = app_state_id_for_idx(idx);
-    if (ch_id >= 0) cur = app_prefs_get_channel_color(ch_id);
-    int next = cur + 1;
-    if (next > 7) next = -1;
-    if (ch_id >= 0) app_prefs_set_channel_color(ch_id, next);
+    picker_open(idx);
+}
 
-    // Update the swatch visual itself — apply_pending only repaints the
+// One handler for all picker buttons. user_data carries the selected palette
+// index, with -1 meaning "no color".
+static void on_picker_choice(lv_event_t *e)
+{
+    int color = (int)(intptr_t) lv_event_get_user_data(e);
+    int ch_id = app_state_id_for_idx(s_picker_target_idx);
+    if (ch_id >= 0) app_prefs_set_channel_color(ch_id, color);
+
+    // Update the source swatch immediately — apply_pending only repaints the
     // fader sliders, not anything inside the settings overlay.
-    lv_obj_t *swatch = (lv_obj_t *) lv_event_get_target(e);
-    if (next < 0) {
-        lv_obj_set_style_bg_color(swatch, lv_color_hex(0x303030), 0);
-    } else {
-        lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_PALETTE[next]), 0);
+    lv_obj_t *swatch = s_color_swatches[s_picker_target_idx];
+    if (swatch) {
+        if (color < 0) {
+            lv_obj_set_style_bg_color(swatch, lv_color_hex(0x303030), 0);
+        } else {
+            lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_PALETTE[color]), 0);
+        }
     }
+    picker_close();
+}
+
+static void on_picker_close_clicked(lv_event_t *e)
+{
+    (void) e;
+    picker_close();
 }
 
 static lv_obj_t *make_radio_button(lv_obj_t *parent, const char *text)
@@ -799,5 +821,103 @@ static void settings_close(void)
 {
     if (s_settings_overlay) {
         lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Color-picker popup — modal panel built lazily on first open. Lives on
+// the screen (not as a child of settings_overlay) so move_foreground
+// raises it above the settings panel.
+// ─────────────────────────────────────────────────────────────────────────
+
+#define PICKER_BTN_SZ   80
+#define PICKER_GAP      10
+#define PICKER_COLS     3
+#define PICKER_ROWS     3
+#define PICKER_INNER_W  (PICKER_COLS * PICKER_BTN_SZ + (PICKER_COLS - 1) * PICKER_GAP)
+#define PICKER_INNER_H  (PICKER_ROWS * PICKER_BTN_SZ + (PICKER_ROWS - 1) * PICKER_GAP)
+#define PICKER_PAD      20
+#define PICKER_HEADER_H 40
+#define PICKER_W        (PICKER_INNER_W + 2 * PICKER_PAD)
+#define PICKER_H        (PICKER_INNER_H + 2 * PICKER_PAD + PICKER_HEADER_H)
+
+static void build_picker_popup(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, PICKER_W, PICKER_H);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, PICKER_PAD, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_picker_popup = p;
+
+    s_picker_title = lv_label_create(p);
+    lv_label_set_text(s_picker_title, "Color");
+    lv_obj_align(s_picker_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(p);
+    lv_obj_set_size(close_btn, 32, 32);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_picker_close_clicked, LV_EVENT_CLICKED, NULL);
+
+    // 3×3 grid: 8 palette colors + 1 "no color" (clear) button.
+    for (int i = 0; i < 9; ++i) {
+        int row = i / PICKER_COLS;
+        int col = i % PICKER_COLS;
+        int x   = col * (PICKER_BTN_SZ + PICKER_GAP);
+        int y   = PICKER_HEADER_H + row * (PICKER_BTN_SZ + PICKER_GAP);
+
+        lv_obj_t *btn = lv_button_create(p);
+        lv_obj_set_size(btn, PICKER_BTN_SZ, PICKER_BTN_SZ);
+        lv_obj_set_pos(btn, x, y);
+        lv_obj_set_style_radius(btn, 6, 0);
+
+        intptr_t color_idx;
+        if (i < 8) {
+            color_idx = i;
+            lv_obj_set_style_bg_color(btn, lv_color_hex(COLOR_PALETTE[i]), 0);
+        } else {
+            // 9th cell — clear / no color. Render with a × glyph so it reads
+            // as "remove" rather than "another shade of grey".
+            color_idx = -1;
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x303030), 0);
+            lv_obj_t *x_lbl = lv_label_create(btn);
+            lv_label_set_text(x_lbl, LV_SYMBOL_CLOSE);
+            lv_obj_center(x_lbl);
+        }
+        lv_obj_add_event_cb(btn, on_picker_choice, LV_EVENT_CLICKED,
+                            (void *)(intptr_t) color_idx);
+    }
+}
+
+static void picker_open(size_t channel_idx)
+{
+    if (!s_picker_popup) build_picker_popup();
+    s_picker_target_idx = channel_idx;
+
+    // Title shows the channel name so a glance confirms the right strip
+    // is being recolored — useful when channel labels are dotted off in
+    // the compact rows.
+    app_channel_t ch;
+    if (app_state_get(channel_idx, &ch)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Color: %s", ch.name);
+        lv_label_set_text(s_picker_title, buf);
+    }
+
+    lv_obj_remove_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_picker_popup);
+}
+
+static void picker_close(void)
+{
+    if (s_picker_popup) {
+        lv_obj_add_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
     }
 }
