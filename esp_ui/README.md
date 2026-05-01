@@ -162,9 +162,9 @@ Pull a log file with `python tools/fetch_b64.py COM3 /sdcard/monmix-NNNN.log out
 - **M2.5b**: "did we crash since last power-on?" indicator surfaced in the UI.
 - **M2.5c** (done): rolling WS/wifi/UI event log to SD (`/sdcard/monmix-NNNN.log`) with a runtime trace toggle. Built after the 2026-05-01 SDIO-storm incident showed M2.5a alone misses non-panic failure modes.
 - **M3** (done): per-channel mute, dB readout (with `-INF` at floor), local SD-stored channel color tags, signal-present indicator, low-light dark theme. Plus the dev-loop tooling (UART REPL, `screenshot`+`touch`) that landed alongside.
-- **M4**: BLE/SoftAP provisioning.
+- **M4**: 3D-printed mic-stand enclosure. Moved earlier so the print can run in the background while the firmware work continues — prints are slow and the device is currently exposed.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).
-- **M6**: 3D-printed mic-stand enclosure.
+- **M6**: BLE/SoftAP provisioning.
 
 See `C:\Users\samallon\.claude\plans\fluffy-singing-moth.md` for the full project plan.
 
