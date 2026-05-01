@@ -1,7 +1,6 @@
 #include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_state.h"
-#include "app_ui.h"
 #include "secrets.h"
 
 #include <stdio.h>
@@ -32,6 +31,28 @@ static const char *TAG = "ms_ws";
 #define WS_GET_PREFIX_LEN      (sizeof(WS_GET_PREFIX) - 1)
 
 static esp_websocket_client_handle_t s_ws;
+static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
+
+#define MAX_SUBSCRIBERS 4
+static struct {
+    app_ms_on_change_t cb;
+    void              *ctx;
+} s_subscribers[MAX_SUBSCRIBERS];
+static size_t s_subscriber_count;
+
+static void notify_subscribers(void)
+{
+    for (size_t i = 0; i < s_subscriber_count; ++i) {
+        if (s_subscribers[i].cb) s_subscribers[i].cb(s_subscribers[i].ctx);
+    }
+}
+
+static void set_state(app_ms_state_t s)
+{
+    if (s_state == s) return;
+    s_state = s;
+    notify_subscribers();
+}
 
 static bool ws_start(void);
 static void ws_set_level(int ms_channel_id, float level);
@@ -43,11 +64,26 @@ static void subscribe_path(const char *dotted, const char *format);
 static void on_connected_subscribe_all(void);
 static void handle_broadcast(const char *json, size_t len);
 
+static app_ms_state_t ws_get_state(void)             { return s_state; }
+static const char    *ws_get_host(void)              { return APP_MS_HOST; }
+static int            ws_get_port(void)              { return APP_MS_PORT; }
+static void           ws_register_on_change(app_ms_on_change_t cb, void *ctx)
+{
+    if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
+    s_subscribers[s_subscriber_count].cb  = cb;
+    s_subscribers[s_subscriber_count].ctx = ctx;
+    s_subscriber_count++;
+}
+
 static const ms_client_iface_t s_iface = {
-    .start     = ws_start,
-    .set_level = ws_set_level,
-    .set_mute  = ws_set_mute,
-    .stop      = ws_stop,
+    .start              = ws_start,
+    .set_level          = ws_set_level,
+    .set_mute           = ws_set_mute,
+    .stop               = ws_stop,
+    .get_state          = ws_get_state,
+    .get_host           = ws_get_host,
+    .get_port           = ws_get_port,
+    .register_on_change = ws_register_on_change,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -78,9 +114,7 @@ static bool ws_start(void)
         return false;
     }
     ESP_LOGI(TAG, "ws starting -> %s", uri);
-    char buf[80];
-    snprintf(buf, sizeof(buf), "MS: connecting to %s:%d...", APP_MS_HOST, APP_MS_PORT);
-    app_ui_set_status(buf);
+    set_state(APP_MS_STATE_CONNECTING);
     return true;
 }
 
@@ -263,9 +297,7 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "connected");
         APP_LOGD_I("ms_ws", "connected to %s:%d", APP_MS_HOST, APP_MS_PORT);
-        char buf[64];
-        snprintf(buf, sizeof(buf), "MS: connected %s:%d", APP_MS_HOST, APP_MS_PORT);
-        app_ui_set_status(buf);
+        set_state(APP_MS_STATE_CONNECTED);
         on_connected_subscribe_all();
         break;
     }
@@ -282,13 +314,13 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected");
         APP_LOGD_W("ms_ws", "disconnected");
-        app_ui_set_status("MS: disconnected, retrying...");
+        set_state(APP_MS_STATE_DISCONNECTED);
         break;
 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "error");
         APP_LOGD_E("ms_ws", "error event");
-        app_ui_set_status("MS: error, retrying...");
+        set_state(APP_MS_STATE_ERROR);
         break;
 
     default:

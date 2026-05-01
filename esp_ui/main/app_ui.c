@@ -101,13 +101,19 @@ static lv_obj_t *s_picker_popup;
 static lv_obj_t *s_picker_title;
 static size_t   s_picker_target_idx;
 
-// Status-bar icons for WiFi connection state. Tap opens the read-only
+// Status-bar icons for WiFi / MS connection state. Tap opens the read-only
 // info panel; the icon color reflects the live state.
 static lv_obj_t *s_wifi_icon_label;     // the LV_SYMBOL_WIFI label inside the button
 static lv_obj_t *s_wifi_panel;
 static lv_obj_t *s_wifi_state_value;
 static lv_obj_t *s_wifi_ssid_value;
 static lv_obj_t *s_wifi_ip_value;
+
+static lv_obj_t *s_ms_icon_label;       // the LV_SYMBOL_AUDIO label inside the button
+static lv_obj_t *s_ms_panel;
+static lv_obj_t *s_ms_state_value;
+static lv_obj_t *s_ms_host_value;
+static lv_obj_t *s_ms_port_value;
 
 static void settings_open(void);
 static void settings_close(void);
@@ -120,6 +126,12 @@ static void wifi_panel_refresh(void);
 static void wifi_icon_refresh(void);
 static void on_wifi_clicked(lv_event_t *e);
 static void on_wifi_state_change(void *ctx);
+static void ms_panel_open(void);
+static void ms_panel_close(void);
+static void ms_panel_refresh(void);
+static void ms_icon_refresh(void);
+static void on_ms_clicked(lv_event_t *e);
+static void on_ms_state_change(void *ctx);
 
 // Rate-limit outbound SETs per channel so a fast drag doesn't flood MS
 // (each SET produces a broadcast echo, doubling on-wire traffic). 50 ms
@@ -522,6 +534,19 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_center(s_wifi_icon_label);
     lv_obj_add_event_cb(wifi_btn, on_wifi_clicked, LV_EVENT_CLICKED, NULL);
 
+    // MS status icon — left of WiFi. Same color/state pattern; tap opens
+    // the read-only MS info panel.
+    lv_obj_t *ms_btn = lv_button_create(scr);
+    lv_obj_set_size(ms_btn, 28, 28);
+    lv_obj_align(ms_btn, LV_ALIGN_TOP_RIGHT, -80, 2);
+    lv_obj_set_style_radius(ms_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(ms_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ms_btn, 0, 0);
+    s_ms_icon_label = lv_label_create(ms_btn);
+    lv_label_set_text(s_ms_icon_label, LV_SYMBOL_AUDIO);
+    lv_obj_center(s_ms_icon_label);
+    lv_obj_add_event_cb(ms_btn, on_ms_clicked, LV_EVENT_CLICKED, NULL);
+
     // Tileview holds one tile per page. Horizontal swipe between pages.
     s_tileview = lv_tileview_create(scr);
     lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
@@ -568,8 +593,12 @@ void app_ui_init(const ms_client_iface_t *ms)
     app_state_register_on_change(on_state_change, NULL);
     app_prefs_register_on_change(on_prefs_change, NULL);
     app_wifi_register_on_change(on_wifi_state_change, NULL);
+    if (s_ms && s_ms->register_on_change) {
+        s_ms->register_on_change(on_ms_state_change, NULL);
+    }
 
     wifi_icon_refresh();
+    ms_icon_refresh();
 
     lvgl_port_unlock();
 
@@ -1091,4 +1120,150 @@ static void on_wifi_clicked(lv_event_t *e)
 {
     (void)e;
     wifi_panel_open();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// MS info panel — same shape as the WiFi panel: read-only state / host /
+// port. Editable fields land alongside the WiFi editor in the follow-up
+// task (#38).
+// ─────────────────────────────────────────────────────────────────────────
+
+static uint32_t ms_state_color(app_ms_state_t s)
+{
+    switch (s) {
+        case APP_MS_STATE_CONNECTED:    return 0x40C040;  // green
+        case APP_MS_STATE_CONNECTING:   return 0xE0D040;  // yellow
+        case APP_MS_STATE_DISCONNECTED: return 0xC04040;  // red — same hue as
+        case APP_MS_STATE_ERROR:        return 0xC04040;  // wifi-failed
+        case APP_MS_STATE_BOOT:
+        default:                         return 0x808080;  // grey
+    }
+}
+
+static const char *ms_state_text(app_ms_state_t s)
+{
+    switch (s) {
+        case APP_MS_STATE_CONNECTED:    return "Connected";
+        case APP_MS_STATE_CONNECTING:   return "Connecting...";
+        case APP_MS_STATE_DISCONNECTED: return "Disconnected";
+        case APP_MS_STATE_ERROR:        return "Error";
+        case APP_MS_STATE_BOOT:
+        default:                         return "Booting";
+    }
+}
+
+static app_ms_state_t ms_state_now(void)
+{
+    return (s_ms && s_ms->get_state) ? s_ms->get_state() : APP_MS_STATE_BOOT;
+}
+
+static void ms_icon_refresh(void)
+{
+    if (!s_ms_icon_label) return;
+    lv_obj_set_style_text_color(s_ms_icon_label,
+                                lv_color_hex(ms_state_color(ms_state_now())),
+                                0);
+}
+
+static void ms_panel_refresh(void)
+{
+    if (!s_ms_panel) return;
+    app_ms_state_t st = ms_state_now();
+    lv_label_set_text(s_ms_state_value, ms_state_text(st));
+    lv_obj_set_style_text_color(s_ms_state_value,
+                                lv_color_hex(ms_state_color(st)), 0);
+    const char *host = (s_ms && s_ms->get_host) ? s_ms->get_host() : "—";
+    int port         = (s_ms && s_ms->get_port) ? s_ms->get_port() : 0;
+    lv_label_set_text(s_ms_host_value, host);
+    char portbuf[8];
+    snprintf(portbuf, sizeof(portbuf), "%d", port);
+    lv_label_set_text(s_ms_port_value, portbuf);
+}
+
+static void ms_apply_async(void *unused)
+{
+    (void)unused;
+    ms_icon_refresh();
+    if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
+        ms_panel_refresh();
+    }
+}
+
+static void on_ms_state_change(void *ctx)
+{
+    (void)ctx;
+    if (!lvgl_port_lock(100)) return;
+    lv_async_call(ms_apply_async, NULL);
+    lvgl_port_unlock();
+}
+
+static void on_ms_panel_close_clicked(lv_event_t *e)
+{
+    (void)e;
+    ms_panel_close();
+}
+
+static void build_ms_panel(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 600, 280);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_ms_panel = p;
+
+    lv_obj_t *title = lv_label_create(p);
+    lv_label_set_text(title, "Mixing Station");
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(p);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_ms_panel_close_clicked, LV_EVENT_CLICKED, NULL);
+
+    const int row_y[3] = { 60, 110, 160 };
+    const char *labels[3] = { "State", "Host", "Port" };
+    lv_obj_t **values[3] = { &s_ms_state_value, &s_ms_host_value, &s_ms_port_value };
+    for (int i = 0; i < 3; ++i) {
+        lv_obj_t *l = lv_label_create(p);
+        lv_label_set_text(l, labels[i]);
+        lv_obj_align(l, LV_ALIGN_TOP_LEFT, 0, row_y[i]);
+
+        lv_obj_t *v = lv_label_create(p);
+        lv_label_set_text(v, "—");
+        lv_obj_align(v, LV_ALIGN_TOP_LEFT, 180, row_y[i]);
+        *(values[i]) = v;
+    }
+
+    lv_obj_t *note = lv_label_create(p);
+    lv_label_set_text(note, "Editing comes in a follow-up — needs on-screen keyboard");
+    lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
+static void ms_panel_open(void)
+{
+    if (!s_ms_panel) build_ms_panel();
+    ms_panel_refresh();
+    lv_obj_remove_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ms_panel);
+}
+
+static void ms_panel_close(void)
+{
+    if (s_ms_panel) {
+        lv_obj_add_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_ms_clicked(lv_event_t *e)
+{
+    (void)e;
+    ms_panel_open();
 }
