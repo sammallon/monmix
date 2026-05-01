@@ -13,6 +13,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_wifi
-        esp_http_client
-        json
+        esp_lcd
+        esp_driver_i2c
+        esp_driver_ledc
 )

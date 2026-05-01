@@ -1,6 +1,13 @@
 # Target: ESP32-P4 (host), ESP32-C6 (Wi-Fi co-processor on the CrowPanel board).
 CONFIG_IDF_TARGET="esp32p4"
 
+# CrowPanel Advanced 10.1" ships with early-revision ESP32-P4 silicon (v1.3
+# observed). IDF v6.0.1 default min-rev is v3.01; the <v3.0 silicon family is
+# binary-incompatible with v3.x, so we have to opt into the pre-v3 path
+# (SELECTS_REV_LESS_V3) which then unlocks REV_MIN_100 (= v1.0).
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
 # 16 MB flash on the CrowPanel Advanced 10.1".
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
@@ -22,12 +29,22 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_FREERTOS_HZ=1000
 
 # Wi-Fi via the on-board ESP32-C6 (esp_hosted SDIO transport).
-# Verify exact pin/transport defaults against the Elecrow schematic at unbox;
-# may need overrides via menuconfig once the board is in hand.
 CONFIG_ESP_WIFI_REMOTE_ENABLED=y
 CONFIG_ESP_HOSTED_ENABLED=y
 CONFIG_ESP_HOSTED_HOST=y
 CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+
+# ESP-Hosted's SDIO mempool needs DMA-capable INTERNAL RAM (PSRAM is
+# excluded from MALLOC_CAP_INTERNAL). At default queue sizes (20/20) the
+# 47 KiB pool itself fails to allocate. With queues=8 it allocates but
+# leaves so little contiguous DMA heap that the SDIO double-buffer's
+# separate 2 KiB aligned malloc later asserts. Disabling mempool entirely
+# trips the task watchdog (ESP-Hosted runs at prio 23 and starves main
+# with malloc/free per packet). Sweet spot: small mempool (4/4 → ~23 KiB)
+# AND keep mempool enabled so packet RX doesn't churn the heap.
+CONFIG_ESP_HOSTED_USE_MEMPOOL=y
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=8
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=8
 
 # Larger LWIP buffers — WS frames + JSON payloads need elbow room.
 CONFIG_LWIP_TCP_RCV_BUF_DEFAULT=16384

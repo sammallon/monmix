@@ -8,8 +8,9 @@ managed_components/
 sdkconfig
 sdkconfig.old
 
-# MCP debug log
+# Session-scoped log captures (build_log.txt, flash_log.txt, serial_log.txt)
 mcp_tee.log
+*_log.txt
 
 # Editor / IDE
 .vscode/

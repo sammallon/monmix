@@ -61,14 +61,16 @@ Reference URLs for development. Mixing Station's HTTP/WebSocket port is configur
 
 - App base:        `http://<MS_HOST>:<MS_PORT>/`
 - REST API docs:   `http://<MS_HOST>:<MS_PORT>/#/rest-api`
-- Data explorer:   `http://<MS_HOST>:<MS_PORT>/#/data-explorer` ← use this to discover exact channel paths
+- Data explorer:   `http://<MS_HOST>:<MS_PORT>/#/data-explorer` — useful for discovering exact channel paths
+- WebSocket URL:   `ws://<MS_HOST>:<MS_PORT>/` — single connection for subscribe + set, JSON envelopes shaped like HTTP requests
 
-The actual subscription/REST paths used by `app_ms_client_ws.c` are placeholders pending verification against the data-explorer (search the source for `TODO(unbox)`).
+`app_ms_client_ws.c` opens one WS to the test instance and (on each connect) subscribes per-tracked-channel to `ch.<N>.levelData.0.lvl` (norm 0..1) and `ch.<N>.cfg.name`. Sets are sent as `POST /console/data/set/...` envelopes through the same socket. Protocol verified via `repro_ms_probe*.py` (gitignored).
 
 ## Milestones
 
 - **M1** (in progress): end-to-end vertical slice — 3 hard-coded faders read & write live over WiFi.
 - **M2**: paged UI, persisted channel selection.
+- **M2.5**: postmortem logging to SD card (FATFS + coredump + WS/REST frame log) so off-bench failures are recoverable.
 - **M3**: UX polish (mute/solo, color tags, low-light theme, meters).
 - **M4**: BLE/SoftAP provisioning.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).

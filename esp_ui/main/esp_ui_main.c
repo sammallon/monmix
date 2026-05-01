@@ -21,11 +21,8 @@ void app_main(void)
 
     app_state_init();
 
-    if (!app_wifi_connect()) {
-        ESP_LOGE(TAG, "WiFi connect failed; halting");
-        return;
-    }
-
+    // Display + UI come up first — the screen should light up immediately,
+    // not wait on WiFi/MS. Status line shows progress thereafter.
     if (!app_display_init()) {
         ESP_LOGE(TAG, "display init failed; halting");
         return;
@@ -33,8 +30,15 @@ void app_main(void)
 
     const ms_client_iface_t *ms = app_ms_client_ws();
     app_ui_init(ms);
+    app_ui_set_status("Connecting WiFi...");
 
-    if (!ms->start()) {
-        ESP_LOGE(TAG, "MS client failed to start");
+    bool wifi_ok = app_wifi_connect();
+    if (!wifi_ok) {
+        ESP_LOGW(TAG, "WiFi unavailable; UI will still render, MS client will retry");
+        app_ui_set_status("WiFi unavailable — UI only");
     }
+
+    // ws_start always returns true when the client object initializes; the
+    // websocket subsystem itself handles reconnect once WiFi is up.
+    ms->start();
 }

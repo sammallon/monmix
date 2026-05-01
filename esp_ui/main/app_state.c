@@ -6,7 +6,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
-static const int s_initial_ids[APP_STATE_MAX_CHANNELS] = {1, 2, 3};
+// MS paths are 0-indexed: ch.0 corresponds to "CH 01" in the MS UI.
+static const int s_initial_ids[APP_STATE_MAX_CHANNELS] = {0, 1, 2};
 
 static app_channel_t        s_channels[APP_STATE_MAX_CHANNELS];
 static SemaphoreHandle_t    s_mutex;
@@ -52,13 +53,17 @@ void app_state_set_level(size_t idx, float level, bool notify)
     }
 }
 
-void app_state_set_name(size_t idx, const char *name)
+void app_state_set_name(size_t idx, const char *name, bool notify)
 {
     if (idx >= APP_STATE_MAX_CHANNELS || !name) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(s_channels[idx].name, name, sizeof(s_channels[idx].name) - 1);
     s_channels[idx].name[sizeof(s_channels[idx].name) - 1] = '\0';
     xSemaphoreGive(s_mutex);
+
+    if (notify && s_on_change) {
+        s_on_change(idx, s_on_change_ctx);
+    }
 }
 
 int app_state_idx_for_id(int ms_channel_id)

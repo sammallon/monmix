@@ -6,12 +6,11 @@ dependencies:
   espressif/esp_lvgl_port:
     version: "^2.0.0"
 
-  # MIPI-DSI panel driver. The CrowPanel Advanced 10.1" ships with either
-  # ILI9881C or JD9365 — confirm via silk/schematic at unbox and swap if needed.
-  espressif/esp_lcd_ili9881c:
+  # MIPI-DSI panel driver. CrowPanel Advanced 10.1" (Elecrow SKU DHE04310D)
+  # uses the EK79007 — confirmed against Elecrow's own Arduino lessons
+  # (esp_panel_board_custom_conf.h sets ESP_PANEL_BOARD_LCD_CONTROLLER EK79007).
+  espressif/esp_lcd_ek79007:
     version: "*"
-  # espressif/esp_lcd_jd9365:
-  #   version: "*"
 
   # Capacitive touch controller (GT911) over I2C.
   espressif/esp_lcd_touch_gt911:
@@ -25,4 +24,8 @@ dependencies:
   espressif/esp_wifi_remote:
     version: "*"
   espressif/esp_hosted:
+    version: "*"
+
+  # cJSON moved out of esp-idf core in v6.0; pull it from the registry.
+  espressif/cjson:
     version: "*"

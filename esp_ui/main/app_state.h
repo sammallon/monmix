@@ -18,7 +18,7 @@ size_t app_state_count(void);
 
 bool app_state_get(size_t idx, app_channel_t *out);
 void app_state_set_level(size_t idx, float level, bool notify);
-void app_state_set_name(size_t idx, const char *name);
+void app_state_set_name(size_t idx, const char *name, bool notify);
 
 int app_state_idx_for_id(int ms_channel_id);
 int app_state_id_for_idx(size_t idx);
