@@ -8,9 +8,12 @@ managed_components/
 sdkconfig
 sdkconfig.old
 
-# Session-scoped log captures (build_log.txt, flash_log.txt, serial_log.txt)
+# Session-scoped log captures (build_log.txt, flash_log.txt, serial_log.txt,
+# serial_capture.txt, console_capture.txt) and coredumps pulled off-device.
 mcp_tee.log
 *_log.txt
+*_capture.txt
+coredump-*.elf
 
 # Editor / IDE
 .vscode/

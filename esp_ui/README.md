@@ -38,8 +38,8 @@ git config --local core.hooksPath tools/git-hooks
 ```
 esp_ui/
 ├── CMakeLists.txt
-├── partitions.csv               4 MB app + 8 MB FATFS
-├── sdkconfig.defaults           PSRAM, hosted WiFi, LVGL flags
+├── partitions.csv               4 MB app + 64 KB coredump + 8 MB FATFS
+├── sdkconfig.defaults           PSRAM, hosted WiFi, LVGL, coredump-to-flash
 ├── main/
 │   ├── CMakeLists.txt
 │   ├── idf_component.yml        managed-component dependencies
@@ -47,11 +47,14 @@ esp_ui/
 │   ├── esp_ui_main.c            entry point
 │   ├── app_config.[ch]          NVS-backed per-musician channel selection (M2)
 │   ├── app_state.[ch]           channel data (mutex-guarded)
-│   ├── app_wifi.[ch]            esp_wifi_remote + retry helper
+│   ├── app_wifi.[ch]            split radio bring-up vs SSID-connect helpers
 │   ├── app_ms_client.h          backend-agnostic MS client interface
 │   ├── app_ms_client_ws.c       REST + WebSocket implementation (M1)
 │   ├── app_display.[ch]         panel + touch + LVGL bring-up
 │   ├── app_ui.[ch]              LVGL paged fader screen (M2)
+│   ├── app_storage.[ch]         microSD mount on SDMMC slot 0 (M2.5a)
+│   ├── app_coredump.[ch]        flush flash coredump → SD on boot (M2.5a)
+│   ├── app_console.[ch]         UART REPL (M2.5a) — ls, cat-b64, coredump-b64
 │   └── pytest_esp_ui.py         host-side smoke tests
 └── README.md
 ```
@@ -76,11 +79,60 @@ The list of MS channels the device tracks is stored in NVS under namespace `monm
 
 An on-device editor lands in M4 (BLE/SoftAP provisioning).
 
+## Postmortem logging (M2.5a)
+
+A panic on the device writes an ELF coredump to a 64 KB `coredump` flash partition. The next clean boot (after `app_wifi_init_radio()` brings up the SDMMC controller) mounts the microSD card on SDMMC slot 0 and copies the dump to `/sdcard/coredump-NNNN.elf` before doing anything that could itself crash. The flash partition is then erased so the next crash gets a fresh slot.
+
+If no SD card is inserted, the dump stays put in flash and is recovered on the first boot with a card present. Decoding host-side:
+
+```bash
+espcoredump.py info_corefile -c coredump-0001.elf build/esp_ui.elf
+```
+
+### UART console (M2.5a+)
+
+The firmware runs an `esp_console` REPL on UART0 (`monmix> ` prompt). Connect with `idf.py monitor` or any serial terminal at 115200 N81. Available commands:
+
+| Command | Source | Notes |
+|---|---|---|
+| `crash` | esp_hosted | Writes to `0` so the panic handler captures a dump. |
+| `reboot` | esp_hosted | Software reset. |
+| `mem-dump` / `task-dump` / `cpu-dump` / `heap-trace` / `sock-dump` / `host-power-save` | esp_hosted | Diagnostic. |
+| `ls [path]` | this repo | Defaults to `/sdcard`. |
+| `cat-b64 <path>` | this repo | Base64-prints a file between `===BEGIN BASE64 …===` / `===END BASE64===` markers, so a host script can extract it without picking up interleaved log lines. |
+| `coredump-b64` | this repo | Same framing, but reads the flash `coredump` partition directly — useful when SD never mounted and the dump is still in flash. |
+| `help` | esp_console | Lists all of the above. |
+
+### Verifying the pipeline end-to-end
+
+```bash
+# 1. Trigger a panic over the console.
+echo crash | <serial-terminal-of-choice> COM3
+
+# 2. After the panic, the device reboots, the boot's
+#    app_coredump_flush_to_sd() copies the dump to
+#    /sdcard/coredump-NNNN.elf, and the REPL comes back up.
+
+# 3. Pull the dump back over UART (no SD card removal needed):
+python tools/fetch_b64.py COM3 /sdcard/coredump-NNNN.elf coredump.elf
+
+# 4. Decode it against the matching ELF:
+espcoredump.py info_corefile -c coredump.elf -t raw build/esp_ui.elf
+```
+
+If the SD card is missing or failed to mount, swap step 3 for
+`python tools/fetch_b64.py COM3 coredump coredump.elf` — same script, but it
+sends `coredump-b64` to read the flash `coredump` partition directly.
+
+On the second boot you should see `app_coredump: saved <N>-byte coredump to /sdcard/coredump-0001.elf` in the serial log. Pull the SD card, copy the file off, and decode with `espcoredump.py info_corefile`.
+
 ## Milestones
 
 - **M1** (done): end-to-end vertical slice — 3 hard-coded faders read & write live over WiFi.
-- **M2** (in progress): paged UI (`lv_tileview` + page indicator) and NVS-persisted channel selection.
-- **M2.5**: postmortem logging to SD card (FATFS + coredump + WS/REST frame log) so off-bench failures are recoverable.
+- **M2** (done): paged UI (`lv_tileview` + page indicator) and NVS-persisted channel selection.
+- **M2.5a** (done): microSD bring-up + coredump persisted to `/sdcard/coredump-NNNN.elf` on boot.
+- **M2.5b**: "did we crash since last power-on?" indicator surfaced in the UI.
+- **M2.5c**: rolling WS/REST frame log to SD (only if M2.5a alone proves insufficient on stage).
 - **M3**: UX polish (mute/solo, color tags, low-light theme, meters).
 - **M4**: BLE/SoftAP provisioning.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).

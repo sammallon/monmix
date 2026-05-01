@@ -7,6 +7,9 @@ idf_component_register(
         "app_ms_client_ws.c"
         "app_display.c"
         "app_ui.c"
+        "app_storage.c"
+        "app_coredump.c"
+        "app_console.c"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES
@@ -17,4 +20,11 @@ idf_component_register(
         esp_lcd
         esp_driver_i2c
         esp_driver_ledc
+        esp_driver_sdmmc
+        sdmmc
+        fatfs
+        esp_partition
+        espcoredump
+        console
+        mbedtls
 )

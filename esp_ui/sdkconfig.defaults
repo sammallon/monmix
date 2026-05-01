@@ -63,3 +63,8 @@ CONFIG_LV_MEM_CUSTOM=y
 
 # Compiler: optimize for performance. UI + WS hot path benefits.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Panic coredump → `coredump` partition (ELF, SHA256-checksummed). On the
+# next boot, app_coredump_flush_to_sd() copies it to the microSD card and
+# erases the partition. Decode host-side with `espcoredump.py info_corefile`.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

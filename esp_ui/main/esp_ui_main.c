@@ -2,9 +2,12 @@
 #include "nvs_flash.h"
 
 #include "app_config.h"
+#include "app_console.h"
+#include "app_coredump.h"
 #include "app_display.h"
 #include "app_ms_client.h"
 #include "app_state.h"
+#include "app_storage.h"
 #include "app_ui.h"
 #include "app_wifi.h"
 
@@ -25,8 +28,21 @@ void app_main(void)
     const int  *ch_ids   = app_config_channel_ids(&ch_count);
     app_state_init(ch_ids, ch_count);
 
-    // Display + UI come up first — the screen should light up immediately,
-    // not wait on WiFi/MS. Status line shows progress thereafter.
+    // Phase 1 of WiFi: bring up the radio transport (esp_wifi_init triggers
+    // ESP-Hosted's SDIO bus to the C6 and sdmmc_host_init() runs once). This
+    // returns immediately — it does NOT wait for an SSID. We need the host
+    // controller alive before SD mount because IDF v6 only allows one host
+    // init and ESP-Hosted is the canonical owner.
+    app_wifi_init_radio();
+
+    // Persist any pending panic dump to the SD card before we do anything
+    // that could itself crash. If the card is missing, both calls log and
+    // the dump stays in the flash partition for the next boot.
+    app_storage_init();
+    app_coredump_flush_to_sd();
+
+    // Display + UI come up next — the screen should light up before we
+    // start waiting on WiFi association.
     if (!app_display_init()) {
         ESP_LOGE(TAG, "display init failed; halting");
         return;
@@ -36,8 +52,8 @@ void app_main(void)
     app_ui_init(ms);
     app_ui_set_status("Connecting WiFi...");
 
-    bool wifi_ok = app_wifi_connect();
-    if (!wifi_ok) {
+    // Phase 2 of WiFi: block until associated or retries exhausted.
+    if (!app_wifi_wait_connected()) {
         ESP_LOGW(TAG, "WiFi unavailable; UI will still render, MS client will retry");
         app_ui_set_status("WiFi unavailable — UI only");
     }
@@ -45,4 +61,11 @@ void app_main(void)
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up.
     ms->start();
+
+    // Last: bring up the UART REPL. esp_hosted has registered its diagnostic
+    // commands (`crash`, `reboot`, `mem-dump`, …) but never starts a REPL
+    // unless CONFIG_ESP_HOSTED_CLI_NEW_INSTANCE is set, which it isn't. We
+    // start one ourselves so those commands and our own (`ls`, `cat-b64`)
+    // become reachable over UART0.
+    app_console_init();
 }

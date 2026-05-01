@@ -58,7 +58,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 
-bool app_wifi_connect(void)
+void app_wifi_init_radio(void)
 {
     s_evt = xEventGroupCreate();
 
@@ -66,6 +66,10 @@ bool app_wifi_connect(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
+    // esp_wifi_init() is what causes ESP-Hosted to bring up its SDIO bus to
+    // the C6 — and as a side effect, sdmmc_host_init() runs once for the
+    // shared host controller. After this returns, slot 0 (the SD card) can
+    // be mounted with dummy host.init/deinit (see app_storage.c).
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
 
@@ -81,7 +85,10 @@ bool app_wifi_connect(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+}
 
+bool app_wifi_wait_connected(void)
+{
     EventBits_t bits = xEventGroupWaitBits(s_evt, BIT_CONNECTED | BIT_FAILED,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
     return (bits & BIT_CONNECTED) != 0;
