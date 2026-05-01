@@ -27,7 +27,12 @@ typedef struct {
 
 static SemaphoreHandle_t       s_mutex;
 static app_level_format_t      s_level_format = APP_LEVEL_FORMAT_NORM;
-static app_signal_indicator_t  s_signal_ind   = APP_SIGNAL_INDICATOR_PRESENT;
+// Default to NONE — the current "signal-present" heuristic only reflects
+// "channel is unmuted and has level set", which gives false positives in
+// MS offline mode (and on real instances when audio isn't flowing). A
+// real implementation requires subscribing to /console/metering/* and
+// parsing the binary int16 stream — see the open follow-up task.
+static app_signal_indicator_t  s_signal_ind   = APP_SIGNAL_INDICATOR_NONE;
 static color_entry_t           s_colors[MAX_COLOR_ENTRIES];
 static size_t                  s_color_count;
 

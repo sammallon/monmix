@@ -46,7 +46,11 @@ void app_touch_inject_init(void)
 void app_touch_inject_set(int x, int y, bool pressed)
 {
     if (!s_indev) return;
-    if (!lvgl_port_lock(100)) return;
+    // 1000 ms timeout — the previous 100 ms could fail when LVGL was busy
+    // with a heavy operation (settings overlay build, screenshot snapshot,
+    // dirty sweep across 12 faders). Silent drops broke run_steps.py
+    // sequences where a tap immediately followed a screenshot.
+    if (!lvgl_port_lock(1000)) return;
 
     // LVGL expects indev coordinates in the PANEL'S physical frame and
     // applies the display rotation internally to map them to logical

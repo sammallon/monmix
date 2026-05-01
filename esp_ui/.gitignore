@@ -17,11 +17,10 @@ mcp_tee.log
 *_capture.txt
 coredump-*.elf
 monmix-*.log
-screenshot*.png
-before*.png
-after*.png
-demo-*.png
-m3-*.png
+# Any PNG at the repo root is a generated screenshot artifact —
+# tools/fetch_screenshot.py and tools/run_steps.py default to writing
+# here. Subdirectories (docs/, etc.) can still hold committed images.
+/*.png
 prefs.json
 
 # Local forensic records of on-device incidents — kept for personal

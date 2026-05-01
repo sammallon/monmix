@@ -83,6 +83,18 @@ static lv_obj_t                *s_page_dots[MAX_PAGES];
 static size_t                   s_page_count;
 static const ms_client_iface_t *s_ms;
 
+// Settings overlay — declared up here so the gear button's event handler
+// can reach it. Overlay is created lazily on first open.
+static lv_obj_t *s_settings_overlay;
+static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
+static lv_obj_t *s_lvl_norm_btn;
+static lv_obj_t *s_lvl_db_btn;
+static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
+
+static void settings_open(void);
+static void settings_close(void);
+static void on_gear_clicked(lv_event_t *e);
+
 // Rate-limit outbound SETs per channel so a fast drag doesn't flood MS
 // (each SET produces a broadcast echo, doubling on-wire traffic). 50 ms
 // = 20 Hz feels live to the user but keeps the websocket task from
@@ -457,6 +469,20 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xC0C0C0), 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 8);
 
+    // Settings gear in the top-right corner of the status bar — opens the
+    // touch-driven configuration overlay defined further below.
+    lv_obj_t *gear = lv_button_create(scr);
+    lv_obj_set_size(gear, 28, 28);
+    lv_obj_align(gear, LV_ALIGN_TOP_RIGHT, -8, 2);
+    lv_obj_set_style_radius(gear, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(gear, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(gear, 0, 0);
+    lv_obj_t *gear_label = lv_label_create(gear);
+    lv_label_set_text(gear_label, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_color(gear_label, lv_color_hex(0xC0C0C0), 0);
+    lv_obj_center(gear_label);
+    lv_obj_add_event_cb(gear, on_gear_clicked, LV_EVENT_CLICKED, NULL);
+
     // Tileview holds one tile per page. Horizontal swipe between pages.
     s_tileview = lv_tileview_create(scr);
     lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
@@ -509,4 +535,230 @@ void app_ui_init(const ms_client_iface_t *ms)
 
     ESP_LOGI(TAG, "UI mounted: %u faders across %u page(s)",
              (unsigned)total, (unsigned)s_page_count);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Settings overlay — touch-driven configuration of the prefs that today
+// only have console commands (level format, signal indicator, channel
+// colors). Built lazily on first gear-icon tap; subsequent opens reuse
+// the same overlay and re-sync visible state from app_prefs.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void on_gear_clicked(lv_event_t *e)
+{
+    (void) e;
+    settings_open();
+}
+
+static void on_close_clicked(lv_event_t *e)
+{
+    (void) e;
+    settings_close();
+}
+
+static void update_radio_visuals(lv_obj_t **buttons, size_t count, size_t selected)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (i == selected) lv_obj_add_state   (buttons[i], LV_STATE_CHECKED);
+        else               lv_obj_remove_state(buttons[i], LV_STATE_CHECKED);
+    }
+}
+
+static void on_lvl_norm_clicked(lv_event_t *e)
+{
+    (void) e;
+    app_prefs_set_level_format(APP_LEVEL_FORMAT_NORM);
+    lv_obj_t *btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
+    update_radio_visuals(btns, 2, 0);
+}
+
+static void on_lvl_db_clicked(lv_event_t *e)
+{
+    (void) e;
+    app_prefs_set_level_format(APP_LEVEL_FORMAT_DB);
+    lv_obj_t *btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
+    update_radio_visuals(btns, 2, 1);
+}
+
+static void on_sig_clicked(lv_event_t *e)
+{
+    int which = (int)(uintptr_t) lv_event_get_user_data(e);
+    app_prefs_set_signal_indicator((app_signal_indicator_t) which);
+    update_radio_visuals(s_sig_buttons, 3, (size_t) which);
+}
+
+// Tap a swatch → cycle to the next palette index (-1 = no color, 0..7 =
+// palette entries). Applies via app_prefs which fires on_prefs_change and
+// the dirty sweep, recolouring the slider in real time.
+static void on_swatch_clicked(lv_event_t *e)
+{
+    size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
+    int    cur = -1;
+    int    ch_id = app_state_id_for_idx(idx);
+    if (ch_id >= 0) cur = app_prefs_get_channel_color(ch_id);
+    int next = cur + 1;
+    if (next > 7) next = -1;
+    if (ch_id >= 0) app_prefs_set_channel_color(ch_id, next);
+
+    // Update the swatch visual itself — apply_pending only repaints the
+    // fader sliders, not anything inside the settings overlay.
+    lv_obj_t *swatch = (lv_obj_t *) lv_event_get_target(e);
+    if (next < 0) {
+        lv_obj_set_style_bg_color(swatch, lv_color_hex(0x303030), 0);
+    } else {
+        lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_PALETTE[next]), 0);
+    }
+}
+
+static lv_obj_t *make_radio_button(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *btn = lv_button_create(parent);
+    // Default (unchecked) is muted; CHECKED uses our accent green so the
+    // active option reads at a glance. The dark-theme default styled
+    // unchecked and checked the same blue, which made the radios look
+    // ambiguous on a screenshot.
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x303744), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x40C060), LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0xC0C0C0), LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0x101010), LV_STATE_CHECKED);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void build_settings_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *ov = lv_obj_create(scr);
+    lv_obj_set_size(ov, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 16, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    s_settings_overlay = ov;
+
+    // Title bar.
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "Settings");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(ov);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_close_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Section: Level Format
+    lv_obj_t *lvl_label = lv_label_create(ov);
+    lv_label_set_text(lvl_label, "Level Format");
+    lv_obj_align(lvl_label, LV_ALIGN_TOP_LEFT, 0, 56);
+
+    s_lvl_norm_btn = make_radio_button(ov, "0..100");
+    lv_obj_set_size(s_lvl_norm_btn, 120, 44);
+    lv_obj_align(s_lvl_norm_btn, LV_ALIGN_TOP_LEFT, 180, 50);
+    lv_obj_add_event_cb(s_lvl_norm_btn, on_lvl_norm_clicked, LV_EVENT_CLICKED, NULL);
+
+    s_lvl_db_btn = make_radio_button(ov, "dB");
+    lv_obj_set_size(s_lvl_db_btn, 120, 44);
+    lv_obj_align(s_lvl_db_btn, LV_ALIGN_TOP_LEFT, 312, 50);
+    lv_obj_add_event_cb(s_lvl_db_btn, on_lvl_db_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Section: Signal Indicator
+    lv_obj_t *sig_label = lv_label_create(ov);
+    lv_label_set_text(sig_label, "Signal Indicator");
+    lv_obj_align(sig_label, LV_ALIGN_TOP_LEFT, 0, 116);
+
+    static const char *sig_text[3] = { "Off", "Signal", "Meter" };
+    for (int i = 0; i < 3; ++i) {
+        s_sig_buttons[i] = make_radio_button(ov, sig_text[i]);
+        lv_obj_set_size(s_sig_buttons[i], 120, 44);
+        lv_obj_align(s_sig_buttons[i], LV_ALIGN_TOP_LEFT, 180 + i * 132, 110);
+        lv_obj_add_event_cb(s_sig_buttons[i], on_sig_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+    }
+
+    // Section: Channel Colors — 6 rows × 2 columns
+    lv_obj_t *col_label = lv_label_create(ov);
+    lv_label_set_text(col_label, "Channel Colors");
+    lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 176);
+
+    const int col_w     = 460;
+    const int row_h     = 50;
+    const int swatch_sz = 32;
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        app_channel_t ch;
+        if (!app_state_get(i, &ch)) continue;
+        int col = (int)(i / 6);
+        int row = (int)(i % 6);
+        int x = 8 + col * (col_w + 16);
+        int y = 210 + row * row_h;
+
+        lv_obj_t *row_obj = lv_obj_create(ov);
+        lv_obj_set_size(row_obj, col_w, row_h - 6);
+        lv_obj_set_pos(row_obj, x, y);
+        lv_obj_set_style_radius(row_obj, 6, 0);
+        lv_obj_set_style_pad_all(row_obj, 8, 0);
+        lv_obj_clear_flag(row_obj, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name = lv_label_create(row_obj);
+        lv_label_set_text(name, ch.name);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_obj_t *swatch = lv_obj_create(row_obj);
+        lv_obj_set_size(swatch, swatch_sz, swatch_sz);
+        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_set_style_radius(swatch, 6, 0);
+        lv_obj_set_style_border_width(swatch, 1, 0);
+        lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
+        lv_obj_clear_flag(swatch, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(swatch, on_swatch_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+        s_color_swatches[i] = swatch;
+    }
+}
+
+static void settings_refresh_state(void)
+{
+    lv_obj_t *lvl_btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
+    update_radio_visuals(lvl_btns, 2,
+                         app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB ? 1 : 0);
+    update_radio_visuals(s_sig_buttons, 3,
+                         (size_t) app_prefs_get_signal_indicator());
+
+    // Refresh swatches from app_prefs.
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        if (!s_color_swatches[i]) continue;
+        int ch_id = app_state_id_for_idx(i);
+        int color = (ch_id >= 0) ? app_prefs_get_channel_color(ch_id) : -1;
+        if (color < 0) {
+            lv_obj_set_style_bg_color(s_color_swatches[i], lv_color_hex(0x303030), 0);
+        } else {
+            lv_obj_set_style_bg_color(s_color_swatches[i],
+                                      lv_color_hex(COLOR_PALETTE[color]), 0);
+        }
+    }
+}
+
+static void settings_open(void)
+{
+    if (!s_settings_overlay) {
+        build_settings_overlay();
+    }
+    settings_refresh_state();
+    lv_obj_remove_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_settings_overlay);
+}
+
+static void settings_close(void)
+{
+    if (s_settings_overlay) {
+        lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
 }
