@@ -8,18 +8,22 @@ managed_components/
 sdkconfig
 sdkconfig.old
 
-# Session-scoped log captures (build_log.txt, flash_log.txt, serial_log.txt,
-# serial_capture.txt, console_capture.txt), coredumps pulled off-device,
-# runtime monmix-NNNN.log files fetched via tools/fetch_b64.py, and
-# screenshots fetched via tools/fetch_screenshot.py.
+# Per-session dev artifacts — screenshots fetched via
+# tools/fetch_screenshot.py and tools/run_steps.py land in tmp/screenshots/,
+# log captures (build_log.txt, flash_log.txt, serial_log.txt,
+# serial_capture.txt, console_capture.txt, mcp_tee.log), coredumps pulled
+# off-device, and runtime monmix-NNNN.log files fetched via
+# tools/fetch_b64.py land in tmp/logs/.
+tmp/
+# Belt-and-braces: also ignore these patterns anywhere in the tree, in
+# case a tool or a stale invocation drops them outside tmp/.
 mcp_tee.log
 *_log.txt
 *_capture.txt
 coredump-*.elf
 monmix-*.log
-# Any PNG at the repo root is a generated screenshot artifact —
-# tools/fetch_screenshot.py and tools/run_steps.py default to writing
-# here. Subdirectories (docs/, etc.) can still hold committed images.
+# Any PNG at the repo root is a generated screenshot artifact.
+# Subdirectories (docs/, etc.) can still hold committed images.
 /*.png
 prefs.json
 

@@ -121,6 +121,8 @@ echo "touch X Y tap" | <serial-terminal>                # drive input
 python tools/fetch_screenshot.py COM3 after.png        # confirm state changed
 ```
 
+Bare-filename outputs land in `tmp/screenshots/` (gitignored). Pass an absolute path or any path with separators to override. The same default applies to `tools/run_steps.py` (`shot:NAME` → `tmp/screenshots/NAME.png`) and to `tools/fetch_b64.py` (bare local-out → `tmp/logs/`). Coredump ELFs and `monmix-NNNN.log` files pulled with `fetch_b64.py` therefore default to `tmp/logs/`.
+
 ### Verifying the pipeline end-to-end
 
 ```bash

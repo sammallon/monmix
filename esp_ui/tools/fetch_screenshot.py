@@ -12,7 +12,12 @@ flags bit 0 = zlib-compressed payload (currently always set).
 
 Usage:
     python tools/fetch_screenshot.py COM3 out.png
+
+A bare filename (no directory component) is written to `tmp/screenshots/`
+relative to the repo root. Pass an absolute path or a path with separators
+to override that default.
 """
+import os
 import struct
 import sys
 import time
@@ -21,8 +26,27 @@ import zlib
 import serial
 import serial.serialutil
 
+
+# Repo root is two levels up from this file (tools/ → repo/).
+_REPO_ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_SHOT_DIR = os.path.join(_REPO_ROOT, "tmp", "screenshots")
+
+
+def resolve_shot_path(name):
+    """Map a user-supplied output name onto the screenshots dir if it's bare.
+
+    Returns the path unchanged when the caller passed a real path (absolute
+    or with a separator). Otherwise prepends the default tmp/screenshots/
+    folder, creating it if needed.
+    """
+    if os.path.isabs(name) or os.path.dirname(name):
+        return name
+    os.makedirs(DEFAULT_SHOT_DIR, exist_ok=True)
+    return os.path.join(DEFAULT_SHOT_DIR, name)
+
+
 PORT     = sys.argv[1] if len(sys.argv) > 1 else "COM3"
-OUT_PATH = sys.argv[2] if len(sys.argv) > 2 else "screenshot.png"
+OUT_PATH = resolve_shot_path(sys.argv[2] if len(sys.argv) > 2 else "screenshot.png")
 
 import re
 import base64

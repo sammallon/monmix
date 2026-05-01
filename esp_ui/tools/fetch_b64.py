@@ -10,8 +10,13 @@ extracts the bytes between the `===BEGIN BASE64 ...===` /
 Usage:
     python tools/fetch_b64.py COM3 /sdcard/coredump-0007.elf  out.elf
     python tools/fetch_b64.py COM3 coredump                   out.elf
+
+A bare local-out filename (no directory component) is written to
+`tmp/logs/` relative to the repo root. Pass an absolute path or a path
+with separators to override that default.
 """
 import base64
+import os
 import re
 import sys
 import time
@@ -22,9 +27,23 @@ import serial.serialutil
 if len(sys.argv) < 4:
     sys.exit("usage: fetch_b64.py <port> <remote-path-or-'coredump'> <local-out>")
 
+
+# Repo root is two levels up from this file (tools/ → repo/).
+_REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_LOG_DIR = os.path.join(_REPO_ROOT, "tmp", "logs")
+
+
+def resolve_local_out(name):
+    """Map a bare filename onto tmp/logs/, leaving real paths untouched."""
+    if os.path.isabs(name) or os.path.dirname(name):
+        return name
+    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+    return os.path.join(DEFAULT_LOG_DIR, name)
+
+
 PORT       = sys.argv[1]
 REMOTE     = sys.argv[2]
-LOCAL_OUT  = sys.argv[3]
+LOCAL_OUT  = resolve_local_out(sys.argv[3])
 REPLY_WAIT = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
 
 BEGIN_RE = re.compile(rb"===BEGIN BASE64 (\S+) SIZE (\d+) ===")

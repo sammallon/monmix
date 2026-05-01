@@ -17,8 +17,13 @@ Example — open settings, switch to dB, capture before/after, close:
 Screenshots are tagged with the supplied NAME (no extension) and use the
 same RGB565+deflate+base64 pipeline as `fetch_screenshot.py`, just inlined
 here so a single port-open serves the whole sequence.
+
+A bare NAME (no directory component) is written to `tmp/screenshots/`
+relative to the repo root. Pass an absolute path or a path with separators
+in NAME to override that default.
 """
 import base64
+import os
 import re
 import struct
 import sys
@@ -33,6 +38,24 @@ if len(sys.argv) < 3:
 
 PORT  = sys.argv[1]
 STEPS = sys.argv[2:]
+
+
+# Repo root is two levels up from this file (tools/ → repo/).
+_REPO_ROOT       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_SHOT_DIR = os.path.join(_REPO_ROOT, "tmp", "screenshots")
+
+
+def resolve_shot_path(name):
+    """Map a `shot:NAME` value onto tmp/screenshots/NAME.png if it's bare.
+
+    Returns an absolute path. If NAME has a directory component or is
+    already absolute, it's used as-is (with `.png` appended).
+    """
+    out = name + ".png"
+    if os.path.isabs(out) or os.path.dirname(out):
+        return out
+    os.makedirs(DEFAULT_SHOT_DIR, exist_ok=True)
+    return os.path.join(DEFAULT_SHOT_DIR, out)
 
 BAUD = 921600
 
@@ -116,7 +139,7 @@ def screenshot(ser, name):
             out[o + 1] = (g << 2) | (g >> 4)
             out[o + 2] = (b << 3) | (b >> 2)
     img = Image.frombytes("RGB", (w, h), bytes(out))
-    out_path = name + ".png"
+    out_path = resolve_shot_path(name)
     img.save(out_path)
     print(f"  → saved {out_path} ({w}×{h}, {clen} comp)")
 
