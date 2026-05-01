@@ -102,8 +102,21 @@ The firmware runs an `esp_console` REPL on UART0 (`monmix> ` prompt). Connect wi
 | `ls [path]` | this repo | Defaults to `/sdcard`. |
 | `cat-b64 <path>` | this repo | Base64-prints a file between `===BEGIN BASE64 …===` / `===END BASE64===` markers, so a host script can extract it without picking up interleaved log lines. |
 | `coredump-b64` | this repo | Same framing, but reads the flash `coredump` partition directly — useful when SD never mounted and the dump is still in flash. |
+| `screenshot` | this repo | Captures the LVGL screen as RGB565, deflate-compresses (≈80× ratio on solid-color UIs), base64-streams it. Decoded by `tools/fetch_screenshot.py` to PNG. |
+| `touch <x> <y> [tap\|down\|up]` | this repo | Drives a virtual LVGL pointer indev. Coordinates are LVGL logical pixels — the same frame as the `screenshot` PNG, so what you see is what you tap. |
 | `log-trace [on\|off]` | this repo | Query or toggle the disk-logger's TRACE gate. Persisted in NVS; survives reboots. |
 | `help` | esp_console | Lists all of the above. |
+
+### Closed dev loop
+
+`screenshot` + `touch` give a host-driven UI verification loop without needing a finger on the panel:
+
+```bash
+python tools/fetch_screenshot.py COM3 before.png       # capture state
+# eyeball the PNG, find a button at (x, y) in logical coords
+echo "touch X Y tap" | <serial-terminal>                # drive input
+python tools/fetch_screenshot.py COM3 after.png        # confirm state changed
+```
 
 ### Verifying the pipeline end-to-end
 

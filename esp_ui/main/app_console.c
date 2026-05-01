@@ -17,8 +17,12 @@
 #include "mbedtls/base64.h"
 #include "miniz.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "app_logd.h"
 #include "app_storage.h"
+#include "app_touch_inject.h"
 
 static const char *TAG = "app_console";
 
@@ -316,6 +320,45 @@ static int cmd_screenshot(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `touch <x> <y> [tap|down|up]` — drive synthetic touches into LVGL via the
+// virtual indev registered by app_touch_inject. Coordinates are LVGL
+// logical pixels (same frame as `screenshot` output).
+//   tap (default): press, hold for one LVGL refresh, release.
+//   down:          press and hold (until subsequent `up`).
+//   up:            release at the last position.
+// ─────────────────────────────────────────────────────────────────────────
+
+#define TOUCH_TAP_HOLD_MS  80   // ≥ one LVGL refresh tick at default 33 ms
+
+static int cmd_touch(int argc, char **argv)
+{
+    if (argc < 3) {
+        printf("usage: touch <x> <y> [tap|down|up]\n");
+        return 1;
+    }
+    int x = atoi(argv[1]);
+    int y = atoi(argv[2]);
+    const char *action = (argc >= 4) ? argv[3] : "tap";
+
+    if (strcmp(action, "tap") == 0) {
+        app_touch_inject_set(x, y, true);
+        vTaskDelay(pdMS_TO_TICKS(TOUCH_TAP_HOLD_MS));
+        app_touch_inject_set(x, y, false);
+        printf("tap at (%d, %d)\n", x, y);
+    } else if (strcmp(action, "down") == 0) {
+        app_touch_inject_set(x, y, true);
+        printf("down at (%d, %d)\n", x, y);
+    } else if (strcmp(action, "up") == 0) {
+        app_touch_inject_set(x, y, false);
+        printf("up at (%d, %d)\n", x, y);
+    } else {
+        printf("usage: touch <x> <y> [tap|down|up]\n");
+        return 1;
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -351,6 +394,7 @@ void app_console_init(void)
         { .command = "cat-b64",      .help = "base64-print a file framed with markers",       .func = cmd_cat_b64      },
         { .command = "coredump-b64", .help = "base64-print the flash coredump partition",     .func = cmd_coredump_b64 },
         { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI",   .func = cmd_screenshot   },
+        { .command = "touch",        .help = "<x> <y> [tap|down|up] — synthetic LVGL touch",  .func = cmd_touch        },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {

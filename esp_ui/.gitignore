@@ -17,8 +17,10 @@ mcp_tee.log
 *_capture.txt
 coredump-*.elf
 monmix-*.log
-screenshot.png
-screenshot-*.png
+screenshot*.png
+before*.png
+after*.png
+demo-*.png
 
 # Local forensic records of on-device incidents — kept for personal
 # reference but never pushed (may include local IPs / network details).

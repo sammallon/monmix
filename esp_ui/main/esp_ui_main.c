@@ -9,6 +9,7 @@
 #include "app_ms_client.h"
 #include "app_state.h"
 #include "app_storage.h"
+#include "app_touch_inject.h"
 #include "app_ui.h"
 #include "app_wifi.h"
 
@@ -65,6 +66,10 @@ void app_main(void)
         ESP_LOGE(TAG, "display init failed; halting");
         return;
     }
+
+    // Virtual touch indev for the `touch` console command. Must come
+    // after app_display_init brings up LVGL.
+    app_touch_inject_init();
 
     const ms_client_iface_t *ms = app_ms_client_ws();
     app_ui_init(ms);
