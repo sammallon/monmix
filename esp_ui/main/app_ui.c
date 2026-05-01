@@ -10,8 +10,12 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <time.h>
+
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_netif_sntp.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 
@@ -60,6 +64,10 @@ typedef struct {
 
 #define SIGNAL_DOT_SIZE     10
 #define DEFAULT_SLIDER_HEX  0x4080E0   // medium blue when no per-channel color set
+// Mid-grey for the "no color set" swatch and the picker's clear cell. 0x808080
+// reads as a neutral indicator on both dark and light themes (the previous
+// 0x303030 blended into the dark-theme row backgrounds).
+#define NO_COLOR_SWATCH_HEX 0x808080
 
 // 8-color palette for the per-channel color tag — see app_prefs / set-color.
 // Roughly evenly spaced around the hue wheel; chose hex values that read
@@ -685,7 +693,7 @@ static void on_picker_choice(lv_event_t *e)
     lv_obj_t *swatch = s_color_swatches[s_picker_target_idx];
     if (swatch) {
         if (color < 0) {
-            lv_obj_set_style_bg_color(swatch, lv_color_hex(0x303030), 0);
+            lv_obj_set_style_bg_color(swatch, lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
         } else {
             lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_PALETTE[color]), 0);
         }
@@ -859,7 +867,7 @@ static void settings_refresh_state(void)
         int ch_id = app_state_id_for_idx(i);
         int color = (ch_id >= 0) ? app_prefs_get_channel_color(ch_id) : -1;
         if (color < 0) {
-            lv_obj_set_style_bg_color(s_color_swatches[i], lv_color_hex(0x303030), 0);
+            lv_obj_set_style_bg_color(s_color_swatches[i], lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
         } else {
             lv_obj_set_style_bg_color(s_color_swatches[i],
                                       lv_color_hex(COLOR_PALETTE[color]), 0);
@@ -946,7 +954,7 @@ static void build_picker_popup(void)
             // 9th cell — clear / no color. Render with a × glyph so it reads
             // as "remove" rather than "another shade of grey".
             color_idx = -1;
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x303030), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
             lv_obj_t *x_lbl = lv_label_create(btn);
             lv_label_set_text(x_lbl, LV_SYMBOL_CLOSE);
             lv_obj_center(x_lbl);
@@ -1033,12 +1041,64 @@ static void wifi_panel_refresh(void)
 
 // Async trampoline for state changes — the wifi event task can't touch LVGL
 // directly, so we ride lv_async_call into the LVGL task.
+// Clock — replaces the centered status text once SNTP has produced a real
+// time. America/Los_Angeles is hardcoded for now; revisit if the device
+// ever leaves the West Coast.
+static lv_timer_t *s_clock_timer;
+static bool        s_sntp_started;
+
+static void clock_tick(lv_timer_t *t)
+{
+    (void) t;
+    if (!s_status_label) return;
+    time_t    now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    if (lt.tm_year < (2024 - 1900)) {
+        // SNTP hasn't returned yet — show a placeholder so the user sees
+        // the slot exists but knows time isn't available.
+        lv_label_set_text(s_status_label, "--:-- --");
+        return;
+    }
+    char buf[16];
+    // %l = space-padded hour, no leading zero (matches typical 12-hour
+    // wall-clock formatting).
+    strftime(buf, sizeof(buf), "%l:%M %p", &lt);
+    const char *p = (buf[0] == ' ') ? buf + 1 : buf;
+    lv_label_set_text(s_status_label, p);
+}
+
+static void start_clock_once(void)
+{
+    if (s_sntp_started) return;
+    s_sntp_started = true;
+
+    // POSIX TZ for America/Los_Angeles with US DST rules. Stored statically
+    // so setenv's reference outlives the call.
+    setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+    tzset();
+
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_netif_sntp_init(&cfg);
+
+    if (!s_clock_timer) {
+        s_clock_timer = lv_timer_create(clock_tick, 1000, NULL);
+        lv_timer_ready(s_clock_timer);  // run once now so the placeholder appears
+    }
+}
+
 static void wifi_apply_async(void *unused)
 {
     (void)unused;
     wifi_icon_refresh();
     if (s_wifi_panel && !lv_obj_has_flag(s_wifi_panel, LV_OBJ_FLAG_HIDDEN)) {
         wifi_panel_refresh();
+    }
+    // SNTP requires a working route; kick it once the first time wifi
+    // reaches CONNECTED. The clock label takes over from the boot status
+    // text (which was last set to "Connecting WiFi...") at the same time.
+    if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED) {
+        start_clock_once();
     }
 }
 
@@ -1097,7 +1157,7 @@ static void build_wifi_panel(void)
     }
 
     lv_obj_t *note = lv_label_create(p);
-    lv_label_set_text(note, "Editing comes in a follow-up — needs on-screen keyboard");
+    lv_label_set_text(note, "Editing comes in a follow-up - needs on-screen keyboard");
     lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 }
 
@@ -1243,7 +1303,7 @@ static void build_ms_panel(void)
     }
 
     lv_obj_t *note = lv_label_create(p);
-    lv_label_set_text(note, "Editing comes in a follow-up — needs on-screen keyboard");
+    lv_label_set_text(note, "Editing comes in a follow-up - needs on-screen keyboard");
     lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 }
 
