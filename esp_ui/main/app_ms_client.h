@@ -8,6 +8,7 @@
 typedef struct {
     bool (*start)(void);
     void (*set_level)(int ms_channel_id, float level);
+    void (*set_mute) (int ms_channel_id, bool mute);
     void (*stop)(void);
 } ms_client_iface_t;
 

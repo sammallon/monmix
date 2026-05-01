@@ -35,6 +35,7 @@ static esp_websocket_client_handle_t s_ws;
 
 static bool ws_start(void);
 static void ws_set_level(int ms_channel_id, float level);
+static void ws_set_mute (int ms_channel_id, bool mute);
 static void ws_stop(void);
 static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data);
 static void send_envelope(const char *method, const char *path, const char *body_json);
@@ -45,6 +46,7 @@ static void handle_broadcast(const char *json, size_t len);
 static const ms_client_iface_t s_iface = {
     .start     = ws_start,
     .set_level = ws_set_level,
+    .set_mute  = ws_set_mute,
     .stop      = ws_stop,
 };
 
@@ -103,6 +105,25 @@ static void ws_set_level(int ms_channel_id, float level)
     send_envelope("POST", path, body);
 }
 
+static void ws_set_mute(int ms_channel_id, bool mute)
+{
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) {
+        ESP_LOGW(TAG, "set_mute dropped: ws not connected");
+        return;
+    }
+
+    char path[80];
+    snprintf(path, sizeof(path),
+             "/console/data/set/ch.%d.levelData.%d.on/val",
+             ms_channel_id, APP_MS_MIX_BUS);
+
+    // MS `.on` is a bool: true = audible (NOT muted), false = muted. We
+    // expose `mute` to the rest of the firmware as the user-facing boolean
+    // (true = "this channel is silenced"), so flip it on the wire.
+    const char *body = mute ? "{\"value\":false}" : "{\"value\":true}";
+    send_envelope("POST", path, body);
+}
+
 static void ws_stop(void)
 {
     if (s_ws) {
@@ -137,9 +158,9 @@ static void subscribe_path(const char *dotted, const char *format)
 
 static void on_connected_subscribe_all(void)
 {
-    // For each tracked channel, subscribe to its fader (norm 0..1) and its
-    // scribble strip name. The initial-value broadcasts populate app_state
-    // before the user touches anything.
+    // For each tracked channel, subscribe to its fader (norm 0..1), scribble
+    // strip name, and mute state. The initial-value broadcasts populate
+    // app_state before the user touches anything.
     for (size_t i = 0; i < app_state_count(); ++i) {
         int ch_id = app_state_id_for_idx(i);
         if (ch_id < 0) continue;
@@ -150,6 +171,10 @@ static void on_connected_subscribe_all(void)
         subscribe_path(dotted, "norm");
 
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", ch_id);
+        subscribe_path(dotted, "val");
+
+        snprintf(dotted, sizeof(dotted),
+                 "ch.%d.levelData.%d.on", ch_id, APP_MS_MIX_BUS);
         subscribe_path(dotted, "val");
     }
     ESP_LOGI(TAG, "subscribed %d channels", (int)app_state_count());
@@ -192,6 +217,19 @@ static void handle_broadcast(const char *json, size_t len)
         int idx = app_state_idx_for_id(ch);
         if (idx >= 0) {
             app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (sscanf(dotted, "ch.%d.levelData.%d.on", &ch, &mix) == 2 &&
+        mix == APP_MS_MIX_BUS && cJSON_IsBool(jvalue)) {
+        int idx = app_state_idx_for_id(ch);
+        if (idx >= 0) {
+            // MS `.on` true = audible, false = muted. Flip to our user-facing
+            // mute boolean (true = "this channel is silenced").
+            bool ms_on = cJSON_IsTrue(jvalue);
+            app_state_set_mute((size_t)idx, !ms_on, true);
         }
         cJSON_Delete(root);
         return;

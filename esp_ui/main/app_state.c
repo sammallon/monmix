@@ -23,6 +23,7 @@ void app_state_init(const int *ids, size_t count)
         // Show "ch N+1" placeholder until the scribble strip name arrives.
         snprintf(s_channels[i].name, sizeof(s_channels[i].name), "ch %d", ids[i] + 1);
         s_channels[i].level = 0.0f;
+        s_channels[i].mute  = false;
     }
 }
 
@@ -64,6 +65,19 @@ void app_state_set_name(size_t idx, const char *name, bool notify)
     xSemaphoreGive(s_mutex);
 
     if (notify && s_on_change) {
+        s_on_change(idx, s_on_change_ctx);
+    }
+}
+
+void app_state_set_mute(size_t idx, bool mute, bool notify)
+{
+    if (idx >= s_count) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = (s_channels[idx].mute != mute);
+    s_channels[idx].mute = mute;
+    xSemaphoreGive(s_mutex);
+
+    if (notify && changed && s_on_change) {
         s_on_change(idx, s_on_change_ctx);
     }
 }

@@ -33,7 +33,15 @@ static const char *TAG = "app_ui";
 #define FADER_BOX_H         500
 #define FADER_BOX_PAD       8
 #define SLIDER_W            28
-#define SLIDER_H            420
+// Slider is centered in the box. Vertical budget within the 484 px inner
+// area, top-to-bottom: name label (~20) + slider (340, centered) + mute
+// button (32 at bottom-mid offset -28) + value label (~20 at bottom).
+// 340 keeps the slider's bottom edge clear of the mute button — at 380 the
+// slider knob (when level=0, knob at bottom of track) was hidden under the
+// mute button.
+#define SLIDER_H            340
+#define MUTE_BTN_W          50
+#define MUTE_BTN_H          32
 #define DOT_SIZE            12
 #define DOT_GAP             10
 
@@ -41,6 +49,7 @@ typedef struct {
     lv_obj_t *slider;
     lv_obj_t *label_name;
     lv_obj_t *label_val;
+    lv_obj_t *btn_mute;
 } fader_widgets_t;
 
 static fader_widgets_t          s_widgets[APP_CONFIG_MAX_CHANNELS];
@@ -130,6 +139,24 @@ static void on_slider_released(lv_event_t *e)
     send_level_now(idx, (float)v / 100.0f);
 }
 
+static void on_mute_toggled(lv_event_t *e)
+{
+    size_t    idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    bool      muted = lv_obj_has_state(btn, LV_STATE_CHECKED);
+
+    int ch_id = app_state_id_for_idx(idx);
+    APP_LOGD_I("app_ui", "mute idx=%u ch=%d -> %d",
+               (unsigned) idx, ch_id, (int) muted);
+    if (s_ms && s_ms->set_mute && ch_id >= 0) {
+        s_ms->set_mute(ch_id, muted);
+    }
+    // Update local state without notifying — the UI already reflects it.
+    // The MS broadcast echo will arrive shortly and reconfirm via the dirty
+    // sweep; that's the canonical state.
+    app_state_set_mute(idx, muted, false);
+}
+
 // Inbound updates from the WS task are coalesced via a per-channel dirty
 // flag plus a single in-flight async sweep. The sweep, running under LVGL's
 // task, reads each channel's latest state and applies it to the widgets.
@@ -169,6 +196,10 @@ static void apply_pending(void *unused)
         snprintf(buf, sizeof(buf), "%d", v);
         lv_label_set_text(s_widgets[i].label_val, buf);
         lv_label_set_text(s_widgets[i].label_name, ch.name);
+        if (s_widgets[i].btn_mute) {
+            if (ch.mute) lv_obj_add_state   (s_widgets[i].btn_mute, LV_STATE_CHECKED);
+            else         lv_obj_remove_state(s_widgets[i].btn_mute, LV_STATE_CHECKED);
+        }
     }
 }
 
@@ -241,6 +272,22 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_add_event_cb(slider, on_slider_released, LV_EVENT_RELEASED,
                         (void *)(uintptr_t)idx);
     s_widgets[idx].slider = slider;
+
+    lv_obj_t *btn_mute = lv_button_create(box);
+    lv_obj_add_flag(btn_mute, LV_OBJ_FLAG_CHECKABLE);
+    lv_obj_set_size(btn_mute, MUTE_BTN_W, MUTE_BTN_H);
+    lv_obj_align(btn_mute, LV_ALIGN_BOTTOM_MID, 0, -28);
+    // Visible "muted" state — saturated red so a glance distinguishes the
+    // silenced channels from the live ones in stage lighting.
+    lv_obj_set_style_bg_color(btn_mute, lv_color_hex(0xC00000), LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(btn_mute, lv_color_hex(0x303030), LV_STATE_DEFAULT);
+    lv_obj_t *btn_label = lv_label_create(btn_mute);
+    lv_label_set_text(btn_label, "MUTE");
+    lv_obj_center(btn_label);
+    lv_obj_add_event_cb(btn_mute, on_mute_toggled, LV_EVENT_VALUE_CHANGED,
+                        (void *)(uintptr_t)idx);
+    s_widgets[idx].btn_mute = btn_mute;
+    if (ch.mute) lv_obj_add_state(btn_mute, LV_STATE_CHECKED);
 
     lv_obj_t *val = lv_label_create(box);
     lv_label_set_text(val, "0");
