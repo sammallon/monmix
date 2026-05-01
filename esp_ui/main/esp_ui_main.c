@@ -5,6 +5,7 @@
 #include "app_console.h"
 #include "app_coredump.h"
 #include "app_display.h"
+#include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_state.h"
 #include "app_storage.h"
@@ -53,6 +54,10 @@ void app_main(void)
     // the dump stays in the flash partition for the next boot.
     app_storage_init();
     app_coredump_flush_to_sd();
+
+    // Disk-log starts here — once SD is up, every subsequent step gets
+    // its WiFi/WS/UI events recorded. No-op if SD didn't mount.
+    app_logd_init();
 
     // Display + UI come up next — the screen should light up before we
     // start waiting on WiFi association.

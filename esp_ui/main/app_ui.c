@@ -1,4 +1,5 @@
 #include "app_ui.h"
+#include "app_logd.h"
 #include "app_state.h"
 
 #include <stdio.h>
@@ -88,6 +89,8 @@ static void send_level_now(size_t idx, float level)
 {
     int ch_id = app_state_id_for_idx(idx);
     if (s_ms && ch_id >= 0) {
+        APP_LOGD_T("app_ui", "fader idx=%u ch=%d -> %.3f",
+                   (unsigned) idx, ch_id, (double) level);
         s_ms->set_level(ch_id, level);
     }
     s_last_send_ms[idx] = (uint32_t)(esp_timer_get_time() / 1000);

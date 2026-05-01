@@ -1,4 +1,5 @@
 #include "app_wifi.h"
+#include "app_logd.h"
 #include "app_ui.h"
 #include "secrets.h"
 
@@ -34,6 +35,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             ++s_retry;
             ESP_LOGW(TAG, "disconnect (reason=%d), retry %d/%d in %d ms",
                      e ? e->reason : -1, s_retry, MAX_RETRIES, RETRY_BACKOFF_MS);
+            APP_LOGD_W("app_wifi", "disconnect reason=%d retry=%d/%d",
+                       e ? e->reason : -1, s_retry, MAX_RETRIES);
             snprintf(buf, sizeof(buf), "WiFi: retry %d/%d (reason %d)",
                      s_retry, MAX_RETRIES, e ? e->reason : -1);
             app_ui_set_status(buf);
@@ -42,6 +45,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         } else {
             ESP_LOGE(TAG, "wifi connect exhausted retries (last reason=%d)",
                      e ? e->reason : -1);
+            APP_LOGD_E("app_wifi", "retries exhausted, last reason=%d",
+                       e ? e->reason : -1);
             snprintf(buf, sizeof(buf), "WiFi failed (reason %d)",
                      e ? e->reason : -1);
             app_ui_set_status(buf);
@@ -50,6 +55,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&evt->ip_info.ip));
+        APP_LOGD_I("app_wifi", "got ip " IPSTR, IP2STR(&evt->ip_info.ip));
         char buf[64];
         snprintf(buf, sizeof(buf), "WiFi: " IPSTR, IP2STR(&evt->ip_info.ip));
         app_ui_set_status(buf);

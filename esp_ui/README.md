@@ -55,6 +55,7 @@ esp_ui/
 │   ├── app_storage.[ch]         microSD mount on SDMMC slot 0 (M2.5a)
 │   ├── app_coredump.[ch]        flush flash coredump → SD on boot (M2.5a)
 │   ├── app_console.[ch]         UART REPL (M2.5a) — ls, cat-b64, coredump-b64
+│   ├── app_logd.[ch]            rolling SD log: WS/wifi/UI events + heartbeat (M2.5c)
 │   └── pytest_esp_ui.py         host-side smoke tests
 └── README.md
 ```
@@ -101,6 +102,7 @@ The firmware runs an `esp_console` REPL on UART0 (`monmix> ` prompt). Connect wi
 | `ls [path]` | this repo | Defaults to `/sdcard`. |
 | `cat-b64 <path>` | this repo | Base64-prints a file between `===BEGIN BASE64 …===` / `===END BASE64===` markers, so a host script can extract it without picking up interleaved log lines. |
 | `coredump-b64` | this repo | Same framing, but reads the flash `coredump` partition directly — useful when SD never mounted and the dump is still in flash. |
+| `log-trace [on\|off]` | this repo | Query or toggle the disk-logger's TRACE gate. Persisted in NVS; survives reboots. |
 | `help` | esp_console | Lists all of the above. |
 
 ### Verifying the pipeline end-to-end
@@ -126,13 +128,21 @@ sends `coredump-b64` to read the flash `coredump` partition directly.
 
 On the second boot you should see `app_coredump: saved <N>-byte coredump to /sdcard/coredump-0001.elf` in the serial log. Pull the SD card, copy the file off, and decode with `espcoredump.py info_corefile`.
 
+## Runtime log (M2.5c)
+
+`app_logd.c` writes one timestamped line per event to `/sdcard/monmix-NNNN.log`. Files rotate at 256 KB, the newest 128 are kept (≈32 MB cap). All emit calls are non-blocking; a background task drains a queue, fsyncs every 16 entries or 5 s. A heartbeat task adds a heap-stats line every 10 s so quiet periods still leave time markers. Captured today: WiFi connect/disconnect/got-ip, MS WS connect/disconnect/error/rx/tx, user fader changes.
+
+TRACE-level lines (rx/tx, fader-drag updates) are gated by the `log-trace` console toggle; INFO/WARN/ERROR always write. Default is ON. Disable with `log-trace off` (persisted in NVS) if SD wear becomes a concern.
+
+Pull a log file with `python tools/fetch_b64.py COM3 /sdcard/monmix-NNNN.log out.log`.
+
 ## Milestones
 
 - **M1** (done): end-to-end vertical slice — 3 hard-coded faders read & write live over WiFi.
 - **M2** (done): paged UI (`lv_tileview` + page indicator) and NVS-persisted channel selection.
 - **M2.5a** (done): microSD bring-up + coredump persisted to `/sdcard/coredump-NNNN.elf` on boot.
 - **M2.5b**: "did we crash since last power-on?" indicator surfaced in the UI.
-- **M2.5c**: rolling WS/REST frame log to SD (only if M2.5a alone proves insufficient on stage).
+- **M2.5c** (done): rolling WS/wifi/UI event log to SD (`/sdcard/monmix-NNNN.log`) with a runtime trace toggle. Built after the 2026-05-01 SDIO-storm incident showed M2.5a alone misses non-panic failure modes.
 - **M3**: UX polish (mute/solo, color tags, low-light theme, meters).
 - **M4**: BLE/SoftAP provisioning.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).

@@ -1,3 +1,4 @@
+#include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_state.h"
 #include "app_ui.h"
@@ -119,8 +120,10 @@ static void send_envelope(const char *method, const char *path, const char *body
                      method, path, body_json);
     if (n <= 0 || n >= (int)sizeof(frame)) {
         ESP_LOGE(TAG, "envelope too large for path %s", path);
+        APP_LOGD_E("ms_ws", "envelope too large path=%s", path);
         return;
     }
+    APP_LOGD_T("ms_ws", "tx %s %s", method, path);
     esp_websocket_client_send_text(s_ws, frame, n, portMAX_DELAY);
 }
 
@@ -210,6 +213,7 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "connected");
+        APP_LOGD_I("ms_ws", "connected to %s:%d", APP_MS_HOST, APP_MS_PORT);
         char buf[64];
         snprintf(buf, sizeof(buf), "MS: connected %s:%d", APP_MS_HOST, APP_MS_PORT);
         app_ui_set_status(buf);
@@ -219,17 +223,22 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
 
     case WEBSOCKET_EVENT_DATA:
         if (evt->op_code == 0x1 /* text */ && evt->data_len > 0) {
+            APP_LOGD_T("ms_ws", "rx %.*s",
+                       (int) (evt->data_len > 90 ? 90 : evt->data_len),
+                       evt->data_ptr);
             handle_broadcast(evt->data_ptr, (size_t)evt->data_len);
         }
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected");
+        APP_LOGD_W("ms_ws", "disconnected");
         app_ui_set_status("MS: disconnected, retrying...");
         break;
 
     case WEBSOCKET_EVENT_ERROR:
         ESP_LOGE(TAG, "error");
+        APP_LOGD_E("ms_ws", "error event");
         app_ui_set_status("MS: error, retrying...");
         break;
 

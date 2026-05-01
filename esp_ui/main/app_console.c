@@ -12,6 +12,7 @@
 #include "esp_partition.h"
 #include "mbedtls/base64.h"
 
+#include "app_logd.h"
 #include "app_storage.h"
 
 static const char *TAG = "app_console";
@@ -157,6 +158,31 @@ static int cmd_coredump_b64(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
+// Persisted in NVS so the choice survives reboots.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_log_trace(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("log-trace: %s\n", app_logd_get_trace() ? "on" : "off");
+        return 0;
+    }
+    if (strcmp(argv[1], "on") == 0) {
+        app_logd_set_trace(true);
+        printf("log-trace: on\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        app_logd_set_trace(false);
+        printf("log-trace: off\n");
+        return 0;
+    }
+    printf("usage: log-trace [on|off]\n");
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // REPL bootstrap.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -166,6 +192,7 @@ void app_console_init(void)
         { .command = "ls",           .help = "list files in a directory (default /sdcard)", .func = cmd_ls           },
         { .command = "cat-b64",      .help = "base64-print a file framed with markers",     .func = cmd_cat_b64      },
         { .command = "coredump-b64", .help = "base64-print the flash coredump partition",   .func = cmd_coredump_b64 },
+        { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace  },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
