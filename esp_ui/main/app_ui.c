@@ -109,6 +109,24 @@ static lv_obj_t *s_picker_popup;
 static lv_obj_t *s_picker_title;
 static size_t   s_picker_target_idx;
 
+// Mute Enabled — safety toggle that gates mute-button taps. Resets to
+// FALSE on every boot so a power-cycle never leaves the device able to
+// silence channels by accident. Mute button visuals continue to track
+// the live MS state regardless; only the input path is gated.
+static bool      s_mute_enabled;
+static lv_obj_t *s_mute_en_btn;
+
+// Toast — single floating label used for "mute is disabled" feedback. We
+// reuse one object across all toast calls; subsequent toasts cancel the
+// pending hide-timer and reset the 2 s window.
+static lv_obj_t   *s_toast;
+static lv_obj_t   *s_toast_label;
+static lv_timer_t *s_toast_timer;
+
+static void toast_show(const char *text);
+static void apply_controls_enabled(void);
+static void on_mute_en_clicked(lv_event_t *e);
+
 // Status-bar icons for WiFi / MS connection state. Tap opens the read-only
 // info panel; the icon color reflects the live state.
 static lv_obj_t *s_wifi_icon_label;     // the LV_SYMBOL_WIFI label inside the button
@@ -231,6 +249,19 @@ static void on_mute_clicked(lv_event_t *e)
 {
     size_t    idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
     lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+
+    // Gate 1: MS must be connected. Silent reject — the MS status icon
+    // already conveys the connection state, no need to nag.
+    bool ms_ok = (s_ms && s_ms->get_state &&
+                  s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    if (!ms_ok) return;
+
+    // Gate 2: Mute Enabled toggle must be on. Loud reject — this is the
+    // user-facing safety; the toast tells them how to enable it.
+    if (!s_mute_enabled) {
+        toast_show("Mute disabled - tap MUTE EN to enable");
+        return;
+    }
 
     // Read canonical state from app_state and toggle. We don't set
     // LV_OBJ_FLAG_CHECKABLE on the button (that fires on press and a
@@ -516,6 +547,20 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_label_set_text(s_status_label, "Booting...");
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 8);
 
+    // Mute-Enabled toggle in the top-left of the status bar. Same red-checked
+    // / grey-default styling as the per-channel MUTE buttons so the visual
+    // language is consistent. Resets to OFF on every boot — see the comment
+    // on s_mute_enabled.
+    s_mute_en_btn = lv_button_create(scr);
+    lv_obj_set_size(s_mute_en_btn, 90, 28);
+    lv_obj_align(s_mute_en_btn, LV_ALIGN_TOP_LEFT, 8, 2);
+    lv_obj_set_style_bg_color(s_mute_en_btn, lv_color_hex(0xC00000), LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_mute_en_btn, lv_color_hex(0x303030), LV_STATE_DEFAULT);
+    lv_obj_t *me_lbl = lv_label_create(s_mute_en_btn);
+    lv_label_set_text(me_lbl, "MUTE EN");
+    lv_obj_center(me_lbl);
+    lv_obj_add_event_cb(s_mute_en_btn, on_mute_en_clicked, LV_EVENT_CLICKED, NULL);
+
     // Settings gear in the top-right corner of the status bar — opens the
     // touch-driven configuration overlay defined further below.
     lv_obj_t *gear = lv_button_create(scr);
@@ -607,6 +652,7 @@ void app_ui_init(const ms_client_iface_t *ms)
 
     wifi_icon_refresh();
     ms_icon_refresh();
+    apply_controls_enabled();
 
     lvgl_port_unlock();
 
@@ -991,6 +1037,94 @@ static void picker_close(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Toast — short auto-dismissing message at the center of the screen. Used
+// today only by the disabled-mute path; kept generic so it can carry
+// other inline feedback (e.g. "Saved" after a settings write) later.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void toast_hide(lv_timer_t *t)
+{
+    (void)t;
+    if (s_toast) lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_toast(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *t = lv_obj_create(scr);
+    lv_obj_set_size(t, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(t, LV_ALIGN_CENTER, 0, 100);
+    lv_obj_set_style_pad_all(t, 16, 0);
+    lv_obj_set_style_radius(t, 8, 0);
+    lv_obj_set_style_border_width(t, 1, 0);
+    lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+    s_toast = t;
+
+    s_toast_label = lv_label_create(t);
+    lv_label_set_text(s_toast_label, "");
+    lv_obj_center(s_toast_label);
+    lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void toast_show(const char *text)
+{
+    if (!s_toast) build_toast();
+    lv_label_set_text(s_toast_label, text);
+    lv_obj_remove_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_toast);
+    if (s_toast_timer) {
+        lv_timer_set_period(s_toast_timer, 2000);
+        lv_timer_reset(s_toast_timer);
+        lv_timer_set_repeat_count(s_toast_timer, 1);
+    } else {
+        s_toast_timer = lv_timer_create(toast_hide, 2000, NULL);
+        lv_timer_set_repeat_count(s_toast_timer, 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Controls enabled state — sliders + mute buttons are gated by MS
+// connection state; mute additionally requires the user-facing Mute
+// Enabled toggle to be ON. Greyed-out (50% opa) is the universal "you
+// can't act on this right now" hint.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void apply_controls_enabled(void)
+{
+    bool ms_ok   = (s_ms && s_ms->get_state &&
+                    s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    bool mute_ok = ms_ok && s_mute_enabled;
+
+    for (size_t i = 0; i < APP_CONFIG_MAX_CHANNELS; ++i) {
+        if (s_widgets[i].slider) {
+            lv_obj_set_style_opa(s_widgets[i].slider,
+                                 ms_ok ? LV_OPA_COVER : LV_OPA_50, 0);
+            if (ms_ok) lv_obj_add_flag(s_widgets[i].slider,    LV_OBJ_FLAG_CLICKABLE);
+            else       lv_obj_remove_flag(s_widgets[i].slider, LV_OBJ_FLAG_CLICKABLE);
+        }
+        if (s_widgets[i].btn_mute) {
+            // Always clickable so we can show the toast on a disabled tap;
+            // the click handler decides whether to act. Greyed when not
+            // mute_ok so the visual matches the behavior.
+            lv_obj_set_style_opa(s_widgets[i].btn_mute,
+                                 mute_ok ? LV_OPA_COVER : LV_OPA_50, 0);
+        }
+    }
+
+    if (s_mute_en_btn) {
+        if (s_mute_enabled) lv_obj_add_state   (s_mute_en_btn, LV_STATE_CHECKED);
+        else                lv_obj_remove_state(s_mute_en_btn, LV_STATE_CHECKED);
+    }
+}
+
+static void on_mute_en_clicked(lv_event_t *e)
+{
+    (void) e;
+    s_mute_enabled = !s_mute_enabled;
+    apply_controls_enabled();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // WiFi info panel — read-only summary of the current connection. Editing
 // (SSID/password/static IP) is queued for a follow-up that needs the
 // on-screen keyboard + creds-in-prefs migration.
@@ -1247,6 +1381,10 @@ static void ms_apply_async(void *unused)
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }
+    // Faders + mute buttons are gated by MS connection — re-evaluate every
+    // time the state transitions so the user can't drag a slider into the
+    // void during an outage.
+    apply_controls_enabled();
 }
 
 static void on_ms_state_change(void *ctx)
