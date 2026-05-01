@@ -1,4 +1,5 @@
 #include "app_ui.h"
+#include "app_display.h"
 #include "app_logd.h"
 #include "app_prefs.h"
 #include "app_state.h"
@@ -90,6 +91,7 @@ static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t *s_lvl_norm_btn;
 static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
+static lv_obj_t *s_theme_buttons[2]; // dark / light
 
 static void settings_open(void);
 static void settings_close(void);
@@ -310,12 +312,15 @@ static void on_state_change(size_t idx, void *ctx)
     lvgl_port_unlock();
 }
 
-// Pref changes (level format, channel colors, signal indicator) affect the
-// rendering of every fader, so we mark all channels dirty and queue a single
-// sweep — same plumbing as the per-channel state changes.
+// Pref changes (level format, channel colors, signal indicator, theme) affect
+// the rendering of every fader, so we mark all channels dirty and queue a
+// single sweep — same plumbing as the per-channel state changes. Theme is
+// re-applied here too; lv_theme_default_init is idempotent for an unchanged
+// theme so we don't need to track the old value.
 static void on_prefs_change(void *ctx)
 {
     (void)ctx;
+    app_display_apply_theme(app_prefs_get_theme());
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
     if (s_sweep_queued) return;
@@ -460,13 +465,11 @@ void app_ui_init(const ms_client_iface_t *ms)
     }
 
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x101010), 0);
 
     // Status line at the top. app_wifi / ms_ws push updates here so the user
     // sees boot progress instead of a static screen.
     s_status_label = lv_label_create(scr);
     lv_label_set_text(s_status_label, "Booting...");
-    lv_obj_set_style_text_color(s_status_label, lv_color_hex(0xC0C0C0), 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 8);
 
     // Settings gear in the top-right corner of the status bar — opens the
@@ -479,7 +482,6 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_set_style_border_width(gear, 0, 0);
     lv_obj_t *gear_label = lv_label_create(gear);
     lv_label_set_text(gear_label, LV_SYMBOL_SETTINGS);
-    lv_obj_set_style_text_color(gear_label, lv_color_hex(0xC0C0C0), 0);
     lv_obj_center(gear_label);
     lv_obj_add_event_cb(gear, on_gear_clicked, LV_EVENT_CLICKED, NULL);
 
@@ -487,7 +489,6 @@ void app_ui_init(const ms_client_iface_t *ms)
     s_tileview = lv_tileview_create(scr);
     lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
     lv_obj_set_pos(s_tileview, 0, TILEVIEW_Y);
-    lv_obj_set_style_bg_color(s_tileview, lv_color_hex(0x101010), 0);
     lv_obj_set_style_border_width(s_tileview, 0, 0);
 
     size_t total = app_state_count();
@@ -510,7 +511,6 @@ void app_ui_init(const ms_client_iface_t *ms)
         // top-left, not its content area).
         lv_obj_set_style_pad_all(tile, 0, 0);
         lv_obj_set_style_border_width(tile, 0, 0);
-        lv_obj_set_style_bg_color(tile, lv_color_hex(0x101010), 0);
         s_page_tiles[p] = tile;
 
         const int slot_w = SCREEN_W / FADERS_PER_PAGE;
@@ -585,6 +585,13 @@ static void on_sig_clicked(lv_event_t *e)
     int which = (int)(uintptr_t) lv_event_get_user_data(e);
     app_prefs_set_signal_indicator((app_signal_indicator_t) which);
     update_radio_visuals(s_sig_buttons, 3, (size_t) which);
+}
+
+static void on_theme_clicked(lv_event_t *e)
+{
+    int which = (int)(uintptr_t) lv_event_get_user_data(e);
+    app_prefs_set_theme((app_theme_t) which);
+    update_radio_visuals(s_theme_buttons, 2, (size_t) which);
 }
 
 // Tap a swatch → cycle to the next palette index (-1 = no color, 0..7 =
@@ -681,6 +688,21 @@ static void build_settings_overlay(void)
                             (void *)(uintptr_t) i);
     }
 
+    // Section: Theme — Dark / Light radios. Right of Signal Indicator on the
+    // same row to keep the panel vertically compact.
+    lv_obj_t *theme_label = lv_label_create(ov);
+    lv_label_set_text(theme_label, "Theme");
+    lv_obj_align(theme_label, LV_ALIGN_TOP_LEFT, 600, 116);
+
+    static const char *theme_text[2] = { "Dark", "Light" };
+    for (int i = 0; i < 2; ++i) {
+        s_theme_buttons[i] = make_radio_button(ov, theme_text[i]);
+        lv_obj_set_size(s_theme_buttons[i], 120, 44);
+        lv_obj_align(s_theme_buttons[i], LV_ALIGN_TOP_LEFT, 700 + i * 132, 110);
+        lv_obj_add_event_cb(s_theme_buttons[i], on_theme_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+    }
+
     // Section: Channel Colors — 6 rows × 2 columns
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channel Colors");
@@ -730,6 +752,8 @@ static void settings_refresh_state(void)
                          app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB ? 1 : 0);
     update_radio_visuals(s_sig_buttons, 3,
                          (size_t) app_prefs_get_signal_indicator());
+    update_radio_visuals(s_theme_buttons, 2,
+                         (size_t) app_prefs_get_theme());
 
     // Refresh swatches from app_prefs.
     size_t total = app_state_count();

@@ -24,6 +24,11 @@ typedef enum {
     APP_SIGNAL_INDICATOR_METER,     // full bar, ~10 Hz polling
 } app_signal_indicator_t;
 
+typedef enum {
+    APP_THEME_DARK = 0,             // default — low-light stage use
+    APP_THEME_LIGHT,
+} app_theme_t;
+
 // Notification fired whenever any preference changes. Multiple
 // subscribers allowed; each callback receives its registered ctx pointer.
 typedef void (*app_prefs_on_change_t)(void *ctx);
@@ -38,6 +43,9 @@ void               app_prefs_set_level_format(app_level_format_t f);
 
 app_signal_indicator_t app_prefs_get_signal_indicator(void);
 void                   app_prefs_set_signal_indicator(app_signal_indicator_t s);
+
+app_theme_t app_prefs_get_theme(void);
+void        app_prefs_set_theme(app_theme_t t);
 
 // Per-channel color tag (palette index 0..7). Returns -1 if no preference
 // is set; callers should fall back to a default palette derived from the

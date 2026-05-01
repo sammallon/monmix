@@ -33,6 +33,7 @@ static app_level_format_t      s_level_format = APP_LEVEL_FORMAT_NORM;
 // real implementation requires subscribing to /console/metering/* and
 // parsing the binary int16 stream — see the open follow-up task.
 static app_signal_indicator_t  s_signal_ind   = APP_SIGNAL_INDICATOR_NONE;
+static app_theme_t             s_theme        = APP_THEME_DARK;
 static color_entry_t           s_colors[MAX_COLOR_ENTRIES];
 static size_t                  s_color_count;
 
@@ -85,6 +86,17 @@ static app_signal_indicator_t signal_indicator_from_str(const char *s)
     return APP_SIGNAL_INDICATOR_PRESENT;
 }
 
+static const char *theme_to_str(app_theme_t t)
+{
+    return (t == APP_THEME_LIGHT) ? "light" : "dark";
+}
+
+static app_theme_t theme_from_str(const char *s)
+{
+    if (s && strcmp(s, "light") == 0) return APP_THEME_LIGHT;
+    return APP_THEME_DARK;
+}
+
 static void notify_subscribers(void)
 {
     for (size_t i = 0; i < s_subscriber_count; ++i) {
@@ -126,6 +138,9 @@ static bool load_from_disk(void)
     cJSON *jsi = cJSON_GetObjectItem(root, "signal_indicator");
     if (cJSON_IsString(jsi)) s_signal_ind = signal_indicator_from_str(jsi->valuestring);
 
+    cJSON *jth = cJSON_GetObjectItem(root, "theme");
+    if (cJSON_IsString(jth)) s_theme = theme_from_str(jth->valuestring);
+
     s_color_count = 0;
     cJSON *jcc = cJSON_GetObjectItem(root, "channel_color");
     if (cJSON_IsObject(jcc)) {
@@ -152,6 +167,7 @@ static bool save_to_disk_locked(void)
     if (!root) return false;
     cJSON_AddStringToObject(root, "level_format",     level_format_to_str(s_level_format));
     cJSON_AddStringToObject(root, "signal_indicator", signal_indicator_to_str(s_signal_ind));
+    cJSON_AddStringToObject(root, "theme",            theme_to_str(s_theme));
     cJSON *jcc = cJSON_AddObjectToObject(root, "channel_color");
     for (size_t i = 0; i < s_color_count; ++i) {
         char key[16];
@@ -194,15 +210,17 @@ void app_prefs_init(void)
     bool loaded = load_from_disk();
     xSemaphoreGive(s_mutex);
     if (loaded) {
-        ESP_LOGI(TAG, "loaded prefs from %s (level=%s indicator=%s colors=%u)",
+        ESP_LOGI(TAG, "loaded prefs from %s (level=%s indicator=%s theme=%s colors=%u)",
                  PREFS_PATH,
                  level_format_to_str(s_level_format),
                  signal_indicator_to_str(s_signal_ind),
+                 theme_to_str(s_theme),
                  (unsigned) s_color_count);
     } else {
-        ESP_LOGI(TAG, "using default prefs (level=%s indicator=%s)",
+        ESP_LOGI(TAG, "using default prefs (level=%s indicator=%s theme=%s)",
                  level_format_to_str(s_level_format),
-                 signal_indicator_to_str(s_signal_ind));
+                 signal_indicator_to_str(s_signal_ind),
+                 theme_to_str(s_theme));
     }
 }
 
@@ -235,6 +253,22 @@ void app_prefs_set_signal_indicator(app_signal_indicator_t s)
     bool ok = save_to_disk_locked();
     xSemaphoreGive(s_mutex);
     if (!ok) ESP_LOGW(TAG, "failed to persist signal_indicator");
+    notify_subscribers();
+}
+
+app_theme_t app_prefs_get_theme(void)
+{
+    return s_theme;
+}
+
+void app_prefs_set_theme(app_theme_t t)
+{
+    if (!s_mutex || s_theme == t) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_theme = t;
+    bool ok = save_to_disk_locked();
+    xSemaphoreGive(s_mutex);
+    if (!ok) ESP_LOGW(TAG, "failed to persist theme");
     notify_subscribers();
 }
 

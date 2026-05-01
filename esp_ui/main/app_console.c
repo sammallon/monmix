@@ -420,6 +420,32 @@ static int cmd_signal_indicator(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `theme [dark|light]` — query/set UI theme. Persisted to
+// /sdcard/monmix-prefs.json; pref-change subscriber re-applies live.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_theme(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("theme: %s\n",
+               app_prefs_get_theme() == APP_THEME_LIGHT ? "light" : "dark");
+        return 0;
+    }
+    if (strcmp(argv[1], "dark") == 0) {
+        app_prefs_set_theme(APP_THEME_DARK);
+        printf("theme: dark\n");
+        return 0;
+    }
+    if (strcmp(argv[1], "light") == 0) {
+        app_prefs_set_theme(APP_THEME_LIGHT);
+        printf("theme: light\n");
+        return 0;
+    }
+    printf("usage: theme [dark|light]\n");
+    return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `set-color <ch_id> <0..7|-1>` — paint a colored stripe on the channel's
 // scribble strip. Index -1 clears the override (channel renders without
 // an accent). Persisted to /sdcard/monmix-prefs.json.
@@ -486,6 +512,7 @@ void app_console_init(void)
         { .command = "touch",        .help = "<x> <y> [tap|down|up] — synthetic LVGL touch",  .func = cmd_touch        },
         { .command = "level-format", .help = "query/set fader value readout: norm | db",      .func = cmd_level_format },
         { .command = "signal-indicator", .help = "query/set: none | signal-present | meter",  .func = cmd_signal_indicator },
+        { .command = "theme",        .help = "query/set UI theme: dark | light",              .func = cmd_theme        },
         { .command = "set-color",    .help = "<ch_id> <0..7|-1> — set/clear channel color",   .func = cmd_set_color    },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };

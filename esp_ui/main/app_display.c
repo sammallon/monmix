@@ -273,18 +273,9 @@ bool app_display_init(void)
     // applies the inverse transform to touch coordinates automatically.
     lvgl_port_lock(0);
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
-    // Low-light stage theme: dark mode = true. Backgrounds become near-black
-    // and the boxes become dark grey instead of white. Primary blue keeps
-    // the slider track visible at a glance; secondary darker so unmuted
-    // mute buttons read as inert.
-    lv_theme_t *theme = lv_theme_default_init(
-        disp,
-        lv_palette_main(LV_PALETTE_BLUE),
-        lv_palette_main(LV_PALETTE_GREY),
-        /* dark */ true,
-        LV_FONT_DEFAULT);
-    lv_display_set_theme(disp, theme);
     lvgl_port_unlock();
+
+    app_display_apply_theme(app_prefs_get_theme());
 
     const lvgl_port_touch_cfg_t touch_cfg = { .disp = disp, .handle = tp };
     if (!lvgl_port_add_touch(&touch_cfg)) {
@@ -294,4 +285,27 @@ bool app_display_init(void)
 
     ESP_LOGI(TAG, "display + touch up @ %dx%d", LCD_H_RES, LCD_V_RES);
     return true;
+}
+
+void app_display_apply_theme(app_theme_t theme)
+{
+    lv_display_t *disp = lv_display_get_default();
+    if (!disp) return;
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "apply_theme: lvgl_port_lock timeout");
+        return;
+    }
+    // Dark mode keeps the original low-light stage palette: near-black
+    // backgrounds, dark-grey boxes, blue primary so the slider track reads
+    // at a glance. Light mode is the LVGL default — white surfaces with
+    // the same blue accent.
+    lv_theme_t *t = lv_theme_default_init(
+        disp,
+        lv_palette_main(LV_PALETTE_BLUE),
+        lv_palette_main(LV_PALETTE_GREY),
+        /* dark */ theme == APP_THEME_DARK,
+        LV_FONT_DEFAULT);
+    lv_display_set_theme(disp, t);
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "theme applied: %s", theme == APP_THEME_DARK ? "dark" : "light");
 }
