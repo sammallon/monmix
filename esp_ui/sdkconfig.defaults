@@ -34,6 +34,16 @@ CONFIG_ESP_HOSTED_ENABLED=y
 CONFIG_ESP_HOSTED_HOST=y
 CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
 
+# CrowPanel-specific: the ESP-Hosted Kconfig defaults the C6 reset GPIO to
+# 54 for the ESP32-P4 (matches Espressif's own dev board), but on the
+# CrowPanel Advanced 10.1" GPIO 54 is wired to the UART2 RX expansion pin.
+# The actual C6 EN line on this board is GPIO 32 (verified against the
+# schematic — net `C6_EN` connects U7.GPIO32 to IC1.EN through R77 pull-up
+# to C6_VDD_3V3 + C15 decoupling cap). With the wrong pin, ESP-Hosted's
+# in-driver reset path is a no-op and the C6 can only be recovered by USB
+# power-cycling the whole module.
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=32
+
 # ESP-Hosted's SDIO mempool needs DMA-capable INTERNAL RAM (PSRAM is
 # excluded from MALLOC_CAP_INTERNAL). At default queue sizes (20/20) the
 # 47 KiB pool itself fails to allocate. With queues=8 it allocates but
