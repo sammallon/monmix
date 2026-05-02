@@ -70,6 +70,14 @@ typedef struct {
 // 0x303030 blended into the dark-theme row backgrounds).
 #define NO_COLOR_SWATCH_HEX 0x808080
 
+// Norm position (0..1) on the slider that corresponds to 0 dB / unity gain.
+// Si Expression 2's level range is -138..+10 dB but the curve is non-linear
+// (typical PA fader taper), so we can't compute this from the endpoints.
+// 0.76 matches the position users typically see for unity on digital-fader
+// curves. Replace with a runtime query of `/convert/ch.0.mix.lvl/vton/0`
+// once the HTTP client lands (see task #40).
+#define NORM_AT_0DB         0.76f
+
 // 8-color palette for the per-channel color tag — see app_prefs / set-color.
 // Roughly evenly spaced around the hue wheel; chose hex values that read
 // well on both the default (light box) and the future low-light theme.
@@ -495,6 +503,21 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_add_event_cb(slider, on_slider_released, LV_EVENT_RELEASED,
                         (void *)(uintptr_t)idx);
     s_widgets[idx].slider = slider;
+
+    // Unity-gain (0 dB) tick to the right of the slider track. The user
+    // lines the knob up with this to dial in unity by feel — no need to
+    // read the dB readout at the bottom while concentrating on the mix.
+    // Slider is centered in the box, value goes UP, so the tick's vertical
+    // offset from center is positive when below center (norm < 0.5) and
+    // negative when above (norm > 0.5).
+    lv_obj_t *tick = lv_obj_create(box);
+    lv_obj_set_size(tick, 12, 2);
+    lv_obj_set_style_bg_color(tick, lv_color_hex(0xC0C0C0), 0);
+    lv_obj_set_style_border_width(tick, 0, 0);
+    lv_obj_set_style_pad_all(tick, 0, 0);
+    lv_obj_clear_flag(tick, LV_OBJ_FLAG_SCROLLABLE);
+    int tick_y_off = (int)((0.5f - NORM_AT_0DB) * (float) SLIDER_H);
+    lv_obj_align(tick, LV_ALIGN_CENTER, SLIDER_W / 2 + 10, tick_y_off);
 
     lv_obj_t *btn_mute = lv_button_create(box);
     // Note: NOT LV_OBJ_FLAG_CHECKABLE — that auto-toggles on press, which
