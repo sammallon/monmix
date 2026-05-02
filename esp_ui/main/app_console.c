@@ -16,6 +16,7 @@
 #include "lvgl.h"
 #include "mbedtls/base64.h"
 #include "miniz.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -474,6 +475,29 @@ static int cmd_set_color(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `channels-reset` — clear the persisted channel selection so the next
+// boot picks up the compile-time default. Used to upgrade a device that
+// was seeded under an older default (e.g. 12 channels) to a newer one
+// (24) without flashing the partition table or running `nvs erase`.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_channels_reset(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("monmix", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        printf("channels-reset: nvs_open failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    nvs_erase_key(h, "chan_ids");
+    nvs_commit(h);
+    nvs_close(h);
+    printf("channels-reset: cleared. Reboot to pick up the default.\n");
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -514,6 +538,7 @@ void app_console_init(void)
         { .command = "signal-indicator", .help = "query/set: none | signal-present | meter",  .func = cmd_signal_indicator },
         { .command = "theme",        .help = "query/set UI theme: dark | light",              .func = cmd_theme        },
         { .command = "set-color",    .help = "<ch_id> <0..7|-1> — set/clear channel color",   .func = cmd_set_color    },
+        { .command = "channels-reset", .help = "clear channel selection NVS, default applies next boot", .func = cmd_channels_reset },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
