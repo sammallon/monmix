@@ -100,16 +100,13 @@ static void ws_set_mix_layout(int offset, int count)
     if (count  > MAX_MIX_BUSES) count  = MAX_MIX_BUSES;
     s_mix_offset = offset;
     s_mix_count  = count;
-    // Subscribe to each mix's scribble-strip name so the picker can show
-    // "FOH" / "Drums" instead of "Mix 1" / "Mix 2". Initial values arrive
-    // immediately on subscribe; later edits in MS rebroadcast through the
-    // same path. handle_broadcast routes by ch index.
+    // The actual ch.<offset+i>.cfg.name subscriptions happen in
+    // on_connected_subscribe_all so they fire on first connect AND
+    // every reconnect. app_main typically calls this before ws_start
+    // — the layout just needs to be remembered; the WS event handler
+    // does the rest.
     if (s_ws && esp_websocket_client_is_connected(s_ws)) {
-        for (int i = 0; i < s_mix_count; ++i) {
-            char dotted[32];
-            snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
-            subscribe_path(dotted, "val");
-        }
+        on_connected_subscribe_all();
     }
 }
 
@@ -318,7 +315,19 @@ static void on_connected_subscribe_all(void)
                  "ch.%d.levelData.%d.on", ch_id, s_mix_bus_idx);
         subscribe_path(dotted, "val");
     }
-    ESP_LOGI(TAG, "subscribed %d channels", (int)app_state_count());
+
+    // Mix-bus scribble-strip names — subscribed here, not in
+    // ws_set_mix_layout, because app_main calls set_mix_layout BEFORE
+    // ws_start (the layout is known from /console/information well
+    // before WS opens). Doing it here means the names also get
+    // re-subscribed on every reconnect for free.
+    for (int i = 0; i < s_mix_count; ++i) {
+        char dotted[32];
+        snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
+        subscribe_path(dotted, "val");
+    }
+    ESP_LOGI(TAG, "subscribed %d channels + %d mix names",
+             (int) app_state_count(), s_mix_count);
 }
 
 static void handle_broadcast(const char *json, size_t len)
