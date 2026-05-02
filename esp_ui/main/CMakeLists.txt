@@ -5,6 +5,7 @@ idf_component_register(
         "app_state.c"
         "app_wifi.c"
         "app_ms_client_ws.c"
+        "app_ms_info.c"
         "app_display.c"
         "app_ui.c"
         "app_storage.c"
@@ -30,5 +31,6 @@ idf_component_register(
         espcoredump
         console
         mbedtls
+        esp_http_client
         esp_rom
 )

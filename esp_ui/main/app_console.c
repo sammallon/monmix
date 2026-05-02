@@ -22,9 +22,12 @@
 #include "freertos/task.h"
 
 #include "app_logd.h"
+#include "app_ms_client.h"
+#include "app_ms_info.h"
 #include "app_prefs.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
+#include "secrets.h"
 
 static const char *TAG = "app_console";
 
@@ -498,6 +501,28 @@ static int cmd_channels_reset(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `ms-info` — fetch /console/information from the configured MS host and
+// dump the parsed channel architecture. Sanity-checks the HTTP path
+// before the discovery flow (#40) wires it into boot.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_ms_info(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    app_ms_info_t info;
+    if (!app_ms_info_fetch(APP_MS_HOST, APP_MS_PORT, &info)) {
+        printf("ms-info: fetch failed (see ms_info ESP_LOGW above)\n");
+        return 1;
+    }
+    printf("total=%d\n",            info.total);
+    printf("input  count=%-3d offset=%d\n", info.input_count,  info.input_offset);
+    printf("aux    count=%-3d offset=%d\n", info.aux_count,    info.aux_offset);
+    printf("mix    count=%-3d offset=%d\n", info.mix_count,    info.mix_offset);
+    printf("matrix count=%-3d offset=%d\n", info.matrix_count, info.matrix_offset);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -539,6 +564,7 @@ void app_console_init(void)
         { .command = "theme",        .help = "query/set UI theme: dark | light",              .func = cmd_theme        },
         { .command = "set-color",    .help = "<ch_id> <0..7|-1> — set/clear channel color",   .func = cmd_set_color    },
         { .command = "channels-reset", .help = "clear channel selection NVS, default applies next boot", .func = cmd_channels_reset },
+        { .command = "ms-info",      .help = "fetch /console/information from MS, print channel arch", .func = cmd_ms_info      },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
