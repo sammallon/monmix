@@ -14,7 +14,19 @@
 #include "app_ui.h"
 #include "app_wifi.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 static const char *TAG = "esp_ui";
+
+// Discovery worker stubbed during boot-stability investigation. Restores
+// the previous M3 behavior: builds the fader UI from the NVS-seeded list.
+static void discovery_task(void *arg)
+{
+    (void) arg;
+    app_ui_present_channels();
+    vTaskDelete(NULL);
+}
 
 void app_main(void)
 {
@@ -89,4 +101,11 @@ void app_main(void)
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up.
     ms->start();
+
+    // Discovery worker: waits for the WS to come up, fetches channel
+    // architecture from MS, reseeds app_state, and finally builds the
+    // fader UI. Until then the user sees the loading spinner mounted by
+    // app_ui_init.
+    xTaskCreate(discovery_task, "ms_discovery", 16 * 1024,
+                (void *) ms, 5, NULL);
 }

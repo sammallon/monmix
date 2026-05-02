@@ -14,9 +14,10 @@ static void                 *s_on_change_ctx;
 
 void app_state_init(const int *ids, size_t count)
 {
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
     if (count > APP_CONFIG_MAX_CHANNELS) count = APP_CONFIG_MAX_CHANNELS;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_count = count;
-    s_mutex = xSemaphoreCreateMutex();
     for (size_t i = 0; i < s_count; ++i) {
         s_channels[i].id = ids[i];
         // MS paths are 0-indexed: ch.0 displays as "CH 01" in the MS UI.
@@ -26,6 +27,7 @@ void app_state_init(const int *ids, size_t count)
         s_channels[i].level_db = -200.0f;   // sentinel: "below floor" until MS reports
         s_channels[i].mute     = false;
     }
+    xSemaphoreGive(s_mutex);
 }
 
 size_t app_state_count(void)

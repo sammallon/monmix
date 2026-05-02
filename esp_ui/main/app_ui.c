@@ -661,12 +661,58 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_label_set_text(s_spinner_label, "Connecting to console...");
     lv_obj_align_to(s_spinner_label, s_spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 
-    // Tileview holds one tile per page. Horizontal swipe between pages.
-    s_tileview = lv_tileview_create(scr);
-    lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
-    lv_obj_set_pos(s_tileview, 0, TILEVIEW_Y);
-    lv_obj_set_style_border_width(s_tileview, 0, 0);
-    lv_obj_add_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);   // hidden until MS connects
+    app_state_register_on_change(on_state_change, NULL);
+    app_prefs_register_on_change(on_prefs_change, NULL);
+    app_wifi_register_on_change(on_wifi_state_change, NULL);
+    if (s_ms && s_ms->register_on_change) {
+        s_ms->register_on_change(on_ms_state_change, NULL);
+    }
+
+    wifi_icon_refresh();
+    ms_icon_refresh();
+    apply_controls_enabled();
+
+    lvgl_port_unlock();
+
+    ESP_LOGI(TAG, "UI shell mounted; awaiting channel enumeration");
+}
+
+// Page indicator widget; recreated on each present_channels() call. Tracked
+// here so a rebuild can destroy the previous one before constructing the
+// new one.
+static lv_obj_t *s_page_indicator;
+
+void app_ui_present_channels(void)
+{
+    if (!lvgl_port_lock(0)) {
+        ESP_LOGE(TAG, "present_channels: lvgl_port_lock failed");
+        return;
+    }
+
+    // Tear down any previous fader UI so a re-call (mix change, channel
+    // selection edit) builds clean. lv_obj_clean keeps the tileview but
+    // removes its children; lv_obj_delete on the page indicator drops it
+    // entirely so we can recreate.
+    if (s_tileview) {
+        lv_obj_clean(s_tileview);
+        memset(s_page_tiles,  0, sizeof(s_page_tiles));
+    } else {
+        s_tileview = lv_tileview_create(lv_screen_active());
+        lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
+        lv_obj_set_pos(s_tileview, 0, TILEVIEW_Y);
+        lv_obj_set_style_border_width(s_tileview, 0, 0);
+        // Hidden by default — ms_apply_async unhides on the next transition
+        // to CONNECTED. Keeps the spinner-vs-tileview ownership clean and
+        // prevents an empty-tileview flash before any data arrives.
+        lv_obj_add_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(s_tileview, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+    if (s_page_indicator) {
+        lv_obj_delete(s_page_indicator);
+        s_page_indicator = NULL;
+        memset(s_page_dots, 0, sizeof(s_page_dots));
+    }
+    memset(s_widgets, 0, sizeof(s_widgets));
 
     size_t total = app_state_count();
     s_page_count = (total + FADERS_PER_PAGE - 1) / FADERS_PER_PAGE;
@@ -683,9 +729,6 @@ void app_ui_init(const ms_client_iface_t *ms)
 
         lv_obj_t *tile = lv_tileview_add_tile(s_tileview, (uint8_t)p, 0, dir);
         lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
-        // Default lv_obj style has padding + border; zero them so our slot
-        // x coordinates land where we expect (relative to the tile's true
-        // top-left, not its content area).
         lv_obj_set_style_pad_all(tile, 0, 0);
         lv_obj_set_style_border_width(tile, 0, 0);
         s_page_tiles[p] = tile;
@@ -698,27 +741,26 @@ void app_ui_init(const ms_client_iface_t *ms)
         }
     }
 
-    lv_obj_add_event_cb(s_tileview, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
-
-    // Page indicator only when there's more than one page.
     if (s_page_count > 1) {
-        create_page_indicator(scr, s_page_count);
+        s_page_indicator = create_page_indicator(lv_screen_active(), s_page_count);
     }
 
-    app_state_register_on_change(on_state_change, NULL);
-    app_prefs_register_on_change(on_prefs_change, NULL);
-    app_wifi_register_on_change(on_wifi_state_change, NULL);
-    if (s_ms && s_ms->register_on_change) {
-        s_ms->register_on_change(on_ms_state_change, NULL);
-    }
-
-    wifi_icon_refresh();
-    ms_icon_refresh();
     apply_controls_enabled();
+
+    // Sync the spinner ↔ tileview visibility with the current MS state.
+    // Without this, the freshly-built tileview would stay hidden until the
+    // next state-change event, leaving the spinner overlaid on the strips.
+    bool ms_connected = (s_ms && s_ms->get_state &&
+                         s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    if (ms_connected) {
+        if (s_tileview)      lv_obj_remove_flag(s_tileview,      LV_OBJ_FLAG_HIDDEN);
+        if (s_spinner)       lv_obj_add_flag   (s_spinner,       LV_OBJ_FLAG_HIDDEN);
+        if (s_spinner_label) lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+    }
 
     lvgl_port_unlock();
 
-    ESP_LOGI(TAG, "UI mounted: %u faders across %u page(s)",
+    ESP_LOGI(TAG, "faders mounted: %u channels across %u page(s)",
              (unsigned)total, (unsigned)s_page_count);
 }
 
