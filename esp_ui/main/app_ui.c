@@ -1743,11 +1743,28 @@ static void wifi_apply_async(void *unused)
     }
 }
 
+// Same coalescing pattern as ms_apply / apply_pending — wifi reconnect
+// retries can fire on_event repeatedly; one async sweep per arrival is
+// enough.
+static volatile bool s_wifi_apply_queued;
+
+static void wifi_apply_async_wrap(void *unused)
+{
+    s_wifi_apply_queued = false;
+    wifi_apply_async(unused);
+}
+
 static void on_wifi_state_change(void *ctx)
 {
     (void)ctx;
+    if (s_wifi_apply_queued) return;
     if (!lvgl_port_lock(100)) return;
-    lv_async_call(wifi_apply_async, NULL);
+    if (!s_wifi_apply_queued) {
+        s_wifi_apply_queued = true;
+        if (lv_async_call(wifi_apply_async_wrap, NULL) != LV_RESULT_OK) {
+            s_wifi_apply_queued = false;
+        }
+    }
     lvgl_port_unlock();
 }
 
@@ -1933,11 +1950,29 @@ static void ms_apply_async(void *unused)
     }
 }
 
+// Coalesce ms_apply_async — a burst of MS broadcasts (e.g. 14 mix-name
+// initial values arriving back-to-back at startup) would otherwise queue
+// 14 redundant async sweeps. apply_pending uses the same s_sweep_queued
+// pattern for the per-channel state-change path.
+static volatile bool s_ms_apply_queued;
+
+static void ms_apply_async_wrap(void *unused)
+{
+    s_ms_apply_queued = false;
+    ms_apply_async(unused);
+}
+
 static void on_ms_state_change(void *ctx)
 {
     (void)ctx;
+    if (s_ms_apply_queued) return;
     if (!lvgl_port_lock(100)) return;
-    lv_async_call(ms_apply_async, NULL);
+    if (!s_ms_apply_queued) {
+        s_ms_apply_queued = true;
+        if (lv_async_call(ms_apply_async_wrap, NULL) != LV_RESULT_OK) {
+            s_ms_apply_queued = false;
+        }
+    }
     lvgl_port_unlock();
 }
 
