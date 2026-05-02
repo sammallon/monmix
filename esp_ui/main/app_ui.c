@@ -12,6 +12,7 @@
 
 #include <time.h>
 
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_netif_sntp.h"
@@ -126,8 +127,13 @@ static size_t   s_picker_target_idx;
 static lv_obj_t *s_mix_indicator;        // status-bar button
 static lv_obj_t *s_mix_indicator_label;  // label inside it
 static lv_obj_t *s_mix_picker_popup;
+// Internal SRAM is tight at this point (we already moved s_mix_names to
+// PSRAM via EXT_RAM_BSS_ATTR — see app_ms_client_ws.c). Even 96 bytes of
+// static pointers can tip the FreeRTOS timer-task-stack alloc over the
+// edge at boot, so keep this in PSRAM too. #42 will move the bigger
+// per-channel arrays similarly.
+EXT_RAM_BSS_ATTR static lv_obj_t *s_mix_picker_btn_labels[24];
 static int       s_mix_count;            // 0 = popup not yet usable
-static bool      s_mix_picker_dirty;     // names changed; rebuild on next open
 
 // Rename popup — full-screen modal with a textarea + on-screen keyboard
 // for editing a channel's scribble-strip name. The same popup is reused
@@ -188,6 +194,7 @@ static void rename_open(size_t channel_idx);
 static void rename_close(void);
 static void mix_picker_open(void);
 static void mix_picker_close(void);
+static void mix_picker_refresh_labels(void);
 static void mix_indicator_refresh(void);
 static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
@@ -1351,22 +1358,24 @@ static void build_mix_picker_popup(void)
         lv_obj_center(lbl);
         lv_obj_add_event_cb(btn, on_mix_choice, LV_EVENT_CLICKED,
                             (void *)(intptr_t) i);
+        if (i < (int)(sizeof(s_mix_picker_btn_labels) /
+                       sizeof(s_mix_picker_btn_labels[0]))) {
+            s_mix_picker_btn_labels[i] = lbl;
+        }
     }
 }
 
 static void mix_picker_open(void)
 {
     if (s_mix_count <= 0) return;
-    // If labels have changed since we last built, drop the cached popup
-    // so the rebuild below picks them up. Safe here because we're at
-    // the start of an open click, not in the middle of a previous
-    // close/notify chain.
-    if (s_mix_picker_dirty && s_mix_picker_popup) {
-        lv_obj_delete(s_mix_picker_popup);
-        s_mix_picker_popup = NULL;
+    if (!s_mix_picker_popup) {
+        build_mix_picker_popup();
+    } else {
+        // Pull in any name updates that arrived since the last open. No
+        // teardown — labels are mutated in place to keep the LVGL heap
+        // quiet over long sessions.
+        mix_picker_refresh_labels();
     }
-    s_mix_picker_dirty = false;
-    if (!s_mix_picker_popup) build_mix_picker_popup();
     lv_obj_remove_flag(s_mix_picker_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_mix_picker_popup);
 }
@@ -1397,10 +1406,13 @@ void app_ui_set_mix_count(int count)
         lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
     }
     // If the popup was already built for an earlier count, drop it so
-    // the next open builds a fresh grid sized to the new count.
+    // the next open builds a fresh grid sized to the new count. The
+    // child labels go with it; clear our cached pointers so we don't
+    // dereference freed widgets in mix_picker_refresh_labels.
     if (s_mix_picker_popup) {
         lv_obj_delete(s_mix_picker_popup);
         s_mix_picker_popup = NULL;
+        memset(s_mix_picker_btn_labels, 0, sizeof(s_mix_picker_btn_labels));
     }
     lvgl_port_unlock();
 }
@@ -1869,17 +1881,31 @@ static void ms_panel_refresh(void)
     lv_label_set_text(s_ms_port_value, portbuf);
 }
 
+static void mix_picker_refresh_labels(void)
+{
+    if (!s_mix_picker_popup || !s_ms || !s_ms->get_mix_name) return;
+    for (int i = 0; i < s_mix_count && i < (int)(sizeof(s_mix_picker_btn_labels) /
+                                                  sizeof(s_mix_picker_btn_labels[0])); ++i) {
+        if (!s_mix_picker_btn_labels[i]) continue;
+        const char *name = s_ms->get_mix_name(i);
+        char buf[24];
+        if (name) snprintf(buf, sizeof(buf), "%s", name);
+        else      snprintf(buf, sizeof(buf), "Mix %d", i + 1);
+        lv_label_set_text(s_mix_picker_btn_labels[i], buf);
+    }
+}
+
 static void ms_apply_async(void *unused)
 {
     (void)unused;
     ms_icon_refresh();
     mix_indicator_refresh();
-    // Mix names arrive piecemeal — mark the popup dirty so the next
-    // open rebuilds with fresh labels. We DON'T delete it here because
-    // ms_apply_async can run as a follow-up to a click that originated
-    // inside the popup; deleting the popup mid-event-chain is a
-    // use-after-free that wedges LVGL on the next interaction.
-    s_mix_picker_dirty = true;
+    // Update labels in place rather than tearing down the popup. The
+    // earlier "delete on every notify" pattern accumulated heap churn
+    // (~31 LVGL widgets per rebuild × every mix change) and after a
+    // long session the LVGL allocator's free-list looped or
+    // corrupted, hanging taskLVGL inside lv_malloc.
+    mix_picker_refresh_labels();
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }
