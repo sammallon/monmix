@@ -19,6 +19,7 @@ typedef struct {
     bool (*start)(void);
     void (*set_level)(int ms_channel_id, float level);
     void (*set_mute) (int ms_channel_id, bool mute);
+    void (*set_name) (int ms_channel_id, const char *name);
     void (*stop)(void);
 
     app_ms_state_t (*get_state)(void);

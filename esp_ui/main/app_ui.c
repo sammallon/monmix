@@ -98,6 +98,7 @@ static const ms_client_iface_t *s_ms;
 // can reach it. Overlay is created lazily on first open.
 static lv_obj_t *s_settings_overlay;
 static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
+static lv_obj_t *s_row_name_labels[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t *s_lvl_norm_btn;
 static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
@@ -109,6 +110,16 @@ static lv_obj_t *s_theme_buttons[2]; // dark / light
 static lv_obj_t *s_picker_popup;
 static lv_obj_t *s_picker_title;
 static size_t   s_picker_target_idx;
+
+// Rename popup — full-screen modal with a textarea + on-screen keyboard
+// for editing a channel's scribble-strip name. The same popup is reused
+// for whichever row was last tapped; s_rename_target_idx remembers which
+// channel to apply the new name to.
+static lv_obj_t *s_rename_popup;
+static lv_obj_t *s_rename_title;
+static lv_obj_t *s_rename_textarea;
+static lv_obj_t *s_rename_keyboard;
+static size_t   s_rename_target_idx;
 
 // Mute Enabled — safety toggle that gates mute-button taps. Resets to
 // FALSE on every boot so a power-cycle never leaves the device able to
@@ -148,6 +159,9 @@ static void on_gear_clicked(lv_event_t *e);
 static void on_reboot_clicked(lv_event_t *e);
 static void picker_open(size_t channel_idx);
 static void picker_close(void);
+static void rename_open(size_t channel_idx);
+static void rename_close(void);
+static void on_name_clicked(lv_event_t *e);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
 // is called on the Yes path; Cancel just hides the popup.
@@ -898,6 +912,13 @@ static void build_settings_overlay(void)
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name, row_w - swatch_sz - 16);
         lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        // Tapping the name opens the rename popup. The swatch on the right
+        // already has its own handler for color editing — two distinct
+        // touch zones avoid an ambiguous "what does this row do?" UX.
+        lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+        s_row_name_labels[i] = name;
 
         lv_obj_t *swatch = lv_obj_create(row_obj);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
@@ -924,9 +945,15 @@ static void settings_refresh_state(void)
     update_radio_visuals(s_theme_buttons, 2,
                          (size_t) app_prefs_get_theme());
 
-    // Refresh swatches from app_prefs.
+    // Refresh row names from app_state — they may have changed via MS
+    // scribble-strip broadcasts (or a local rename) since the overlay was
+    // built. Same loop also re-paints the swatches from app_prefs.
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) {
+        app_channel_t ch;
+        if (s_row_name_labels[i] && app_state_get(i, &ch)) {
+            lv_label_set_text(s_row_name_labels[i], ch.name);
+        }
         if (!s_color_swatches[i]) continue;
         int ch_id = app_state_id_for_idx(i);
         int color = (ch_id >= 0) ? app_prefs_get_channel_color(ch_id) : -1;
@@ -1116,6 +1143,121 @@ static void picker_close(void)
     if (s_picker_popup) {
         lv_obj_add_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Rename popup — full-screen modal with a textarea and an on-screen
+// keyboard for editing a channel's scribble-strip name. Save POSTs the
+// new name to MS via the client interface; the existing subscription on
+// `ch.<n>.cfg.name` echoes the change back and updates local state.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void on_rename_save(lv_event_t *e)
+{
+    (void) e;
+    const char *text = lv_textarea_get_text(s_rename_textarea);
+    if (text && *text) {
+        int ch_id = app_state_id_for_idx(s_rename_target_idx);
+        if (ch_id >= 0 && s_ms && s_ms->set_name) {
+            s_ms->set_name(ch_id, text);
+        }
+    }
+    rename_close();
+}
+
+static void on_rename_cancel(lv_event_t *e)
+{
+    (void) e;
+    rename_close();
+}
+
+static void on_rename_kb_event(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY)  on_rename_save  (e);
+    if (code == LV_EVENT_CANCEL) on_rename_cancel(e);
+}
+
+static void build_rename_popup(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(p, 0, 0);
+    lv_obj_set_style_pad_all(p, 12, 0);
+    lv_obj_set_style_radius(p, 0, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_rename_popup = p;
+
+    s_rename_title = lv_label_create(p);
+    lv_label_set_text(s_rename_title, "Rename channel");
+    lv_obj_align(s_rename_title, LV_ALIGN_TOP_LEFT, 4, 4);
+
+    // Cancel + Save buttons in the title row so they're visible above the
+    // keyboard's footprint.
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 110, 36);
+    lv_obj_align(cancel, LV_ALIGN_TOP_RIGHT, -130, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_rename_cancel, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save = lv_button_create(p);
+    lv_obj_set_size(save, 110, 36);
+    lv_obj_align(save, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(save, lv_color_hex(0x40C060), 0);
+    lv_obj_t *save_lbl = lv_label_create(save);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK " Save");
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save, on_rename_save, LV_EVENT_CLICKED, NULL);
+
+    s_rename_textarea = lv_textarea_create(p);
+    lv_obj_set_size(s_rename_textarea, SCREEN_W - 32, 60);
+    lv_obj_align(s_rename_textarea, LV_ALIGN_TOP_LEFT, 4, 56);
+    lv_textarea_set_one_line(s_rename_textarea, true);
+    // MS scribble strip names are typically short — 16 chars is plenty
+    // and prevents accidental overflow on the textarea label widths.
+    lv_textarea_set_max_length(s_rename_textarea, 16);
+
+    s_rename_keyboard = lv_keyboard_create(p);
+    lv_obj_set_size(s_rename_keyboard, SCREEN_W - 32, SCREEN_H - 56 - 60 - 32);
+    lv_obj_align(s_rename_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_keyboard_set_textarea(s_rename_keyboard, s_rename_textarea);
+    // Custom event cb so the keyboard's built-in OK / Close buttons map
+    // to our save / cancel actions instead of just dismissing the keyboard.
+    lv_obj_add_event_cb(s_rename_keyboard, on_rename_kb_event, LV_EVENT_ALL, NULL);
+}
+
+static void rename_open(size_t channel_idx)
+{
+    if (!s_rename_popup) build_rename_popup();
+    s_rename_target_idx = channel_idx;
+
+    app_channel_t ch;
+    if (app_state_get(channel_idx, &ch)) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "Rename: %s", ch.name);
+        lv_label_set_text(s_rename_title, buf);
+        lv_textarea_set_text(s_rename_textarea, ch.name);
+    }
+
+    lv_obj_remove_flag(s_rename_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_rename_popup);
+}
+
+static void rename_close(void)
+{
+    if (s_rename_popup) {
+        lv_obj_add_flag(s_rename_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_name_clicked(lv_event_t *e)
+{
+    size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
+    rename_open(idx);
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -57,6 +57,7 @@ static void set_state(app_ms_state_t s)
 static bool ws_start(void);
 static void ws_set_level(int ms_channel_id, float level);
 static void ws_set_mute (int ms_channel_id, bool mute);
+static void ws_set_name (int ms_channel_id, const char *name);
 static void ws_stop(void);
 static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data);
 static void send_envelope(const char *method, const char *path, const char *body_json);
@@ -79,6 +80,7 @@ static const ms_client_iface_t s_iface = {
     .start              = ws_start,
     .set_level          = ws_set_level,
     .set_mute           = ws_set_mute,
+    .set_name           = ws_set_name,
     .stop               = ws_stop,
     .get_state          = ws_get_state,
     .get_host           = ws_get_host,
@@ -156,6 +158,31 @@ static void ws_set_mute(int ms_channel_id, bool mute)
     // (true = "this channel is silenced"), so flip it on the wire.
     const char *body = mute ? "{\"value\":false}" : "{\"value\":true}";
     send_envelope("POST", path, body);
+}
+
+static void ws_set_name(int ms_channel_id, const char *name)
+{
+    if (!name) return;
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) {
+        ESP_LOGW(TAG, "set_name dropped: ws not connected");
+        return;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "/console/data/set/ch.%d.cfg.name/val", ms_channel_id);
+
+    // Build the JSON body via cJSON so the name string is escaped properly
+    // (quotes, backslashes, control chars) — a hand-rolled snprintf would
+    // miscompose any name with a quote in it.
+    cJSON *body = cJSON_CreateObject();
+    if (!body) return;
+    cJSON_AddStringToObject(body, "value", name);
+    char *body_text = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_text) return;
+
+    send_envelope("POST", path, body_text);
+    free(body_text);
 }
 
 static void ws_stop(void)
