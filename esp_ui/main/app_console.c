@@ -188,10 +188,27 @@ static void emit_b64_line(const uint8_t *src, size_t n)
     }
 }
 
+static int cmd_screenshot_impl(void);
+
 static int cmd_screenshot(int argc, char **argv)
 {
     (void) argc; (void) argv;
 
+    // Silence other tasks' UART logging for the duration of the screenshot.
+    // The base64 emit takes ~2 s of dense UART writes; any concurrent
+    // ESP_LOG output (WS broadcast handlers, wifi events, logd, ...)
+    // interleaves with the base64 stream and breaks the host-side
+    // BEGIN/END marker parsing. The wrapper layer takes care of restoring
+    // the prior level so every return path inside the impl stays simple.
+    esp_log_level_t prior = esp_log_level_get("*");
+    esp_log_level_set("*", ESP_LOG_NONE);
+    int rc = cmd_screenshot_impl();
+    esp_log_level_set("*", prior);
+    return rc;
+}
+
+static int cmd_screenshot_impl(void)
+{
     // The default LVGL draw-buffer allocator pulls from DMA-capable internal
     // RAM (so the PPA can hit it during normal flush). At 1024×600×2 bytes =
     // 1.2 MB that's bigger than the entire internal pool. Snapshots don't
