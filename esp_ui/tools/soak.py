@@ -143,7 +143,13 @@ def send_and_drain(ser: serial.Serial, line: str,
 
 
 def screenshot(ser: serial.Serial, name: str) -> bool:
-    raw = send_and_drain(ser, "screenshot", idle_grace=1.5, max_wait=30)
+    # Bumped max_wait from 30 → 60 s — under realistic WS-broadcast load
+    # the device's snapshot + compress + b64-emit chain can stretch to
+    # ~10–20 s before the BEGIN marker arrives. idle_grace bumped 1.5 →
+    # 5.0 because under load the device can pause for 2–3 s between the
+    # initial echo and the first printf (LVGL render takes lvgl_port_lock
+    # which a still-draining sweep is contesting).
+    raw = send_and_drain(ser, "screenshot", idle_grace=5.0, max_wait=60)
     m = BEGIN_RE.search(raw)
     if not m:
         print(f"  ! {name}: no BEGIN marker")
@@ -306,14 +312,14 @@ def main() -> None:
                 # --- Periodic screenshot ---
                 if now >= next_shot_t:
                     next_shot_t = now + args.shot_every
-                    # Pause REST activity for the screenshot window — the
-                    # base64 emit on UART takes ~2 s and any concurrent
-                    # ESP_LOG output (which the device fires on
-                    # WS-broadcast bursts) interleaves with the base64
-                    # stream and breaks the BEGIN/END marker parsing.
-                    # Push next REST tick out by 3 s; the touch timer
-                    # is already coarse enough to not collide.
-                    next_rest_t = now + 3.0
+                    # Pause REST activity for the screenshot window. The
+                    # device's snapshot + b64-emit chain can take 10–20 s
+                    # under WS-broadcast load (the broadcasts queue up
+                    # async sweeps which run after lvgl_port_lock
+                    # releases). Pushing the next REST tick 15 s out
+                    # gives the device room to drain before we hit it
+                    # again.
+                    next_rest_t = now + 15.0
                     elapsed_min = int((now - start_t) / 60)
                     name = f"soak-{shots:04d}-t{elapsed_min:03d}m"
                     # Drain any pending UART chatter before triggering shot.
