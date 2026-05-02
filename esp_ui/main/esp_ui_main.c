@@ -7,26 +7,16 @@
 #include "app_display.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
+#include "app_ms_info.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
 #include "app_ui.h"
 #include "app_wifi.h"
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "secrets.h"
 
 static const char *TAG = "esp_ui";
-
-// Discovery worker stubbed during boot-stability investigation. Restores
-// the previous M3 behavior: builds the fader UI from the NVS-seeded list.
-static void discovery_task(void *arg)
-{
-    (void) arg;
-    app_ui_present_channels();
-    vTaskDelete(NULL);
-}
 
 void app_main(void)
 {
@@ -98,14 +88,44 @@ void app_main(void)
         app_ui_set_status("WiFi unavailable — UI only");
     }
 
+    // Channel discovery — done HERE, BEFORE ms->start(), so the fader UI
+    // builds exactly once with the final channel list and broadcasts arrive
+    // against an already-built UI. An earlier attempt deferred this to a
+    // worker that fired after the WS connected; rebuilding the tileview
+    // while subscription echoes streamed in starved CPU 0's idle and
+    // tripped the task watchdog.
+    //
+    // /console/information is a plain HTTP GET on the same port as the WS,
+    // so we can call it as soon as WiFi has an IP. If the fetch fails (MS
+    // unreachable, bad response, etc.) we keep the NVS-seeded fallback list.
+    app_ms_info_t info;
+    if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED &&
+        app_ms_info_fetch(APP_MS_HOST, APP_MS_PORT, &info) &&
+        info.input_count > 0) {
+        int ids[APP_CONFIG_MAX_CHANNELS];
+        // Cap at 12 for now — empirically the LVGL task starves IDLE0 when
+        // building >12 fader strips while WS broadcasts arrive. Channel
+        // selection (#33) will let the user grow this once the static
+        // arrays move to PSRAM and the rebuild path is hardened.
+        const int safe_max = 12;
+        int  n = 0;
+        for (int i = 0; i < info.input_count && i < safe_max; ++i) {
+            ids[n++] = info.input_offset + i;
+        }
+        app_state_init(ids, (size_t) n);
+        ESP_LOGI(TAG, "discovery: %d MS inputs available, using first %d",
+                 info.input_count, n);
+    } else {
+        ESP_LOGW(TAG, "discovery: /console/information unavailable, using fallback");
+    }
+
+    // Build the fader UI now, BEFORE ms->start. Must happen here so the
+    // tileview is fully constructed by the time the WS subscriptions echo
+    // initial values back; rebuilding the UI under live broadcast traffic
+    // hangs the LVGL task.
+    app_ui_present_channels();
+
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up.
     ms->start();
-
-    // Discovery worker: waits for the WS to come up, fetches channel
-    // architecture from MS, reseeds app_state, and finally builds the
-    // fader UI. Until then the user sees the loading spinner mounted by
-    // app_ui_init.
-    xTaskCreate(discovery_task, "ms_discovery", 16 * 1024,
-                (void *) ms, 5, NULL);
 }
