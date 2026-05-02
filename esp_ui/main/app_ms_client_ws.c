@@ -3,6 +3,8 @@
 #include "app_state.h"
 #include "secrets.h"
 
+#include "esp_attr.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -31,6 +33,17 @@ static const char *TAG = "ms_ws";
 #define WS_GET_PREFIX_LEN      (sizeof(WS_GET_PREFIX) - 1)
 
 static int s_mix_bus_idx;
+
+// Mix-bus layout — set by app_main from /console/information after WiFi
+// associates. Mix scribble-strip names live at ch.<offset+i>.cfg.name and
+// arrive via the same broadcast path as channel names. Names array goes
+// to PSRAM (EXT_RAM_BSS_ATTR) — internal SRAM is tight enough that the
+// 768 bytes of names alone can prevent the FreeRTOS timer task from
+// allocating its stack at boot.
+#define MAX_MIX_BUSES 24
+static int  s_mix_offset;
+static int  s_mix_count;
+EXT_RAM_BSS_ATTR static char s_mix_names[MAX_MIX_BUSES][32];
 
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
@@ -80,6 +93,33 @@ static void           ws_register_on_change(app_ms_on_change_t cb, void *ctx)
 
 static int ws_get_mix(void) { return s_mix_bus_idx; }
 
+static void ws_set_mix_layout(int offset, int count)
+{
+    if (offset < 0)             offset = 0;
+    if (count  < 0)             count  = 0;
+    if (count  > MAX_MIX_BUSES) count  = MAX_MIX_BUSES;
+    s_mix_offset = offset;
+    s_mix_count  = count;
+    // Subscribe to each mix's scribble-strip name so the picker can show
+    // "FOH" / "Drums" instead of "Mix 1" / "Mix 2". Initial values arrive
+    // immediately on subscribe; later edits in MS rebroadcast through the
+    // same path. handle_broadcast routes by ch index.
+    if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+        for (int i = 0; i < s_mix_count; ++i) {
+            char dotted[32];
+            snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
+            subscribe_path(dotted, "val");
+        }
+    }
+}
+
+static const char *ws_get_mix_name(int mix_idx)
+{
+    if (mix_idx < 0 || mix_idx >= s_mix_count) return NULL;
+    if (s_mix_names[mix_idx][0] == '\0')        return NULL;
+    return s_mix_names[mix_idx];
+}
+
 static void ws_resubscribe(void)
 {
     if (s_ws && esp_websocket_client_is_connected(s_ws)) {
@@ -115,6 +155,8 @@ static const ms_client_iface_t s_iface = {
     .register_on_change = ws_register_on_change,
     .get_mix            = ws_get_mix,
     .set_mix            = ws_set_mix,
+    .set_mix_layout     = ws_set_mix_layout,
+    .get_mix_name       = ws_get_mix_name,
     .resubscribe        = ws_resubscribe,
 };
 
@@ -341,6 +383,16 @@ static void handle_broadcast(const char *json, size_t len)
         int idx = app_state_idx_for_id(ch);
         if (idx >= 0) {
             app_state_set_name((size_t)idx, jvalue->valuestring, true);
+        }
+        // Mix scribble-strip names use the same path; if this ch falls in
+        // the mix range, cache the name for the selector popup.
+        if (s_mix_count > 0 && ch >= s_mix_offset &&
+            ch < s_mix_offset + s_mix_count) {
+            int mix_idx = ch - s_mix_offset;
+            strncpy(s_mix_names[mix_idx], jvalue->valuestring,
+                    sizeof(s_mix_names[mix_idx]) - 1);
+            s_mix_names[mix_idx][sizeof(s_mix_names[mix_idx]) - 1] = '\0';
+            notify_subscribers();
         }
     }
 

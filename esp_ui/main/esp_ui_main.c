@@ -125,6 +125,14 @@ void app_main(void)
     // right number of buttons. 0 = no MS info → selector stays hidden.
     app_ui_set_mix_count(info_ok ? info.mix_count : 0);
 
+    // Tell the WS client where the mix strips live in the dotted-path
+    // namespace so it can subscribe to their scribble-strip names. Names
+    // come back via the same broadcast path as channel names; the picker
+    // popup uses them in place of "Mix N" placeholders.
+    if (info_ok && ms->set_mix_layout) {
+        ms->set_mix_layout(info.mix_offset, info.mix_count);
+    }
+
     // Build the fader UI now, BEFORE ms->start. Must happen here so the
     // tileview is fully constructed by the time the WS subscriptions echo
     // initial values back; rebuilding the UI under live broadcast traffic

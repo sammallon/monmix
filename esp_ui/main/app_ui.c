@@ -1265,8 +1265,14 @@ static void picker_close(void)
 static void mix_indicator_refresh(void)
 {
     if (!s_mix_indicator_label || !s_ms || !s_ms->get_mix) return;
-    char buf[16];
-    snprintf(buf, sizeof(buf), "Mix %d", s_ms->get_mix() + 1);
+    int cur = s_ms->get_mix();
+    const char *name = (s_ms->get_mix_name) ? s_ms->get_mix_name(cur) : NULL;
+    char buf[24];
+    if (name) {
+        snprintf(buf, sizeof(buf), "%s", name);
+    } else {
+        snprintf(buf, sizeof(buf), "Mix %d", cur + 1);
+    }
     lv_label_set_text(s_mix_indicator_label, buf);
 }
 
@@ -1334,8 +1340,11 @@ static void build_mix_picker_popup(void)
         lv_obj_t *btn = lv_button_create(p);
         lv_obj_set_size(btn, btn_w, btn_h);
         lv_obj_set_pos(btn, x, y);
-        char buf[16];
-        snprintf(buf, sizeof(buf), "Mix %d", i + 1);
+        const char *name = (s_ms && s_ms->get_mix_name) ? s_ms->get_mix_name(i)
+                                                         : NULL;
+        char buf[24];
+        if (name) snprintf(buf, sizeof(buf), "%s", name);
+        else      snprintf(buf, sizeof(buf), "Mix %d", i + 1);
         lv_obj_t *lbl = lv_label_create(btn);
         lv_label_set_text(lbl, buf);
         lv_obj_center(lbl);
@@ -1855,6 +1864,13 @@ static void ms_apply_async(void *unused)
     (void)unused;
     ms_icon_refresh();
     mix_indicator_refresh();
+    // Mix names arrive piecemeal as broadcasts; drop the cached popup so
+    // the next open rebuilds with fresh labels. Cheap — the popup is
+    // small and only built when actually opened.
+    if (s_mix_picker_popup) {
+        lv_obj_delete(s_mix_picker_popup);
+        s_mix_picker_popup = NULL;
+    }
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }

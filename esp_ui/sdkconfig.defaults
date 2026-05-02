@@ -20,6 +20,12 @@ CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Allow large BSS-resident arrays to live in PSRAM via EXT_RAM_BSS_ATTR.
+# Without this, every static array competes for the ~440 KB internal SRAM
+# pool that also has to hold the FreeRTOS task stacks. Used by
+# s_mix_names (app_ms_client_ws.c) and a planned migration of the
+# per-channel widget/state arrays (#42).
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 
 # Custom partition table (4 MB app + 8 MB FAT for fonts/assets/NVS overflow).
 CONFIG_PARTITION_TABLE_CUSTOM=y

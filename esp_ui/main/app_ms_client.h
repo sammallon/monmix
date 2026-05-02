@@ -33,6 +33,17 @@ typedef struct {
     int  (*get_mix)(void);
     void (*set_mix)(int mix_idx);
 
+    // Set the mix-bus layout from /console/information's Mix channelType.
+    // Tells the client where in the ch.<n>.* namespace the mix strips live
+    // (offset = first mix's channel id, count = how many) so it can
+    // subscribe to their cfg.name scribble strips.
+    void (*set_mix_layout)(int offset, int count);
+
+    // Mix scribble-strip name. Returns NULL if the layout hasn't been set
+    // or the name hasn't broadcast yet. Caller should fall back to
+    // "Mix <idx+1>" when NULL.
+    const char *(*get_mix_name)(int mix_idx);
+
     // Re-subscribe every tracked channel under the current mix bus. Used
     // by the discovery flow after reseeding app_state. No-op when the WS
     // isn't connected.
