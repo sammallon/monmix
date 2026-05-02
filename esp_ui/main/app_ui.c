@@ -129,6 +129,13 @@ static lv_obj_t *s_rename_textarea;
 static lv_obj_t *s_rename_keyboard;
 static size_t   s_rename_target_idx;
 
+// Spinner shown when MS is not yet CONNECTED — replaces the fader strips
+// during boot / outage so the user sees an unambiguous "waiting on the
+// console" state instead of strips with no live data. Hidden once MS
+// transitions to CONNECTED; reshown on disconnect / error.
+static lv_obj_t *s_spinner;
+static lv_obj_t *s_spinner_label;
+
 // Mute Enabled — safety toggle that gates mute-button taps. Resets to
 // FALSE on every boot so a power-cycle never leaves the device able to
 // silence channels by accident. Mute button visuals continue to track
@@ -643,11 +650,23 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_center(s_ms_icon_label);
     lv_obj_add_event_cb(ms_btn, on_ms_clicked, LV_EVENT_CLICKED, NULL);
 
+    // Loading spinner — shown while we're not connected to MS so the user
+    // sees an explicit "waiting" state instead of stale / empty fader
+    // strips. Position centered in the fader area; the tileview overlays
+    // it once we're connected.
+    s_spinner = lv_spinner_create(scr);
+    lv_obj_set_size(s_spinner, 80, 80);
+    lv_obj_align(s_spinner, LV_ALIGN_CENTER, 0, -10);
+    s_spinner_label = lv_label_create(scr);
+    lv_label_set_text(s_spinner_label, "Connecting to console...");
+    lv_obj_align_to(s_spinner_label, s_spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
+
     // Tileview holds one tile per page. Horizontal swipe between pages.
     s_tileview = lv_tileview_create(scr);
     lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
     lv_obj_set_pos(s_tileview, 0, TILEVIEW_Y);
     lv_obj_set_style_border_width(s_tileview, 0, 0);
+    lv_obj_add_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);   // hidden until MS connects
 
     size_t total = app_state_count();
     s_page_count = (total + FADERS_PER_PAGE - 1) / FADERS_PER_PAGE;
@@ -1643,6 +1662,24 @@ static void ms_apply_async(void *unused)
     // time the state transitions so the user can't drag a slider into the
     // void during an outage.
     apply_controls_enabled();
+
+    // Toggle the spinner ↔ fader tileview based on MS connection. Hidden
+    // strips during an outage prevent the user from interacting with stale
+    // values; the spinner makes the waiting state explicit.
+    bool ms_connected = (s_ms && s_ms->get_state &&
+                         s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    if (s_tileview) {
+        if (ms_connected) lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag   (s_tileview, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_spinner) {
+        if (ms_connected) lv_obj_add_flag   (s_spinner, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_remove_flag(s_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_spinner_label) {
+        if (ms_connected) lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_remove_flag(s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void on_ms_state_change(void *ctx)
