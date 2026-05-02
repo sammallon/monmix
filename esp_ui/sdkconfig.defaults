@@ -117,6 +117,13 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # erases the partition. Decode host-side with `espcoredump.py info_corefile`.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 
+# WDT panic — when a task starves IDLE0/1 past CONFIG_ESP_TASK_WDT_TIMEOUT_S,
+# trigger a panic + coredump + reboot instead of silently looping the WDT
+# print every N seconds. The coredump pipeline above picks up the wedged
+# stack for postmortem; the auto-reboot recovers the device without
+# requiring a power cycle (which the current pre-WDT-panic builds did).
+CONFIG_ESP_TASK_WDT_PANIC=y
+
 # Pull NTP server hint from DHCP option 42 when the network offers one.
 # app_ui's clock prefers the DHCP-supplied server and falls back to the
 # static pool entries when the lease has none (see start_clock_once).

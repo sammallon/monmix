@@ -201,17 +201,47 @@ static void logger_task(void *arg)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Heartbeat — emits a line every 10 s with heap stats so quiet periods
-// still leave time markers in the log.
+// Heartbeat — emits a line every 10 s with per-cap heap stats so quiet
+// periods still leave time markers in the log AND we can watch
+// fragmentation accumulating before it crashes us. The previous
+// "free=N min=N" format just showed the dominant pool (usually PSRAM)
+// and hid the internal-RAM exhaustion that bites the most.
+//
+// Once per minute (every 6 heartbeats) we also run
+// heap_caps_check_integrity_all so corruption gets reported at the
+// source instead of 22 minutes later inside lv_malloc.
 // ─────────────────────────────────────────────────────────────────────────
+
+#define HEARTBEAT_INTEGRITY_PERIOD 6
 
 static void heartbeat_task(void *arg)
 {
+    (void) arg;
+    int integ_ctr = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_MS));
-        APP_LOGD_I("hb", "free=%u min=%u",
-                   (unsigned) esp_get_free_heap_size(),
-                   (unsigned) esp_get_minimum_free_heap_size());
+
+        multi_heap_info_t in, sp;
+        heap_caps_get_info(&in, MALLOC_CAP_INTERNAL);
+        heap_caps_get_info(&sp, MALLOC_CAP_SPIRAM);
+        APP_LOGD_I("hb",
+                   "int free=%u largest=%u min=%u | spi free=%u largest=%u",
+                   (unsigned) in.total_free_bytes,
+                   (unsigned) in.largest_free_block,
+                   (unsigned) in.minimum_free_bytes,
+                   (unsigned) sp.total_free_bytes,
+                   (unsigned) sp.largest_free_block);
+
+        if (++integ_ctr >= HEARTBEAT_INTEGRITY_PERIOD) {
+            integ_ctr = 0;
+            // print_errors=true makes the heap component dump a full
+            // diagnostic to UART before we even get to log it ourselves;
+            // the early dump is what we'd actually use to chase corruption.
+            if (!heap_caps_check_integrity_all(true)) {
+                APP_LOGD_E("hb", "HEAP CORRUPTION DETECTED");
+                ESP_LOGE(TAG, "HEAP CORRUPTION DETECTED");
+            }
+        }
     }
 }
 
@@ -246,7 +276,10 @@ void app_logd_init(void)
     }
 
     xTaskCreate(logger_task,    "logd",    4096, NULL, 2, NULL);
-    xTaskCreate(heartbeat_task, "logd_hb", 2048, NULL, 1, NULL);
+    // Heartbeat stack bumped from 2048 — heap_caps_check_integrity_all
+    // walks every block in every region and uses noticeable stack for
+    // the per-region recursion.
+    xTaskCreate(heartbeat_task, "logd_hb", 4096, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "logd up; current=monmix-%04d.log; trace=%s",
              s_seq, s_trace_on ? "on" : "off");
