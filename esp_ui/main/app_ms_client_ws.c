@@ -25,10 +25,12 @@ static const char *TAG = "ms_ws";
 //   on stage WiFi, and it scales naturally to per-musician channel
 //   selection later.
 //
-//   "Mix 1" in the MS UI = MIX index 0. M1 hardcodes a single mix bus.
-#define APP_MS_MIX_BUS         0
+//   "Mix 1" in the MS UI = MIX index 0. Runtime-selectable via ws_set_mix;
+//   defaults to 0 on boot.
 #define WS_GET_PREFIX          "/console/data/get/"
 #define WS_GET_PREFIX_LEN      (sizeof(WS_GET_PREFIX) - 1)
+
+static int s_mix_bus_idx;
 
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
@@ -76,6 +78,31 @@ static void           ws_register_on_change(app_ms_on_change_t cb, void *ctx)
     s_subscriber_count++;
 }
 
+static int ws_get_mix(void) { return s_mix_bus_idx; }
+
+static void ws_resubscribe(void)
+{
+    if (s_ws && esp_websocket_client_is_connected(s_ws)) {
+        on_connected_subscribe_all();
+    }
+}
+
+static void ws_set_mix(int mix_idx)
+{
+    if (mix_idx < 0)               return;
+    if (s_mix_bus_idx == mix_idx)  return;
+    s_mix_bus_idx = mix_idx;
+    ESP_LOGI(TAG, "mix bus -> %d (Mix %d)", mix_idx, mix_idx + 1);
+    // Re-subscribe per-channel under the new mix index. MS dedupes on
+    // path, so the old mix's subscriptions remain active server-side and
+    // continue broadcasting; handle_broadcast filters those by current
+    // s_mix_bus_idx and silently drops them. True unsubscribe support is
+    // a follow-up — the leak is bounded (N channels per mix selected this
+    // session) and resets on WS reconnect.
+    ws_resubscribe();
+    notify_subscribers();
+}
+
 static const ms_client_iface_t s_iface = {
     .start              = ws_start,
     .set_level          = ws_set_level,
@@ -86,6 +113,9 @@ static const ms_client_iface_t s_iface = {
     .get_host           = ws_get_host,
     .get_port           = ws_get_port,
     .register_on_change = ws_register_on_change,
+    .get_mix            = ws_get_mix,
+    .set_mix            = ws_set_mix,
+    .resubscribe        = ws_resubscribe,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -133,7 +163,7 @@ static void ws_set_level(int ms_channel_id, float level)
     char path[80];
     snprintf(path, sizeof(path),
              "/console/data/set/ch.%d.levelData.%d.lvl/norm",
-             ms_channel_id, APP_MS_MIX_BUS);
+             ms_channel_id, s_mix_bus_idx);
 
     char body[48];
     snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)level);
@@ -151,7 +181,7 @@ static void ws_set_mute(int ms_channel_id, bool mute)
     char path[80];
     snprintf(path, sizeof(path),
              "/console/data/set/ch.%d.levelData.%d.on/val",
-             ms_channel_id, APP_MS_MIX_BUS);
+             ms_channel_id, s_mix_bus_idx);
 
     // MS `.on` is a bool: true = audible (NOT muted), false = muted. We
     // expose `mute` to the rest of the firmware as the user-facing boolean
@@ -228,7 +258,7 @@ static void on_connected_subscribe_all(void)
 
         char dotted[48];
         snprintf(dotted, sizeof(dotted),
-                 "ch.%d.levelData.%d.lvl", ch_id, APP_MS_MIX_BUS);
+                 "ch.%d.levelData.%d.lvl", ch_id, s_mix_bus_idx);
         subscribe_path(dotted, "norm");
 
         // Same level node, different alias + format → MS sends dB. We need
@@ -236,14 +266,14 @@ static void on_connected_subscribe_all(void)
         // user-facing readout (with non-linear MS-specific mapping that we
         // can't compute locally).
         snprintf(dotted, sizeof(dotted),
-                 "ch.%d.levelData.%d.level", ch_id, APP_MS_MIX_BUS);
+                 "ch.%d.levelData.%d.level", ch_id, s_mix_bus_idx);
         subscribe_path(dotted, "val");
 
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", ch_id);
         subscribe_path(dotted, "val");
 
         snprintf(dotted, sizeof(dotted),
-                 "ch.%d.levelData.%d.on", ch_id, APP_MS_MIX_BUS);
+                 "ch.%d.levelData.%d.on", ch_id, s_mix_bus_idx);
         subscribe_path(dotted, "val");
     }
     ESP_LOGI(TAG, "subscribed %d channels", (int)app_state_count());
@@ -289,7 +319,7 @@ static void handle_broadcast(const char *json, size_t len)
     int  ch = 0, mix = 0;
     char suffix[16] = {0};
     if (sscanf(dotted, "ch.%d.levelData.%d.%15s", &ch, &mix, suffix) == 3 &&
-        mix == APP_MS_MIX_BUS) {
+        mix == s_mix_bus_idx) {
         int idx = app_state_idx_for_id(ch);
         if (idx >= 0) {
             if (strcmp(suffix, "lvl") == 0 && cJSON_IsNumber(jvalue)) {

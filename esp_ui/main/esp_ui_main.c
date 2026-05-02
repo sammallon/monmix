@@ -99,9 +99,11 @@ void app_main(void)
     // so we can call it as soon as WiFi has an IP. If the fetch fails (MS
     // unreachable, bad response, etc.) we keep the NVS-seeded fallback list.
     app_ms_info_t info;
+    bool info_ok = false;
     if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED &&
         app_ms_info_fetch(APP_MS_HOST, APP_MS_PORT, &info) &&
         info.input_count > 0) {
+        info_ok = true;
         int ids[APP_CONFIG_MAX_CHANNELS];
         // Cap at 12 for now — empirically the LVGL task starves IDLE0 when
         // building >12 fader strips while WS broadcasts arrive. Channel
@@ -118,6 +120,10 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "discovery: /console/information unavailable, using fallback");
     }
+
+    // Hand the mix count to the UI so the selector populates with the
+    // right number of buttons. 0 = no MS info → selector stays hidden.
+    app_ui_set_mix_count(info_ok ? info.mix_count : 0);
 
     // Build the fader UI now, BEFORE ms->start. Must happen here so the
     // tileview is fully constructed by the time the WS subscriptions echo

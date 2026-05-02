@@ -119,6 +119,15 @@ static lv_obj_t *s_picker_popup;
 static lv_obj_t *s_picker_title;
 static size_t   s_picker_target_idx;
 
+// Mix bus selector — small button in the top bar shows the active mix
+// label ("Mix N"); tap opens a grid popup of N mixes. Mix count is set
+// by app_main from /console/information after WiFi associates. Active
+// mix lives in app_ms_client (s_mix_bus_idx) — the UI is just the surface.
+static lv_obj_t *s_mix_indicator;        // status-bar button
+static lv_obj_t *s_mix_indicator_label;  // label inside it
+static lv_obj_t *s_mix_picker_popup;
+static int       s_mix_count;            // 0 = popup not yet usable
+
 // Rename popup — full-screen modal with a textarea + on-screen keyboard
 // for editing a channel's scribble-strip name. The same popup is reused
 // for whichever row was last tapped; s_rename_target_idx remembers which
@@ -176,6 +185,10 @@ static void picker_open(size_t channel_idx);
 static void picker_close(void);
 static void rename_open(size_t channel_idx);
 static void rename_close(void);
+static void mix_picker_open(void);
+static void mix_picker_close(void);
+static void mix_indicator_refresh(void);
+static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
@@ -649,6 +662,19 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_label_set_text(s_ms_icon_label, LV_SYMBOL_AUDIO);
     lv_obj_center(s_ms_icon_label);
     lv_obj_add_event_cb(ms_btn, on_ms_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Mix-bus indicator — left of the MS icon. Shows the active mix label
+    // ("Mix N"); tap opens the selector popup. Hidden until app_main tells
+    // us how many mixes the connected console exposes.
+    s_mix_indicator = lv_button_create(scr);
+    lv_obj_set_size(s_mix_indicator, 90, 28);
+    lv_obj_align(s_mix_indicator, LV_ALIGN_TOP_RIGHT, -118, 2);
+    s_mix_indicator_label = lv_label_create(s_mix_indicator);
+    lv_label_set_text(s_mix_indicator_label, "Mix 1");
+    lv_obj_center(s_mix_indicator_label);
+    lv_obj_add_event_cb(s_mix_indicator, on_mix_indicator_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
 
     // Loading spinner — shown while we're not connected to MS so the user
     // sees an explicit "waiting" state instead of stale / empty fader
@@ -1230,6 +1256,137 @@ static void picker_close(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Mix-bus selector — modal popup of N buttons (one per mix); tap one to
+// switch the active mix. The label is "Mix N" until scribble-strip names
+// land in a follow-up; the protocol-side mix index is 0-based so the
+// label is i+1.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void mix_indicator_refresh(void)
+{
+    if (!s_mix_indicator_label || !s_ms || !s_ms->get_mix) return;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Mix %d", s_ms->get_mix() + 1);
+    lv_label_set_text(s_mix_indicator_label, buf);
+}
+
+static void on_mix_choice(lv_event_t *e)
+{
+    int mix_idx = (int)(intptr_t) lv_event_get_user_data(e);
+    if (s_ms && s_ms->set_mix) s_ms->set_mix(mix_idx);
+    mix_indicator_refresh();
+    mix_picker_close();
+}
+
+static void on_mix_picker_close_clicked(lv_event_t *e)
+{
+    (void) e;
+    mix_picker_close();
+}
+
+static void build_mix_picker_popup(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    // 4-column grid; cols × rows sized to fit the current mix count.
+    const int btn_w  = 110;
+    const int btn_h  = 50;
+    const int gap    = 10;
+    const int pad    = 20;
+    const int header = 40;
+    const int cols   = 4;
+    int rows         = (s_mix_count + cols - 1) / cols;
+    if (rows < 1) rows = 1;
+
+    int inner_w = cols * btn_w + (cols - 1) * gap;
+    int inner_h = rows * btn_h + (rows - 1) * gap;
+    int popup_w = inner_w + 2 * pad;
+    int popup_h = inner_h + 2 * pad + header;
+
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, popup_w, popup_h);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, pad, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_mix_picker_popup = p;
+
+    lv_obj_t *title = lv_label_create(p);
+    lv_label_set_text(title, "Mix");
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(p);
+    lv_obj_set_size(close_btn, 32, 32);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_mix_picker_close_clicked,
+                        LV_EVENT_CLICKED, NULL);
+
+    for (int i = 0; i < s_mix_count; ++i) {
+        int row = i / cols;
+        int col = i % cols;
+        int x   = col * (btn_w + gap);
+        int y   = header + row * (btn_h + gap);
+
+        lv_obj_t *btn = lv_button_create(p);
+        lv_obj_set_size(btn, btn_w, btn_h);
+        lv_obj_set_pos(btn, x, y);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "Mix %d", i + 1);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, buf);
+        lv_obj_center(lbl);
+        lv_obj_add_event_cb(btn, on_mix_choice, LV_EVENT_CLICKED,
+                            (void *)(intptr_t) i);
+    }
+}
+
+static void mix_picker_open(void)
+{
+    if (s_mix_count <= 0) return;
+    if (!s_mix_picker_popup) build_mix_picker_popup();
+    lv_obj_remove_flag(s_mix_picker_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_mix_picker_popup);
+}
+
+static void mix_picker_close(void)
+{
+    if (s_mix_picker_popup) {
+        lv_obj_add_flag(s_mix_picker_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_mix_indicator_clicked(lv_event_t *e)
+{
+    (void) e;
+    mix_picker_open();
+}
+
+void app_ui_set_mix_count(int count)
+{
+    if (count < 0) count = 0;
+    s_mix_count = count;
+    if (!s_mix_indicator) return;
+    if (!lvgl_port_lock(1000)) return;
+    if (s_mix_count > 0) {
+        lv_obj_remove_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
+        mix_indicator_refresh();
+    } else {
+        lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
+    }
+    // If the popup was already built for an earlier count, drop it so
+    // the next open builds a fresh grid sized to the new count.
+    if (s_mix_picker_popup) {
+        lv_obj_delete(s_mix_picker_popup);
+        s_mix_picker_popup = NULL;
+    }
+    lvgl_port_unlock();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Rename popup — full-screen modal with a textarea and an on-screen
 // keyboard for editing a channel's scribble-strip name. Save POSTs the
 // new name to MS via the client interface; the existing subscription on
@@ -1697,6 +1854,7 @@ static void ms_apply_async(void *unused)
 {
     (void)unused;
     ms_icon_refresh();
+    mix_indicator_refresh();
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }
