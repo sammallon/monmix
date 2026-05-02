@@ -127,6 +127,7 @@ static lv_obj_t *s_mix_indicator;        // status-bar button
 static lv_obj_t *s_mix_indicator_label;  // label inside it
 static lv_obj_t *s_mix_picker_popup;
 static int       s_mix_count;            // 0 = popup not yet usable
+static bool      s_mix_picker_dirty;     // names changed; rebuild on next open
 
 // Rename popup — full-screen modal with a textarea + on-screen keyboard
 // for editing a channel's scribble-strip name. The same popup is reused
@@ -1356,6 +1357,15 @@ static void build_mix_picker_popup(void)
 static void mix_picker_open(void)
 {
     if (s_mix_count <= 0) return;
+    // If labels have changed since we last built, drop the cached popup
+    // so the rebuild below picks them up. Safe here because we're at
+    // the start of an open click, not in the middle of a previous
+    // close/notify chain.
+    if (s_mix_picker_dirty && s_mix_picker_popup) {
+        lv_obj_delete(s_mix_picker_popup);
+        s_mix_picker_popup = NULL;
+    }
+    s_mix_picker_dirty = false;
     if (!s_mix_picker_popup) build_mix_picker_popup();
     lv_obj_remove_flag(s_mix_picker_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_mix_picker_popup);
@@ -1864,13 +1874,12 @@ static void ms_apply_async(void *unused)
     (void)unused;
     ms_icon_refresh();
     mix_indicator_refresh();
-    // Mix names arrive piecemeal as broadcasts; drop the cached popup so
-    // the next open rebuilds with fresh labels. Cheap — the popup is
-    // small and only built when actually opened.
-    if (s_mix_picker_popup) {
-        lv_obj_delete(s_mix_picker_popup);
-        s_mix_picker_popup = NULL;
-    }
+    // Mix names arrive piecemeal — mark the popup dirty so the next
+    // open rebuilds with fresh labels. We DON'T delete it here because
+    // ms_apply_async can run as a follow-up to a click that originated
+    // inside the popup; deleting the popup mid-event-chain is a
+    // use-after-free that wedges LVGL on the next interaction.
+    s_mix_picker_dirty = true;
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }
