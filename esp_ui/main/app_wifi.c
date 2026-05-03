@@ -18,8 +18,11 @@
 
 static const char *TAG = "app_wifi";
 
-#define BIT_CONNECTED (1 << 0)
-#define BIT_FAILED    (1 << 1)
+#define BIT_CONNECTED            (1 << 0)
+#define BIT_FAILED               (1 << 1)
+// Set on every IP_EVENT_STA_GOT_IP and consumed by force_reassociate.
+// Distinct from BIT_CONNECTED, which is sticky after the boot wait.
+#define BIT_GOT_IP_SINCE_REASSOC (1 << 2)
 #define MAX_RETRIES         20
 #define RETRY_BACKOFF_MS    1000
 
@@ -27,6 +30,19 @@ static EventGroupHandle_t s_evt;
 static int                s_retry;
 static app_wifi_state_t   s_state = APP_WIFI_STATE_BOOT;
 static esp_ip4_addr_t     s_ip;          // latest assigned IP, zero when none
+
+// Set by app_wifi_force_reassociate before esp_wifi_disconnect(). The next
+// STA_DISCONNECTED is treated as expected: reconnect immediately, do NOT
+// bump s_retry. Without this, every WS-watchdog reassociate ate one of the
+// 20 retry slots; ~20 cycles of an intermittent server killed wifi for the
+// rest of the session.
+static volatile bool      s_intentional_disconnect;
+
+// Reconnect task absorbs the retry-backoff sleep so the wifi/IP event task
+// never blocks. The 1 s vTaskDelay used to be inside on_event, which
+// queued any subsequent WIFI_EVENT/IP_EVENT (including the GOT_IP that
+// resets s_retry) for the duration of the wait.
+static TaskHandle_t       s_reconnect_task;
 
 #define MAX_SUBSCRIBERS 4
 static struct {
@@ -61,6 +77,22 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
         s_ip.addr = 0;
+
+        // Intentional path: caller (force_reassociate) just asked for this.
+        // Reconnect inline; no backoff, no retry-counter pollution. Clear
+        // the flag immediately so a real disconnect that races behind it
+        // takes the unexpected path.
+        if (s_intentional_disconnect) {
+            s_intentional_disconnect = false;
+            ESP_LOGI(TAG, "intentional disconnect (reason=%d), reconnecting",
+                     e ? e->reason : -1);
+            APP_LOGD_I("app_wifi", "intentional disconnect reason=%d",
+                       e ? e->reason : -1);
+            set_state(APP_WIFI_STATE_CONNECTING);
+            esp_wifi_connect();
+            return;
+        }
+
         if (s_retry < MAX_RETRIES) {
             ++s_retry;
             ESP_LOGW(TAG, "disconnect (reason=%d), retry %d/%d in %d ms",
@@ -68,8 +100,10 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             APP_LOGD_W("app_wifi", "disconnect reason=%d retry=%d/%d",
                        e ? e->reason : -1, s_retry, MAX_RETRIES);
             set_state(APP_WIFI_STATE_CONNECTING);
-            vTaskDelay(pdMS_TO_TICKS(RETRY_BACKOFF_MS));
-            esp_wifi_connect();
+            // Hand the backoff off to s_reconnect_task. Blocking the event
+            // task would queue any subsequent WIFI_EVENT/IP_EVENT — most
+            // notably GOT_IP, which is what resets s_retry.
+            if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
         } else {
             ESP_LOGE(TAG, "wifi connect exhausted retries (last reason=%d)",
                      e ? e->reason : -1);
@@ -85,7 +119,20 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ip = evt->ip_info.ip;
         s_retry = 0;
         set_state(APP_WIFI_STATE_CONNECTED);
-        xEventGroupSetBits(s_evt, BIT_CONNECTED);
+        xEventGroupSetBits(s_evt, BIT_CONNECTED | BIT_GOT_IP_SINCE_REASSOC);
+    }
+}
+
+static void reconnect_task(void *arg)
+{
+    (void) arg;
+    while (1) {
+        // ulTaskNotifyTake collapses bursts into a single wakeup, which is
+        // exactly what we want: multiple disconnects between sleeps just
+        // become "one more reconnect attempt".
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(RETRY_BACKOFF_MS));
+        esp_wifi_connect();
     }
 }
 
@@ -129,7 +176,53 @@ void app_wifi_init_radio(void)
     // NB: app_wifi_apply_ip_config() runs from app_main AFTER app_prefs_init.
     // We can't call it here -- this function runs before prefs are loaded
     // (the SDMMC singleton forces this order, see CLAUDE.md).
+
+    // Reconnect-backoff task before esp_wifi_start so it's ready by the
+    // time the first STA_DISCONNECTED could fire. Stack 3072 is plenty --
+    // it only does ulTaskNotifyTake + vTaskDelay + esp_wifi_connect.
+    xTaskCreate(reconnect_task, "wifi_reconn", 3072, NULL, 5,
+                &s_reconnect_task);
+
     ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+bool app_wifi_force_reassociate(uint32_t timeout_ms)
+{
+    if (!s_evt) return false;
+
+    // Clear the GOT_IP signal so we wait for the *next* one.
+    xEventGroupClearBits(s_evt, BIT_GOT_IP_SINCE_REASSOC);
+    s_intentional_disconnect = true;
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        s_intentional_disconnect = false;
+        ESP_LOGW(TAG, "force_reassociate: disconnect failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    if (err == ESP_ERR_WIFI_NOT_CONNECT) {
+        // Already disconnected — no STA_DISCONNECTED will fire to consume
+        // the flag, and we'd misclassify the next real disconnect. Clear
+        // it ourselves and drive the reconnect inline.
+        s_intentional_disconnect = false;
+        esp_wifi_connect();
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_evt, BIT_GOT_IP_SINCE_REASSOC | BIT_FAILED,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+
+    // Belt-and-suspenders: if the flag is somehow still set (e.g. timeout
+    // before any disconnect event), clear it so the next real event isn't
+    // misclassified.
+    s_intentional_disconnect = false;
+
+    if (bits & BIT_GOT_IP_SINCE_REASSOC) {
+        xEventGroupClearBits(s_evt, BIT_GOT_IP_SINCE_REASSOC);
+        return true;
+    }
+    return false;
 }
 
 bool app_wifi_wait_connected(void)

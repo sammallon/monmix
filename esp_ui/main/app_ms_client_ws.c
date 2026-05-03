@@ -40,6 +40,7 @@
 #include "app_ms_info.h"
 #include "app_prefs.h"
 #include "app_state.h"
+#include "app_wifi.h"
 
 #include <stdio.h>
 #include <stdlib.h>

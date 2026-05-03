@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef enum {
     APP_WIFI_STATE_BOOT = 0,    // before init
@@ -78,3 +79,13 @@ app_wifi_scan_result_t app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *c
 // caller passes a `dst` of at least max_count strings each at least
 // 33 bytes. Safe to call from any task. Returns 0 if no scan completed.
 size_t app_wifi_scan_results(char (*dst)[33], size_t max_count);
+
+// Force a clean STA reassociate: disconnect, reconnect, block until got-IP
+// or timeout. Used by the WS watchdog when ESP-Hosted's per-association
+// state on the C6 needs to be cleared without rebooting. Marks the
+// disconnect as intentional so it does NOT count toward MAX_RETRIES and
+// the event handler skips the retry-backoff path.
+//
+// Safe to call from any task except the wifi event task itself. Returns
+// true if a fresh IP arrived within timeout_ms.
+bool app_wifi_force_reassociate(uint32_t timeout_ms);
