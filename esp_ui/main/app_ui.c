@@ -2348,6 +2348,78 @@ static void build_chpick_discard_confirm(void)
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Save-confirm popup. Save applies via reboot (the rebuild-while-live
+// path has a known race -- see esp_ui_main.c safe_max comment), and
+// users would be surprised by a chip reset they didn't agree to. So
+// Save shows this confirm first.
+static lv_obj_t *s_chpick_save_confirm;
+
+static void on_chpick_save_yes(lv_event_t *e)
+{
+    (void)e;
+    int  ids[APP_CONFIG_MAX_CHANNELS];
+    int  out = 0;
+    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
+                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    for (int i = 0; i < bound && out < APP_UI_MAX_TRACKED_CHANNELS; ++i) {
+        if (s_chpick_state[i]) ids[out++] = s_input_offset + i;
+    }
+    if (!app_config_set_channel_ids(ids, (size_t) out)) {
+        if (s_chpick_save_confirm) lv_obj_add_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_chpick_status_label,
+                          "#FF6060 Save failed (NVS error).#");
+        return;
+    }
+    lv_label_set_text(s_chpick_status_label, "#40C060 Saved. Restarting...#");
+    lv_refr_now(NULL);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static void on_chpick_save_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_chpick_save_confirm) lv_obj_add_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_chpick_save_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 480, 220);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_chpick_save_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg,
+                      "Save selection and restart the device?\n"
+                      "The fader UI will rebuild against the new channels.");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, on_chpick_save_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 200, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, LV_SYMBOL_OK " Save & Restart");
+    lv_obj_center(yl);
+    lv_obj_add_event_cb(yes, on_chpick_save_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void on_chpick_save(lv_event_t *e)
 {
     (void)e;
@@ -2357,22 +2429,9 @@ static void on_chpick_save(lv_event_t *e)
                           "#FF6060 Pick at least one channel.#");
         return;
     }
-    int  ids[APP_CONFIG_MAX_CHANNELS];
-    int  out = 0;
-    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
-                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
-    for (int i = 0; i < bound && out < APP_UI_MAX_TRACKED_CHANNELS; ++i) {
-        if (s_chpick_state[i]) ids[out++] = s_input_offset + i;
-    }
-    if (!app_config_set_channel_ids(ids, (size_t) out)) {
-        lv_label_set_text(s_chpick_status_label,
-                          "#FF6060 Save failed (NVS error).#");
-        return;
-    }
-    lv_label_set_text(s_chpick_status_label, "#40C060 Saved. Rebooting...#");
-    lv_refr_now(NULL);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    if (!s_chpick_save_confirm) build_chpick_save_confirm();
+    lv_obj_remove_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_chpick_save_confirm);
 }
 
 static void build_chpick_overlay(void)
