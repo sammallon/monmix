@@ -150,6 +150,20 @@ static const char *ws_get_mix_name(int mix_idx)
     return s_mix_names[mix_idx];
 }
 
+static bool ws_create_and_start(void);  // fwd
+
+static void ws_reconnect(void)
+{
+    APP_LOGD_I("ms_ws", "reconnect requested (config change)");
+    if (s_ws) {
+        esp_websocket_client_stop(s_ws);
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+    }
+    ws_create_and_start();
+    s_state_entered_us = esp_timer_get_time();
+}
+
 static void ws_resubscribe(void)
 {
     if (s_ws && esp_websocket_client_is_connected(s_ws)) {
@@ -188,6 +202,7 @@ static const ms_client_iface_t s_iface = {
     .set_mix_layout     = ws_set_mix_layout,
     .get_mix_name       = ws_get_mix_name,
     .resubscribe        = ws_resubscribe,
+    .reconnect          = ws_reconnect,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)

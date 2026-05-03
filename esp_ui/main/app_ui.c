@@ -150,28 +150,34 @@ static size_t   s_rename_target_idx;
 // app_config_set_*; user is prompted to reboot to apply since live re-init
 // of WiFi/WS while preserving UI state is more complex than the use case
 // warrants.
-static lv_obj_t *s_net_overlay;
-static lv_obj_t *s_net_ssid_ta;
-static lv_obj_t *s_net_pass_ta;
-static lv_obj_t *s_net_host_ta;
-static lv_obj_t *s_net_port_ta;
-static lv_obj_t *s_net_show_pass_cb;
-static lv_obj_t *s_net_keyboard;
-static lv_obj_t *s_net_status_label;
-static lv_obj_t *s_net_scan_btn;
-static lv_obj_t *s_net_scan_btn_label;
-// SSID scan results popup. Built lazily, reused. Hidden until scan completes.
+// WiFi settings panel (entry: WiFi icon). Save = reboot since wifi config
+// changes need a full driver re-init.
+static lv_obj_t *s_wcfg_overlay;
+static lv_obj_t *s_wcfg_ssid_ta;
+static lv_obj_t *s_wcfg_pass_ta;
+static lv_obj_t *s_wcfg_show_pass_cb;
+static lv_obj_t *s_wcfg_keyboard;
+static lv_obj_t *s_wcfg_status_label;
+static lv_obj_t *s_wcfg_scan_btn;
+static lv_obj_t *s_wcfg_scan_btn_label;
+static lv_obj_t *s_wcfg_discard_confirm;
+static char     s_wcfg_orig_ssid[APP_CONFIG_SSID_MAX];
+static char     s_wcfg_orig_pass[APP_CONFIG_PASS_MAX];
+
+// MS connection settings panel (entry: MS icon). Save = ws_reconnect()
+// (live), no reboot -- just kicks the WS client to use the new host:port.
+static lv_obj_t *s_mcfg_overlay;
+static lv_obj_t *s_mcfg_host_ta;
+static lv_obj_t *s_mcfg_port_ta;
+static lv_obj_t *s_mcfg_keyboard;
+static lv_obj_t *s_mcfg_status_label;
+static lv_obj_t *s_mcfg_discard_confirm;
+static char     s_mcfg_orig_host[APP_CONFIG_HOST_MAX];
+static char     s_mcfg_orig_port[8];
+
+// SSID scan results popup. Used only by the WiFi panel.
 static lv_obj_t *s_ssid_list_popup;
 static lv_obj_t *s_ssid_list;
-// Discard-changes confirm popup. Built lazily, opened by the X button only
-// when the user has unsaved edits relative to NVS.
-static lv_obj_t *s_net_discard_confirm;
-// Snapshot of textarea contents at open() time, used to detect whether the
-// user has unsaved edits when they tap X. Sized to the largest field bound.
-static char s_net_orig_ssid[APP_CONFIG_SSID_MAX];
-static char s_net_orig_pass[APP_CONFIG_PASS_MAX];
-static char s_net_orig_host[APP_CONFIG_HOST_MAX];
-static char s_net_orig_port[8];
 
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
@@ -226,8 +232,10 @@ static void mix_picker_refresh_labels(void);
 static void mix_indicator_refresh(void);
 static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
-static void network_settings_open(void);
-static void network_settings_close(void);
+static void wcfg_open(void);
+static void wcfg_close(void);
+static void mcfg_open(void);
+static void mcfg_close(void);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
 // is called on the Yes path; Cancel just hides the popup.
@@ -1563,59 +1571,63 @@ static void on_name_clicked(lv_event_t *e)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Network settings overlay — WiFi SSID/password + MS host/port editor.
-// Edits persist to NVS via app_config; user must reboot to apply (live
-// re-init of WiFi/WS while preserving UI state is more complex than the
-// "set up the device once" use case warrants).
+// WiFi + MS settings overlays. Two separate panels with the same UX
+// patterns (kb hide on checkmark/non-text, X confirms discard with
+// unsaved changes), but different commit semantics:
+//   WiFi save -> reboot (driver re-init needed for new SSID/pass).
+//   MS   save -> live ws_reconnect() (just kicks the WS client).
+// Entry points: WiFi icon -> wcfg_open. MS icon -> mcfg_open.
 // ─────────────────────────────────────────────────────────────────────────
 
-static void net_hide_keyboard(void)
+// --- shared keyboard helpers (factored as small inline-ish funcs so each
+// panel can call them without duplicating the LV_EVENT_READY/CANCEL plumbing)
+
+static void wcfg_hide_keyboard(void)
 {
-    if (s_net_keyboard) {
-        lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (s_wcfg_keyboard) lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+static void mcfg_hide_keyboard(void)
+{
+    if (s_mcfg_keyboard) lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
-static bool net_has_unsaved_changes(void)
+// --- WiFi panel ----------------------------------------------------------
+
+static bool wcfg_has_unsaved_changes(void)
 {
-    return strcmp(lv_textarea_get_text(s_net_ssid_ta), s_net_orig_ssid) != 0 ||
-           strcmp(lv_textarea_get_text(s_net_pass_ta), s_net_orig_pass) != 0 ||
-           strcmp(lv_textarea_get_text(s_net_host_ta), s_net_orig_host) != 0 ||
-           strcmp(lv_textarea_get_text(s_net_port_ta), s_net_orig_port) != 0;
+    return strcmp(lv_textarea_get_text(s_wcfg_ssid_ta), s_wcfg_orig_ssid) != 0 ||
+           strcmp(lv_textarea_get_text(s_wcfg_pass_ta), s_wcfg_orig_pass) != 0;
 }
 
-static void build_net_discard_confirm(void);
+static void build_wcfg_discard_confirm(void);
 
-static void on_net_close(lv_event_t *e)
+static void on_wcfg_close(lv_event_t *e)
 {
     (void)e;
-    net_hide_keyboard();
-    if (net_has_unsaved_changes()) {
-        if (!s_net_discard_confirm) build_net_discard_confirm();
-        lv_obj_remove_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_move_foreground(s_net_discard_confirm);
+    wcfg_hide_keyboard();
+    if (wcfg_has_unsaved_changes()) {
+        if (!s_wcfg_discard_confirm) build_wcfg_discard_confirm();
+        lv_obj_remove_flag(s_wcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_wcfg_discard_confirm);
         return;
     }
-    network_settings_close();
+    wcfg_close();
 }
 
-static void on_net_discard_yes(lv_event_t *e)
+static void on_wcfg_discard_yes(lv_event_t *e)
 {
     (void)e;
-    // Nothing to roll back -- Save is what writes NVS, so unsaved edits
-    // are purely textarea-local. Hide the confirm + the overlay, the next
-    // open will repopulate from app_config.
-    if (s_net_discard_confirm) lv_obj_add_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
-    network_settings_close();
+    if (s_wcfg_discard_confirm) lv_obj_add_flag(s_wcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+    wcfg_close();
 }
 
-static void on_net_discard_no(lv_event_t *e)
+static void on_wcfg_discard_no(lv_event_t *e)
 {
     (void)e;
-    if (s_net_discard_confirm) lv_obj_add_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcfg_discard_confirm) lv_obj_add_flag(s_wcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void build_net_discard_confirm(void)
+static void build_wcfg_discard_confirm(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_t *p = lv_obj_create(scr);
@@ -1625,7 +1637,7 @@ static void build_net_discard_confirm(void)
     lv_obj_set_style_radius(p, 12, 0);
     lv_obj_set_style_border_width(p, 2, 0);
     lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
-    s_net_discard_confirm = p;
+    s_wcfg_discard_confirm = p;
 
     lv_obj_t *msg = lv_label_create(p);
     lv_label_set_text(msg, "Unsaved changes will be lost.\nDiscard and close?");
@@ -1637,7 +1649,7 @@ static void build_net_discard_confirm(void)
     lv_obj_t *cancel_lbl = lv_label_create(cancel);
     lv_label_set_text(cancel_lbl, "Keep Editing");
     lv_obj_center(cancel_lbl);
-    lv_obj_add_event_cb(cancel, on_net_discard_no, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(cancel, on_wcfg_discard_no, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *yes = lv_button_create(p);
     lv_obj_set_size(yes, 160, 50);
@@ -1646,90 +1658,67 @@ static void build_net_discard_confirm(void)
     lv_obj_t *yes_lbl = lv_label_create(yes);
     lv_label_set_text(yes_lbl, "Discard");
     lv_obj_center(yes_lbl);
-    lv_obj_add_event_cb(yes, on_net_discard_yes, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(yes, on_wcfg_discard_yes, LV_EVENT_CLICKED, NULL);
 
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void on_net_show_pass_changed(lv_event_t *e)
+static void on_wcfg_show_pass_changed(lv_event_t *e)
 {
     (void)e;
-    bool show = lv_obj_has_state(s_net_show_pass_cb, LV_STATE_CHECKED);
-    lv_textarea_set_password_mode(s_net_pass_ta, !show);
-    // Tapping a non-text control -> the user is done with the keyboard
-    // for now. Hide it so the status line below the form is visible.
-    net_hide_keyboard();
+    bool show = lv_obj_has_state(s_wcfg_show_pass_cb, LV_STATE_CHECKED);
+    lv_textarea_set_password_mode(s_wcfg_pass_ta, !show);
+    wcfg_hide_keyboard();
 }
 
-static void on_net_textarea_focused(lv_event_t *e)
+static void on_wcfg_textarea_focused(lv_event_t *e)
 {
     lv_obj_t *ta = lv_event_get_target_obj(e);
-    if (s_net_keyboard) {
-        lv_keyboard_set_textarea(s_net_keyboard, ta);
-        // Numeric keyboard for the port field, lowercase otherwise. Most
-        // SSIDs and hosts are typed lowercase so user doesn't have to hunt
-        // for the shift key.
-        lv_keyboard_mode_t mode = (ta == s_net_port_ta)
-            ? LV_KEYBOARD_MODE_NUMBER
-            : LV_KEYBOARD_MODE_TEXT_LOWER;
-        lv_keyboard_set_mode(s_net_keyboard, mode);
-        lv_obj_remove_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcfg_keyboard) {
+        lv_keyboard_set_textarea(s_wcfg_keyboard, ta);
+        lv_keyboard_set_mode(s_wcfg_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_remove_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-// LVGL keyboard fires READY on the checkmark/OK button and CANCEL on the
-// keyboard-X button. Either one means the user is done typing for now;
-// hide the keyboard and surface the form again.
-static void on_net_keyboard_event(lv_event_t *e)
+static void on_wcfg_keyboard_event(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        net_hide_keyboard();
+        wcfg_hide_keyboard();
     }
 }
 
-static void on_net_save(lv_event_t *e)
+static void on_wcfg_save(lv_event_t *e)
 {
     (void)e;
-    net_hide_keyboard();
-    const char *ssid = lv_textarea_get_text(s_net_ssid_ta);
-    const char *pass = lv_textarea_get_text(s_net_pass_ta);
-    const char *host = lv_textarea_get_text(s_net_host_ta);
-    const char *port_s = lv_textarea_get_text(s_net_port_ta);
+    wcfg_hide_keyboard();
+    const char *ssid = lv_textarea_get_text(s_wcfg_ssid_ta);
+    const char *pass = lv_textarea_get_text(s_wcfg_pass_ta);
 
-    long port = strtol(port_s, NULL, 10);
-    if (port <= 0 || port > 65535) {
-        lv_label_set_text(s_net_status_label,
-                          "#FF6060 Invalid port (1-65535)#");
+    if (strlen(ssid) == 0) {
+        lv_label_set_text(s_wcfg_status_label,
+                          "#FF6060 SSID cannot be empty.#");
         return;
     }
-
-    bool ok = true;
-    if (strlen(ssid) == 0) { ok = false; }
-    else                   { ok = ok && app_config_set_wifi_ssid(ssid); }
-    // Empty password is valid (open networks). MS host empty is not.
-    ok = ok && app_config_set_wifi_pass(pass);
-    if (strlen(host) == 0) { ok = false; }
-    else                   { ok = ok && app_config_set_ms_host(host); }
-    ok = ok && app_config_set_ms_port((uint16_t) port);
-
+    bool ok = app_config_set_wifi_ssid(ssid) && app_config_set_wifi_pass(pass);
     if (!ok) {
-        lv_label_set_text(s_net_status_label,
-                          "#FF6060 Save failed (empty field or NVS error).#");
+        lv_label_set_text(s_wcfg_status_label,
+                          "#FF6060 Save failed (NVS error).#");
         return;
     }
 
-    // Save + reboot. The brief delay lets the SD log flush + the user see
-    // the status text register before the chip resets and the screen blanks.
-    lv_label_set_text(s_net_status_label, "#40C060 Saved. Rebooting...#");
-    lv_refr_now(NULL);  // force the label flush before we block
+    // Reboot to apply -- new SSID/pass needs a full wifi driver re-init,
+    // and disconnecting/reconnecting cleanly mid-session would also drop
+    // the WS, the SD logger, and several subscribers; reboot is simpler.
+    lv_label_set_text(s_wcfg_status_label, "#40C060 Saved. Rebooting...#");
+    lv_refr_now(NULL);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
 
-// Triggered by the Scan button. Kicks off an async wifi scan; the done
-// callback fires from the wifi event task and we hop into LVGL via
-// lv_async_call to actually populate the popup.
+// --- SSID scan list (used only by the WiFi panel) ------------------------
+
 static void ssid_list_populate_async(void *arg);
 static void on_ssid_row_clicked(lv_event_t *e);
 
@@ -1782,7 +1771,7 @@ static void ssid_list_populate_async(void *arg)
 {
     (void)arg;
     if (!s_ssid_list_popup) build_ssid_list_popup();
-    lv_obj_clean(s_ssid_list);  // remove rows from prior scan
+    lv_obj_clean(s_ssid_list);
 
     char results[APP_WIFI_SCAN_MAX_RESULTS][33];
     size_t n = app_wifi_scan_results(results, APP_WIFI_SCAN_MAX_RESULTS);
@@ -1795,15 +1784,13 @@ static void ssid_list_populate_async(void *arg)
         for (size_t i = 0; i < n; ++i) {
             lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WIFI,
                                                results[i]);
-            lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED,
-                                NULL);
+            lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED, NULL);
         }
     }
 
-    // Re-enable the Scan button now that results are in.
-    if (s_net_scan_btn) {
-        lv_obj_remove_state(s_net_scan_btn, LV_STATE_DISABLED);
-        lv_label_set_text(s_net_scan_btn_label, "Scan");
+    if (s_wcfg_scan_btn) {
+        lv_obj_remove_state(s_wcfg_scan_btn, LV_STATE_DISABLED);
+        lv_label_set_text(s_wcfg_scan_btn_label, "Scan");
     }
 
     lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
@@ -1814,31 +1801,29 @@ static void on_ssid_row_clicked(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target_obj(e);
     const char *txt = lv_list_get_button_text(s_ssid_list, btn);
-    if (txt && s_net_ssid_ta) {
-        lv_textarea_set_text(s_net_ssid_ta, txt);
+    if (txt && s_wcfg_ssid_ta) {
+        lv_textarea_set_text(s_wcfg_ssid_ta, txt);
     }
     if (s_ssid_list_popup) {
         lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-static void on_net_scan_clicked(lv_event_t *e)
+static void on_wcfg_scan_clicked(lv_event_t *e)
 {
     (void)e;
-    net_hide_keyboard();
+    wcfg_hide_keyboard();
     if (!app_wifi_scan_start(on_wifi_scan_done, NULL)) {
-        // Already in progress or failed to start. Surface in the status line.
-        lv_label_set_text(s_net_status_label,
+        lv_label_set_text(s_wcfg_status_label,
                           "#FF6060 Scan already in progress.#");
         return;
     }
-    // Visual feedback while scan runs — usually 1-3 s.
-    lv_obj_add_state(s_net_scan_btn, LV_STATE_DISABLED);
-    lv_label_set_text(s_net_scan_btn_label, "Scanning...");
-    lv_label_set_text(s_net_status_label, "");
+    lv_obj_add_state(s_wcfg_scan_btn, LV_STATE_DISABLED);
+    lv_label_set_text(s_wcfg_scan_btn_label, "Scanning...");
+    lv_label_set_text(s_wcfg_status_label, "");
 }
 
-static void build_network_settings_overlay(void)
+static void build_wcfg_overlay(void)
 {
     lv_obj_t *scr = lv_screen_active();
 
@@ -1848,10 +1833,10 @@ static void build_network_settings_overlay(void)
     lv_obj_set_style_radius(ov, 0, 0);
     lv_obj_set_style_pad_all(ov, 16, 0);
     lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-    s_net_overlay = ov;
+    s_wcfg_overlay = ov;
 
     lv_obj_t *title = lv_label_create(ov);
-    lv_label_set_text(title, "Network Settings");
+    lv_label_set_text(title, "WiFi");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_t *close_btn = lv_button_create(ov);
@@ -1860,7 +1845,7 @@ static void build_network_settings_overlay(void)
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
     lv_obj_center(close_lbl);
-    lv_obj_add_event_cb(close_btn, on_net_close, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(close_btn, on_wcfg_close, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *save_btn = lv_button_create(ov);
     lv_obj_set_size(save_btn, 110, 36);
@@ -1869,153 +1854,315 @@ static void build_network_settings_overlay(void)
     lv_obj_t *save_lbl = lv_label_create(save_btn);
     lv_label_set_text(save_lbl, LV_SYMBOL_OK " Save");
     lv_obj_center(save_lbl);
-    lv_obj_add_event_cb(save_btn, on_net_save, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(save_btn, on_wcfg_save, LV_EVENT_CLICKED, NULL);
 
-    // Two-column form: WiFi (left) / Mixing Station (right). Each column is
-    // ~480 px wide with a 16 px gap between them. Fields below the section
-    // headers are 36 px tall textareas; total form height fits in the top
-    // ~280 px so the keyboard has the bottom 280 px when active.
-    const int col_w   = (SCREEN_W - 32 - 16) / 2;   // 32 = pad_all*2, 16 = gap
-    const int field_h = 36;
-    const int row_dy  = 56;
-
-    // --- WiFi column ---
-    lv_obj_t *wifi_hdr = lv_label_create(ov);
-    lv_label_set_text(wifi_hdr, "WiFi");
-    lv_obj_align(wifi_hdr, LV_ALIGN_TOP_LEFT, 0, 56);
+    const int field_h    = 36;
+    const int row_dy     = 56;
+    const int form_w     = SCREEN_W - 32;
+    const int scan_btn_w = 110;
 
     lv_obj_t *ssid_lbl = lv_label_create(ov);
     lv_label_set_text(ssid_lbl, "SSID");
-    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 30);
-    // SSID textarea takes the row minus 90 px reserved for the Scan button
-    // on the right end of the row (label takes 60 px on the left).
-    const int scan_btn_w = 90;
-    s_net_ssid_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_net_ssid_ta, col_w - 60 - scan_btn_w - 6, field_h);
-    lv_obj_align(s_net_ssid_ta, LV_ALIGN_TOP_LEFT, 60, 56 + 26);
-    lv_textarea_set_one_line(s_net_ssid_ta, true);
-    lv_textarea_set_max_length(s_net_ssid_ta, APP_CONFIG_SSID_MAX - 1);
-    lv_obj_add_event_cb(s_net_ssid_ta, on_net_textarea_focused,
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 4);
+
+    s_wcfg_ssid_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_wcfg_ssid_ta, form_w - 80 - scan_btn_w - 12, field_h);
+    lv_obj_align(s_wcfg_ssid_ta, LV_ALIGN_TOP_LEFT, 80, 56);
+    lv_textarea_set_one_line(s_wcfg_ssid_ta, true);
+    lv_textarea_set_max_length(s_wcfg_ssid_ta, APP_CONFIG_SSID_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_ssid_ta, on_wcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
-    s_net_scan_btn = lv_button_create(ov);
-    lv_obj_set_size(s_net_scan_btn, scan_btn_w, field_h);
-    lv_obj_align(s_net_scan_btn, LV_ALIGN_TOP_LEFT,
-                 col_w - scan_btn_w, 56 + 26);
-    s_net_scan_btn_label = lv_label_create(s_net_scan_btn);
-    lv_label_set_text(s_net_scan_btn_label, "Scan");
-    lv_obj_center(s_net_scan_btn_label);
-    lv_obj_add_event_cb(s_net_scan_btn, on_net_scan_clicked,
+    s_wcfg_scan_btn = lv_button_create(ov);
+    lv_obj_set_size(s_wcfg_scan_btn, scan_btn_w, field_h);
+    lv_obj_align(s_wcfg_scan_btn, LV_ALIGN_TOP_LEFT, form_w - scan_btn_w, 56);
+    s_wcfg_scan_btn_label = lv_label_create(s_wcfg_scan_btn);
+    lv_label_set_text(s_wcfg_scan_btn_label, "Scan");
+    lv_obj_center(s_wcfg_scan_btn_label);
+    lv_obj_add_event_cb(s_wcfg_scan_btn, on_wcfg_scan_clicked,
                         LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *pass_lbl = lv_label_create(ov);
     lv_label_set_text(pass_lbl, "Pass");
-    lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 30 + row_dy);
-    s_net_pass_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_net_pass_ta, col_w - 60, field_h);
-    lv_obj_align(s_net_pass_ta, LV_ALIGN_TOP_LEFT, 60, 56 + 26 + row_dy);
-    lv_textarea_set_one_line(s_net_pass_ta, true);
-    lv_textarea_set_max_length(s_net_pass_ta, APP_CONFIG_PASS_MAX - 1);
-    lv_textarea_set_password_mode(s_net_pass_ta, true);
-    lv_obj_add_event_cb(s_net_pass_ta, on_net_textarea_focused,
+    lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy + 4);
+
+    s_wcfg_pass_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_wcfg_pass_ta, form_w - 80, field_h);
+    lv_obj_align(s_wcfg_pass_ta, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy);
+    lv_textarea_set_one_line(s_wcfg_pass_ta, true);
+    lv_textarea_set_max_length(s_wcfg_pass_ta, APP_CONFIG_PASS_MAX - 1);
+    lv_textarea_set_password_mode(s_wcfg_pass_ta, true);
+    lv_obj_add_event_cb(s_wcfg_pass_ta, on_wcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
-    s_net_show_pass_cb = lv_checkbox_create(ov);
-    lv_checkbox_set_text(s_net_show_pass_cb, "Show");
-    lv_obj_align(s_net_show_pass_cb, LV_ALIGN_TOP_LEFT,
-                 0, 56 + 30 + row_dy * 2);
-    lv_obj_add_event_cb(s_net_show_pass_cb, on_net_show_pass_changed,
+    s_wcfg_show_pass_cb = lv_checkbox_create(ov);
+    lv_checkbox_set_text(s_wcfg_show_pass_cb, "Show password");
+    lv_obj_align(s_wcfg_show_pass_cb, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 2);
+    lv_obj_add_event_cb(s_wcfg_show_pass_cb, on_wcfg_show_pass_changed,
                         LV_EVENT_VALUE_CHANGED, NULL);
 
-    // --- Mixing Station column ---
-    const int ms_x = col_w + 16;
+    s_wcfg_status_label = lv_label_create(ov);
+    lv_label_set_text(s_wcfg_status_label, "");
+    lv_label_set_recolor(s_wcfg_status_label, true);
+    lv_obj_align(s_wcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 3);
 
-    lv_obj_t *ms_hdr = lv_label_create(ov);
-    lv_label_set_text(ms_hdr, "Mixing Station");
-    lv_obj_align(ms_hdr, LV_ALIGN_TOP_LEFT, ms_x, 56);
+    s_wcfg_keyboard = lv_keyboard_create(ov);
+    lv_obj_set_size(s_wcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
+    lv_obj_align(s_wcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_wcfg_keyboard, on_wcfg_keyboard_event, LV_EVENT_ALL, NULL);
+}
+
+static void wcfg_open(void)
+{
+    if (!s_wcfg_overlay) build_wcfg_overlay();
+    const char *ssid = app_config_wifi_ssid();
+    const char *pass = app_config_wifi_pass();
+    lv_textarea_set_text(s_wcfg_ssid_ta, ssid);
+    lv_textarea_set_text(s_wcfg_pass_ta, pass);
+    strncpy(s_wcfg_orig_ssid, ssid, sizeof(s_wcfg_orig_ssid) - 1);
+    s_wcfg_orig_ssid[sizeof(s_wcfg_orig_ssid) - 1] = '\0';
+    strncpy(s_wcfg_orig_pass, pass, sizeof(s_wcfg_orig_pass) - 1);
+    s_wcfg_orig_pass[sizeof(s_wcfg_orig_pass) - 1] = '\0';
+    lv_textarea_set_password_mode(s_wcfg_pass_ta, true);
+    lv_obj_remove_state(s_wcfg_show_pass_cb, LV_STATE_CHECKED);
+    lv_label_set_text(s_wcfg_status_label, "");
+    lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_wcfg_overlay);
+}
+
+static void wcfg_close(void)
+{
+    if (s_wcfg_overlay) lv_obj_add_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// --- MS panel ------------------------------------------------------------
+
+static bool mcfg_has_unsaved_changes(void)
+{
+    return strcmp(lv_textarea_get_text(s_mcfg_host_ta), s_mcfg_orig_host) != 0 ||
+           strcmp(lv_textarea_get_text(s_mcfg_port_ta), s_mcfg_orig_port) != 0;
+}
+
+static void build_mcfg_discard_confirm(void);
+
+static void on_mcfg_close(lv_event_t *e)
+{
+    (void)e;
+    mcfg_hide_keyboard();
+    if (mcfg_has_unsaved_changes()) {
+        if (!s_mcfg_discard_confirm) build_mcfg_discard_confirm();
+        lv_obj_remove_flag(s_mcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_mcfg_discard_confirm);
+        return;
+    }
+    mcfg_close();
+}
+
+static void on_mcfg_discard_yes(lv_event_t *e)
+{
+    (void)e;
+    if (s_mcfg_discard_confirm) lv_obj_add_flag(s_mcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+    mcfg_close();
+}
+
+static void on_mcfg_discard_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_mcfg_discard_confirm) lv_obj_add_flag(s_mcfg_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_mcfg_discard_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_mcfg_discard_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg, "Unsaved changes will be lost.\nDiscard and close?");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Keep Editing");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_mcfg_discard_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 160, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xC04040), 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes);
+    lv_label_set_text(yes_lbl, "Discard");
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes, on_mcfg_discard_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_mcfg_textarea_focused(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target_obj(e);
+    if (s_mcfg_keyboard) {
+        lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
+        lv_keyboard_set_mode(s_mcfg_keyboard,
+                             ta == s_mcfg_port_ta ? LV_KEYBOARD_MODE_NUMBER
+                                                  : LV_KEYBOARD_MODE_TEXT_LOWER);
+        lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_mcfg_keyboard_event(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        mcfg_hide_keyboard();
+    }
+}
+
+static void on_mcfg_save(lv_event_t *e)
+{
+    (void)e;
+    mcfg_hide_keyboard();
+    const char *host   = lv_textarea_get_text(s_mcfg_host_ta);
+    const char *port_s = lv_textarea_get_text(s_mcfg_port_ta);
+    long port = strtol(port_s, NULL, 10);
+    if (strlen(host) == 0) {
+        lv_label_set_text(s_mcfg_status_label,
+                          "#FF6060 Host cannot be empty.#");
+        return;
+    }
+    if (port <= 0 || port > 65535) {
+        lv_label_set_text(s_mcfg_status_label,
+                          "#FF6060 Invalid port (1-65535)#");
+        return;
+    }
+    bool ok = app_config_set_ms_host(host) &&
+              app_config_set_ms_port((uint16_t) port);
+    if (!ok) {
+        lv_label_set_text(s_mcfg_status_label,
+                          "#FF6060 Save failed (NVS error).#");
+        return;
+    }
+
+    // Re-snapshot originals so the X close path doesn't think we still
+    // have unsaved changes from the just-committed edit.
+    strncpy(s_mcfg_orig_host, host, sizeof(s_mcfg_orig_host) - 1);
+    s_mcfg_orig_host[sizeof(s_mcfg_orig_host) - 1] = '\0';
+    strncpy(s_mcfg_orig_port, port_s, sizeof(s_mcfg_orig_port) - 1);
+    s_mcfg_orig_port[sizeof(s_mcfg_orig_port) - 1] = '\0';
+
+    lv_label_set_text(s_mcfg_status_label,
+                      "#40C060 Saved. Reconnecting to MS...#");
+
+    // Live-apply by kicking the WS client to recreate against the new
+    // host:port. No reboot needed -- the WS task tears down + spins up
+    // with whatever app_config now returns. Status icon will flip to
+    // CONNECTING then back to CONNECTED via the existing event path.
+    if (s_ms && s_ms->reconnect) s_ms->reconnect();
+}
+
+static void build_mcfg_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *ov = lv_obj_create(scr);
+    lv_obj_set_size(ov, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 16, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    s_mcfg_overlay = ov;
+
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "Mixing Station");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(ov);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_mcfg_close, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_button_create(ov);
+    lv_obj_set_size(save_btn, 110, 36);
+    lv_obj_align(save_btn, LV_ALIGN_TOP_LEFT, 0, -4);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x40C060), 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK " Save");
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, on_mcfg_save, LV_EVENT_CLICKED, NULL);
+
+    const int field_h = 36;
+    const int row_dy  = 56;
+    const int form_w  = SCREEN_W - 32;
 
     lv_obj_t *host_lbl = lv_label_create(ov);
     lv_label_set_text(host_lbl, "Host");
-    lv_obj_align(host_lbl, LV_ALIGN_TOP_LEFT, ms_x, 56 + 30);
-    s_net_host_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_net_host_ta, col_w - 60, field_h);
-    lv_obj_align(s_net_host_ta, LV_ALIGN_TOP_LEFT, ms_x + 60, 56 + 26);
-    lv_textarea_set_one_line(s_net_host_ta, true);
-    lv_textarea_set_max_length(s_net_host_ta, APP_CONFIG_HOST_MAX - 1);
-    lv_obj_add_event_cb(s_net_host_ta, on_net_textarea_focused,
+    lv_obj_align(host_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 4);
+    s_mcfg_host_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_mcfg_host_ta, form_w - 80, field_h);
+    lv_obj_align(s_mcfg_host_ta, LV_ALIGN_TOP_LEFT, 80, 56);
+    lv_textarea_set_one_line(s_mcfg_host_ta, true);
+    lv_textarea_set_max_length(s_mcfg_host_ta, APP_CONFIG_HOST_MAX - 1);
+    lv_obj_add_event_cb(s_mcfg_host_ta, on_mcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
     lv_obj_t *port_lbl = lv_label_create(ov);
     lv_label_set_text(port_lbl, "Port");
-    lv_obj_align(port_lbl, LV_ALIGN_TOP_LEFT, ms_x, 56 + 30 + row_dy);
-    s_net_port_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_net_port_ta, 120, field_h);
-    lv_obj_align(s_net_port_ta, LV_ALIGN_TOP_LEFT,
-                 ms_x + 60, 56 + 26 + row_dy);
-    lv_textarea_set_one_line(s_net_port_ta, true);
-    lv_textarea_set_max_length(s_net_port_ta, 5);  // 65535 = 5 digits
-    lv_obj_add_event_cb(s_net_port_ta, on_net_textarea_focused,
+    lv_obj_align(port_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy + 4);
+    s_mcfg_port_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_mcfg_port_ta, 140, field_h);
+    lv_obj_align(s_mcfg_port_ta, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy);
+    lv_textarea_set_one_line(s_mcfg_port_ta, true);
+    lv_textarea_set_max_length(s_mcfg_port_ta, 5);
+    lv_obj_add_event_cb(s_mcfg_port_ta, on_mcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
-    // Status line below the form — used by save handler to confirm or report
-    // errors. Recolor-via-markup needs lv_label_set_recolor.
-    s_net_status_label = lv_label_create(ov);
-    lv_label_set_text(s_net_status_label, "");
-    lv_label_set_recolor(s_net_status_label, true);
-    lv_obj_align(s_net_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + 30 + row_dy * 3);
+    s_mcfg_status_label = lv_label_create(ov);
+    lv_label_set_text(s_mcfg_status_label, "");
+    lv_label_set_recolor(s_mcfg_status_label, true);
+    lv_obj_align(s_mcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 2 + 4);
 
-    // Keyboard occupies the bottom half. Hidden until a textarea is focused
-    // so the form is visible at first open.
-    s_net_keyboard = lv_keyboard_create(ov);
-    lv_obj_set_size(s_net_keyboard, SCREEN_W - 32, SCREEN_H / 2);
-    lv_obj_align(s_net_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
-    // Hook checkmark/cancel keys -> hide keyboard (instead of LVGL's
-    // default which is to delete the textarea binding without hiding).
-    lv_obj_add_event_cb(s_net_keyboard, on_net_keyboard_event, LV_EVENT_ALL, NULL);
+    s_mcfg_keyboard = lv_keyboard_create(ov);
+    lv_obj_set_size(s_mcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
+    lv_obj_align(s_mcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_mcfg_keyboard, on_mcfg_keyboard_event, LV_EVENT_ALL, NULL);
 }
 
-static void network_settings_open(void)
+static void mcfg_open(void)
 {
-    if (!s_net_overlay) build_network_settings_overlay();
-    // Pre-fill from the current persisted values each time we open so the
-    // user sees the truth from NVS (in case they edited then cancelled).
-    const char *ssid = app_config_wifi_ssid();
-    const char *pass = app_config_wifi_pass();
+    if (!s_mcfg_overlay) build_mcfg_overlay();
     const char *host = app_config_ms_host();
     char port_s[8];
     snprintf(port_s, sizeof(port_s), "%u", (unsigned) app_config_ms_port());
-
-    lv_textarea_set_text(s_net_ssid_ta, ssid);
-    lv_textarea_set_text(s_net_pass_ta, pass);
-    lv_textarea_set_text(s_net_host_ta, host);
-    lv_textarea_set_text(s_net_port_ta, port_s);
-
-    // Snapshot for has-changes detection on close (X confirms discard
-    // when there are unsaved edits relative to these originals).
-    strncpy(s_net_orig_ssid, ssid,    sizeof(s_net_orig_ssid) - 1);
-    s_net_orig_ssid[sizeof(s_net_orig_ssid) - 1] = '\0';
-    strncpy(s_net_orig_pass, pass,    sizeof(s_net_orig_pass) - 1);
-    s_net_orig_pass[sizeof(s_net_orig_pass) - 1] = '\0';
-    strncpy(s_net_orig_host, host,    sizeof(s_net_orig_host) - 1);
-    s_net_orig_host[sizeof(s_net_orig_host) - 1] = '\0';
-    strncpy(s_net_orig_port, port_s,  sizeof(s_net_orig_port) - 1);
-    s_net_orig_port[sizeof(s_net_orig_port) - 1] = '\0';
-
-    lv_textarea_set_password_mode(s_net_pass_ta, true);
-    lv_obj_remove_state(s_net_show_pass_cb, LV_STATE_CHECKED);
-    lv_label_set_text(s_net_status_label, "");
-    lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
-
-    lv_obj_remove_flag(s_net_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_net_overlay);
+    lv_textarea_set_text(s_mcfg_host_ta, host);
+    lv_textarea_set_text(s_mcfg_port_ta, port_s);
+    strncpy(s_mcfg_orig_host, host, sizeof(s_mcfg_orig_host) - 1);
+    s_mcfg_orig_host[sizeof(s_mcfg_orig_host) - 1] = '\0';
+    strncpy(s_mcfg_orig_port, port_s, sizeof(s_mcfg_orig_port) - 1);
+    s_mcfg_orig_port[sizeof(s_mcfg_orig_port) - 1] = '\0';
+    lv_label_set_text(s_mcfg_status_label, "");
+    lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_mcfg_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_mcfg_overlay);
 }
 
-static void network_settings_close(void)
+static void mcfg_close(void)
 {
-    if (s_net_overlay) {
-        lv_obj_add_flag(s_net_overlay, LV_OBJ_FLAG_HIDDEN);
-    }
+    if (s_mcfg_overlay) lv_obj_add_flag(s_mcfg_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2334,11 +2481,9 @@ static void wifi_panel_close(void)
 static void on_wifi_clicked(lv_event_t *e)
 {
     (void)e;
-    // Tapping the WiFi icon opens the editable network settings overlay.
-    // The old read-only wifi_panel is still around but unreferenced --
-    // dead-code removal is a follow-up; kept here so wifi_panel_refresh
-    // (called from the state-change subscriber) remains a no-op-safe.
-    network_settings_open();
+    // WiFi icon -> WiFi-only editor. The old read-only wifi_panel build
+    // code is still around but unreferenced (cleanup is a follow-up).
+    wcfg_open();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2545,10 +2690,7 @@ static void ms_panel_close(void)
 static void on_ms_clicked(lv_event_t *e)
 {
     (void)e;
-    // Like the WiFi icon, route to the editable network settings overlay
-    // rather than the read-only ms_panel popup. The overlay's Mixing
-    // Station column carries the same fields ms_panel was showing
-    // (host/port) plus the editing affordances. ms_panel build/refresh
-    // code is kept around but unreachable; cleanup is a follow-up.
-    network_settings_open();
+    // MS icon -> MS-only editor. Save here is a live ws_reconnect rather
+    // than a reboot; host/port can be applied without a full chip reset.
+    mcfg_open();
 }

@@ -48,6 +48,13 @@ typedef struct {
     // by the discovery flow after reseeding app_state. No-op when the WS
     // isn't connected.
     void (*resubscribe)(void);
+
+    // Live-apply a host/port change: stop + destroy the current client,
+    // start a fresh one against whatever app_config_ms_host/port currently
+    // returns. Called from the MS-settings UI after the user saves new
+    // values. Does NOT touch wifi -- the watchdog's wifi-reassoc path is
+    // for stuck connections, not for normal config changes.
+    void (*reconnect)(void);
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);
