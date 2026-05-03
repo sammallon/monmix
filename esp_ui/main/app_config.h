@@ -25,6 +25,12 @@ void app_config_init(void);
 // Channel selection.
 const int *app_config_channel_ids(size_t *out_count);
 
+// Persist a new channel selection. Returns false if count is 0 or
+// exceeds APP_CONFIG_MAX_CHANNELS, or if the NVS write fails. The
+// in-memory list is updated on success; callers reboot to rebuild
+// the fader UI against the new set.
+bool app_config_set_channel_ids(const int *ids, size_t count);
+
 // WiFi/MS credentials. Getters return pointers to internal RAM that stays
 // valid until the next set_* call (or app_config_init re-seed). Setters
 // persist immediately to NVS but DO NOT reapply -- callers are responsible

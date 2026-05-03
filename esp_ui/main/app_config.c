@@ -148,6 +148,23 @@ const int *app_config_channel_ids(size_t *out_count)
     return s_ids;
 }
 
+bool app_config_set_channel_ids(const int *ids, size_t count)
+{
+    if (!ids || count == 0 || count > APP_CONFIG_MAX_CHANNELS) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_blob(h, NVS_KEY_CHAN, ids, count * sizeof(int));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set channel ids failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    memcpy(s_ids, ids, count * sizeof(int));
+    s_count = count;
+    return true;
+}
+
 const char *app_config_wifi_ssid(void) { return s_wifi_ssid; }
 const char *app_config_wifi_pass(void) { return s_wifi_pass; }
 const char *app_config_ms_host(void)   { return s_ms_host; }

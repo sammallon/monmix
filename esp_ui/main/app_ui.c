@@ -183,6 +183,29 @@ static char     s_mcfg_orig_port[8];
 static lv_obj_t *s_ssid_list_popup;
 static lv_obj_t *s_ssid_list;
 
+// Channel picker overlay (entry: Settings -> Edit Channels...).
+// Shows every input channel on the connected console as a row with a
+// checkbox; user picks up to APP_UI_MAX_TRACKED_CHANNELS to track on
+// faders. Save persists to NVS via app_config_set_channel_ids and
+// reboots; the rebuild path under live broadcast traffic is a known
+// race (see esp_ui_main.c safe_max comment), so reboot is the simpler
+// shape.
+static int       s_input_offset;          // first MS channel id in the input range
+static int       s_input_count;           // total inputs available on the console
+static lv_obj_t *s_chpick_overlay;
+static lv_obj_t *s_chpick_list;
+static lv_obj_t *s_chpick_status_label;
+static lv_obj_t *s_chpick_count_label;
+static lv_obj_t *s_chpick_discard_confirm;
+// Per-input checkbox pointers, indexed 0..s_input_count-1. Sized to the
+// storage cap so we don't have to malloc; PSRAM since this can be 24+
+// pointers and the array is only used while the picker is open.
+EXT_RAM_BSS_ATTR static lv_obj_t *s_chpick_checks[APP_CONFIG_MAX_CHANNELS];
+// Working selection during edit -- bool per input, size = s_input_count.
+EXT_RAM_BSS_ATTR static bool      s_chpick_state[APP_CONFIG_MAX_CHANNELS];
+// Originals at open-time, used for has-changes detection.
+EXT_RAM_BSS_ATTR static bool      s_chpick_orig[APP_CONFIG_MAX_CHANNELS];
+
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
 // console" state instead of strips with no live data. Hidden once MS
@@ -240,6 +263,9 @@ static void wcfg_open(void);
 static void wcfg_close(void);
 static void mcfg_open(void);
 static void mcfg_close(void);
+static void chpick_open(void);
+static void chpick_close(void);
+static void on_edit_channels_clicked(lv_event_t *e);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
 // is called on the Yes path; Cancel just hides the popup.
@@ -1038,6 +1064,19 @@ static void build_settings_overlay(void)
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 176);
+
+    // Edit-channels entry — opens the picker overlay (#33). Button sits to
+    // the right of the section label so it doesn't push the existing list
+    // layout. The picker is the runtime way to change which inputs are
+    // tracked; was previously only doable via channels-reset + reflash.
+    lv_obj_t *edit_btn = lv_button_create(ov);
+    lv_obj_set_size(edit_btn, 180, 36);
+    lv_obj_align(edit_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
+    lv_obj_t *edit_lbl = lv_label_create(edit_btn);
+    lv_label_set_text(edit_lbl, LV_SYMBOL_LIST " Edit Channels...");
+    lv_obj_center(edit_lbl);
+    lv_obj_add_event_cb(edit_btn, on_edit_channels_clicked,
+                        LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *list = lv_obj_create(ov);
     lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 220);
@@ -2167,6 +2206,310 @@ static void mcfg_open(void)
 static void mcfg_close(void)
 {
     if (s_mcfg_overlay) lv_obj_add_flag(s_mcfg_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Channel picker overlay — pick up to APP_UI_MAX_TRACKED_CHANNELS inputs
+// from the full set available on the connected console. Save persists
+// to NVS and reboots so the fader UI rebuilds against the new selection
+// at boot (the rebuild-while-live path has a known race -- see comment
+// in esp_ui_main.c).
+// ─────────────────────────────────────────────────────────────────────────
+
+static int chpick_count_selected(void)
+{
+    int n = 0;
+    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
+                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    for (int i = 0; i < bound; ++i) if (s_chpick_state[i]) n++;
+    return n;
+}
+
+static void chpick_refresh_count_label(void)
+{
+    if (!s_chpick_count_label) return;
+    int n = chpick_count_selected();
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%d / %d selected",
+             n, APP_UI_MAX_TRACKED_CHANNELS);
+    lv_label_set_text(s_chpick_count_label, buf);
+}
+
+// Disable unchecked rows when the cap is hit -- the user can still
+// uncheck currently-checked rows to free a slot, but can't add more.
+static void chpick_apply_disable_state(void)
+{
+    bool at_cap = chpick_count_selected() >= APP_UI_MAX_TRACKED_CHANNELS;
+    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
+                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    for (int i = 0; i < bound; ++i) {
+        if (!s_chpick_checks[i]) continue;
+        if (s_chpick_state[i]) {
+            lv_obj_remove_state(s_chpick_checks[i], LV_STATE_DISABLED);
+        } else if (at_cap) {
+            lv_obj_add_state(s_chpick_checks[i], LV_STATE_DISABLED);
+        } else {
+            lv_obj_remove_state(s_chpick_checks[i], LV_STATE_DISABLED);
+        }
+    }
+}
+
+static bool chpick_has_unsaved_changes(void)
+{
+    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
+                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    for (int i = 0; i < bound; ++i) {
+        if (s_chpick_state[i] != s_chpick_orig[i]) return true;
+    }
+    return false;
+}
+
+static void on_chpick_check_changed(lv_event_t *e)
+{
+    lv_obj_t *cb  = lv_event_get_target_obj(e);
+    int       idx = (int)(intptr_t) lv_event_get_user_data(e);
+    if (idx < 0 || idx >= s_input_count) return;
+    bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    // Enforce cap: if the user just turned this on and we're now over the
+    // cap, refuse the change and revert the visual state.
+    if (checked && !s_chpick_state[idx] &&
+        chpick_count_selected() >= APP_UI_MAX_TRACKED_CHANNELS) {
+        lv_obj_remove_state(cb, LV_STATE_CHECKED);
+        lv_label_set_text(s_chpick_status_label,
+                          "#FF6060 At maximum -- uncheck another channel first.#");
+        return;
+    }
+    s_chpick_state[idx] = checked;
+    lv_label_set_text(s_chpick_status_label, "");
+    chpick_refresh_count_label();
+    chpick_apply_disable_state();
+}
+
+static void build_chpick_discard_confirm(void);
+
+static void on_chpick_close(lv_event_t *e)
+{
+    (void)e;
+    if (chpick_has_unsaved_changes()) {
+        if (!s_chpick_discard_confirm) build_chpick_discard_confirm();
+        lv_obj_remove_flag(s_chpick_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_chpick_discard_confirm);
+        return;
+    }
+    chpick_close();
+}
+
+static void on_chpick_discard_yes(lv_event_t *e)
+{
+    (void)e;
+    if (s_chpick_discard_confirm) lv_obj_add_flag(s_chpick_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+    chpick_close();
+}
+
+static void on_chpick_discard_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_chpick_discard_confirm) lv_obj_add_flag(s_chpick_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_chpick_discard_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_chpick_discard_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg, "Unsaved channel changes will be lost.\nDiscard and close?");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Keep Editing");
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, on_chpick_discard_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 160, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xC04040), 0);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, "Discard");
+    lv_obj_center(yl);
+    lv_obj_add_event_cb(yes, on_chpick_discard_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_chpick_save(lv_event_t *e)
+{
+    (void)e;
+    int n = chpick_count_selected();
+    if (n == 0) {
+        lv_label_set_text(s_chpick_status_label,
+                          "#FF6060 Pick at least one channel.#");
+        return;
+    }
+    int  ids[APP_CONFIG_MAX_CHANNELS];
+    int  out = 0;
+    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
+                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    for (int i = 0; i < bound && out < APP_UI_MAX_TRACKED_CHANNELS; ++i) {
+        if (s_chpick_state[i]) ids[out++] = s_input_offset + i;
+    }
+    if (!app_config_set_channel_ids(ids, (size_t) out)) {
+        lv_label_set_text(s_chpick_status_label,
+                          "#FF6060 Save failed (NVS error).#");
+        return;
+    }
+    lv_label_set_text(s_chpick_status_label, "#40C060 Saved. Rebooting...#");
+    lv_refr_now(NULL);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static void build_chpick_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *ov = lv_obj_create(scr);
+    lv_obj_set_size(ov, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 16, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    s_chpick_overlay = ov;
+
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "Edit Channels");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(ov);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_chpick_close, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_button_create(ov);
+    lv_obj_set_size(save_btn, 110, 36);
+    lv_obj_align(save_btn, LV_ALIGN_TOP_LEFT, 0, -4);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x40C060), 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK " Save");
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, on_chpick_save, LV_EVENT_CLICKED, NULL);
+
+    s_chpick_count_label = lv_label_create(ov);
+    lv_obj_align(s_chpick_count_label, LV_ALIGN_TOP_MID, 0, 30);
+
+    s_chpick_status_label = lv_label_create(ov);
+    lv_label_set_text(s_chpick_status_label, "");
+    lv_label_set_recolor(s_chpick_status_label, true);
+    lv_obj_align(s_chpick_status_label, LV_ALIGN_BOTTOM_LEFT, 0, -4);
+
+    // Scrollable list of N rows in 3 columns. Each cell is checkbox +
+    // label "CH NN <name>"; layout mirrors the Settings overlay's
+    // existing 3-col channel list.
+    s_chpick_list = lv_obj_create(ov);
+    lv_obj_set_size(s_chpick_list, SCREEN_W - 32, SCREEN_H - 96);
+    lv_obj_align(s_chpick_list, LV_ALIGN_TOP_LEFT, 0, 60);
+    lv_obj_set_style_pad_all(s_chpick_list, 6, 0);
+    lv_obj_set_style_pad_row(s_chpick_list, 4, 0);
+    lv_obj_set_style_pad_column(s_chpick_list, 8, 0);
+    lv_obj_set_layout(s_chpick_list, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_chpick_list, LV_FLEX_FLOW_ROW_WRAP);
+}
+
+static void chpick_open(void)
+{
+    if (s_input_count <= 0) {
+        // No range from MS yet -- we can't show a meaningful picker. Bail
+        // silently; the Channels button stays harmless.
+        return;
+    }
+    if (!s_chpick_overlay) build_chpick_overlay();
+
+    // Rebuild rows each open so a reconnect to a different console doesn't
+    // leave stale row count.
+    lv_obj_clean(s_chpick_list);
+    memset(s_chpick_checks, 0, sizeof(s_chpick_checks));
+    // Zero the state + orig arrays defensively. EXT_RAM_BSS_ATTR data lives
+    // in PSRAM and IDF does zero it at startup, but we touched these arrays
+    // in a prior open and the indices we don't iterate below would otherwise
+    // hold stale values that count_selected would read.
+    memset(s_chpick_state, 0, sizeof(s_chpick_state));
+    memset(s_chpick_orig,  0, sizeof(s_chpick_orig));
+
+    // Clamp s_input_count to the array size we actually allocated. Si
+    // Expression has 24, exactly APP_CONFIG_MAX_CHANNELS, so this is a
+    // belt-and-braces guard against future consoles with more inputs.
+    int n_inputs = s_input_count;
+    if (n_inputs > APP_CONFIG_MAX_CHANNELS) n_inputs = APP_CONFIG_MAX_CHANNELS;
+
+    // Seed working state from the persisted selection.
+    size_t cur_count = 0;
+    const int *cur = app_config_channel_ids(&cur_count);
+    for (int i = 0; i < n_inputs; ++i) {
+        for (size_t j = 0; j < cur_count; ++j) {
+            if (cur[j] == s_input_offset + i) {
+                s_chpick_state[i] = true;
+                break;
+            }
+        }
+        s_chpick_orig[i] = s_chpick_state[i];
+    }
+
+    // 3 columns to fit 24 rows in a single scroll, but each cell wide
+    // enough to show the channel name comfortably.
+    const int row_w = (SCREEN_W - 32 - 12 - 16) / 3;  // pad + gaps
+    for (int i = 0; i < s_input_count && i < APP_CONFIG_MAX_CHANNELS; ++i) {
+        lv_obj_t *row = lv_obj_create(s_chpick_list);
+        lv_obj_set_size(row, row_w, 36);
+        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *cb = lv_checkbox_create(row);
+        char buf[24];
+        snprintf(buf, sizeof(buf), "CH %02d", s_input_offset + i + 1);
+        lv_checkbox_set_text(cb, buf);
+        if (s_chpick_state[i]) lv_obj_add_state(cb, LV_STATE_CHECKED);
+        lv_obj_align(cb, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_add_event_cb(cb, on_chpick_check_changed,
+                            LV_EVENT_VALUE_CHANGED, (void *)(intptr_t) i);
+        s_chpick_checks[i] = cb;
+    }
+
+    chpick_refresh_count_label();
+    chpick_apply_disable_state();
+    lv_label_set_text(s_chpick_status_label, "");
+    lv_obj_remove_flag(s_chpick_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_chpick_overlay);
+}
+
+static void chpick_close(void)
+{
+    if (s_chpick_overlay) lv_obj_add_flag(s_chpick_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+void app_ui_set_input_range(int offset, int count)
+{
+    s_input_offset = offset;
+    s_input_count  = count;
+}
+
+static void on_edit_channels_clicked(lv_event_t *e)
+{
+    (void)e;
+    chpick_open();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
