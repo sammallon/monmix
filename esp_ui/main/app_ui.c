@@ -145,6 +145,20 @@ static lv_obj_t *s_rename_textarea;
 static lv_obj_t *s_rename_keyboard;
 static size_t   s_rename_target_idx;
 
+// Network settings overlay — full-screen form with WiFi (SSID + password)
+// and Mixing Station (host + port) fields. Edits are written to NVS via
+// app_config_set_*; user is prompted to reboot to apply since live re-init
+// of WiFi/WS while preserving UI state is more complex than the use case
+// warrants.
+static lv_obj_t *s_net_overlay;
+static lv_obj_t *s_net_ssid_ta;
+static lv_obj_t *s_net_pass_ta;
+static lv_obj_t *s_net_host_ta;
+static lv_obj_t *s_net_port_ta;
+static lv_obj_t *s_net_show_pass_cb;
+static lv_obj_t *s_net_keyboard;
+static lv_obj_t *s_net_status_label;
+
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
 // console" state instead of strips with no live data. Hidden once MS
@@ -198,6 +212,9 @@ static void mix_picker_refresh_labels(void);
 static void mix_indicator_refresh(void);
 static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
+static void on_network_clicked(lv_event_t *e);
+static void network_settings_open(void);
+static void network_settings_close(void);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
 // is called on the Yes path; Cancel just hides the popup.
@@ -989,6 +1006,17 @@ static void build_settings_overlay(void)
                             (void *)(uintptr_t) i);
     }
 
+    // Network settings entry button — opens a separate overlay for editing
+    // WiFi creds and MS host:port. Aligned with the Channels section header
+    // on the same row, far right, so it doesn't crowd the radio rows.
+    lv_obj_t *net_btn = lv_button_create(ov);
+    lv_obj_set_size(net_btn, 160, 36);
+    lv_obj_align(net_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
+    lv_obj_t *net_lbl = lv_label_create(net_btn);
+    lv_label_set_text(net_lbl, LV_SYMBOL_WIFI " Network...");
+    lv_obj_center(net_lbl);
+    lv_obj_add_event_cb(net_btn, on_network_clicked, LV_EVENT_CLICKED, NULL);
+
     // Section: Channels — 3 columns × N rows in a scrollable container so
     // the same layout works at 12 channels (default) and at the Si Expression
     // 2's full 60-channel count. Row is just [name] + [swatch] for now;
@@ -1530,6 +1558,230 @@ static void on_name_clicked(lv_event_t *e)
 {
     size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
     rename_open(idx);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Network settings overlay — WiFi SSID/password + MS host/port editor.
+// Edits persist to NVS via app_config; user must reboot to apply (live
+// re-init of WiFi/WS while preserving UI state is more complex than the
+// "set up the device once" use case warrants).
+// ─────────────────────────────────────────────────────────────────────────
+
+static void on_network_clicked(lv_event_t *e)
+{
+    (void)e; network_settings_open();
+}
+
+static void on_net_close(lv_event_t *e)
+{
+    (void)e; network_settings_close();
+}
+
+static void on_net_show_pass_changed(lv_event_t *e)
+{
+    (void)e;
+    bool show = lv_obj_has_state(s_net_show_pass_cb, LV_STATE_CHECKED);
+    lv_textarea_set_password_mode(s_net_pass_ta, !show);
+}
+
+static void on_net_textarea_focused(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target_obj(e);
+    if (s_net_keyboard) {
+        lv_keyboard_set_textarea(s_net_keyboard, ta);
+        // Numeric keyboard for the port field, lowercase otherwise. Most
+        // SSIDs and hosts are typed lowercase so user doesn't have to hunt
+        // for the shift key.
+        lv_keyboard_mode_t mode = (ta == s_net_port_ta)
+            ? LV_KEYBOARD_MODE_NUMBER
+            : LV_KEYBOARD_MODE_TEXT_LOWER;
+        lv_keyboard_set_mode(s_net_keyboard, mode);
+        lv_obj_remove_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_net_save(lv_event_t *e)
+{
+    (void)e;
+    const char *ssid = lv_textarea_get_text(s_net_ssid_ta);
+    const char *pass = lv_textarea_get_text(s_net_pass_ta);
+    const char *host = lv_textarea_get_text(s_net_host_ta);
+    const char *port_s = lv_textarea_get_text(s_net_port_ta);
+
+    long port = strtol(port_s, NULL, 10);
+    if (port <= 0 || port > 65535) {
+        lv_label_set_text(s_net_status_label,
+                          "#FF6060 Invalid port (1-65535)#");
+        return;
+    }
+
+    bool ok = true;
+    if (strlen(ssid) == 0) { ok = false; }
+    else                   { ok = ok && app_config_set_wifi_ssid(ssid); }
+    // Empty password is valid (open networks). MS host empty is not.
+    ok = ok && app_config_set_wifi_pass(pass);
+    if (strlen(host) == 0) { ok = false; }
+    else                   { ok = ok && app_config_set_ms_host(host); }
+    ok = ok && app_config_set_ms_port((uint16_t) port);
+
+    if (ok) {
+        lv_label_set_text(s_net_status_label,
+                          "#40C060 Saved. Reboot to apply.#");
+        // Hide the keyboard so the status text isn't clipped under it. User
+        // can tap a field again to bring the keyboard back.
+        lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_net_status_label,
+                          "#FF6060 Save failed (empty field or NVS error).#");
+    }
+}
+
+static void build_network_settings_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_t *ov = lv_obj_create(scr);
+    lv_obj_set_size(ov, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_radius(ov, 0, 0);
+    lv_obj_set_style_pad_all(ov, 16, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    s_net_overlay = ov;
+
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "Network Settings");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(ov);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_net_close, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_btn = lv_button_create(ov);
+    lv_obj_set_size(save_btn, 110, 36);
+    lv_obj_align(save_btn, LV_ALIGN_TOP_LEFT, 0, -4);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x40C060), 0);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, LV_SYMBOL_OK " Save");
+    lv_obj_center(save_lbl);
+    lv_obj_add_event_cb(save_btn, on_net_save, LV_EVENT_CLICKED, NULL);
+
+    // Two-column form: WiFi (left) / Mixing Station (right). Each column is
+    // ~480 px wide with a 16 px gap between them. Fields below the section
+    // headers are 36 px tall textareas; total form height fits in the top
+    // ~280 px so the keyboard has the bottom 280 px when active.
+    const int col_w   = (SCREEN_W - 32 - 16) / 2;   // 32 = pad_all*2, 16 = gap
+    const int field_h = 36;
+    const int row_dy  = 56;
+
+    // --- WiFi column ---
+    lv_obj_t *wifi_hdr = lv_label_create(ov);
+    lv_label_set_text(wifi_hdr, "WiFi");
+    lv_obj_align(wifi_hdr, LV_ALIGN_TOP_LEFT, 0, 56);
+
+    lv_obj_t *ssid_lbl = lv_label_create(ov);
+    lv_label_set_text(ssid_lbl, "SSID");
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 30);
+    s_net_ssid_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_net_ssid_ta, col_w - 60, field_h);
+    lv_obj_align(s_net_ssid_ta, LV_ALIGN_TOP_LEFT, 60, 56 + 26);
+    lv_textarea_set_one_line(s_net_ssid_ta, true);
+    lv_textarea_set_max_length(s_net_ssid_ta, APP_CONFIG_SSID_MAX - 1);
+    lv_obj_add_event_cb(s_net_ssid_ta, on_net_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *pass_lbl = lv_label_create(ov);
+    lv_label_set_text(pass_lbl, "Pass");
+    lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 30 + row_dy);
+    s_net_pass_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_net_pass_ta, col_w - 60, field_h);
+    lv_obj_align(s_net_pass_ta, LV_ALIGN_TOP_LEFT, 60, 56 + 26 + row_dy);
+    lv_textarea_set_one_line(s_net_pass_ta, true);
+    lv_textarea_set_max_length(s_net_pass_ta, APP_CONFIG_PASS_MAX - 1);
+    lv_textarea_set_password_mode(s_net_pass_ta, true);
+    lv_obj_add_event_cb(s_net_pass_ta, on_net_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    s_net_show_pass_cb = lv_checkbox_create(ov);
+    lv_checkbox_set_text(s_net_show_pass_cb, "Show");
+    lv_obj_align(s_net_show_pass_cb, LV_ALIGN_TOP_LEFT,
+                 0, 56 + 30 + row_dy * 2);
+    lv_obj_add_event_cb(s_net_show_pass_cb, on_net_show_pass_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    // --- Mixing Station column ---
+    const int ms_x = col_w + 16;
+
+    lv_obj_t *ms_hdr = lv_label_create(ov);
+    lv_label_set_text(ms_hdr, "Mixing Station");
+    lv_obj_align(ms_hdr, LV_ALIGN_TOP_LEFT, ms_x, 56);
+
+    lv_obj_t *host_lbl = lv_label_create(ov);
+    lv_label_set_text(host_lbl, "Host");
+    lv_obj_align(host_lbl, LV_ALIGN_TOP_LEFT, ms_x, 56 + 30);
+    s_net_host_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_net_host_ta, col_w - 60, field_h);
+    lv_obj_align(s_net_host_ta, LV_ALIGN_TOP_LEFT, ms_x + 60, 56 + 26);
+    lv_textarea_set_one_line(s_net_host_ta, true);
+    lv_textarea_set_max_length(s_net_host_ta, APP_CONFIG_HOST_MAX - 1);
+    lv_obj_add_event_cb(s_net_host_ta, on_net_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *port_lbl = lv_label_create(ov);
+    lv_label_set_text(port_lbl, "Port");
+    lv_obj_align(port_lbl, LV_ALIGN_TOP_LEFT, ms_x, 56 + 30 + row_dy);
+    s_net_port_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_net_port_ta, 120, field_h);
+    lv_obj_align(s_net_port_ta, LV_ALIGN_TOP_LEFT,
+                 ms_x + 60, 56 + 26 + row_dy);
+    lv_textarea_set_one_line(s_net_port_ta, true);
+    lv_textarea_set_max_length(s_net_port_ta, 5);  // 65535 = 5 digits
+    lv_obj_add_event_cb(s_net_port_ta, on_net_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    // Status line below the form — used by save handler to confirm or report
+    // errors. Recolor-via-markup needs lv_label_set_recolor.
+    s_net_status_label = lv_label_create(ov);
+    lv_label_set_text(s_net_status_label, "");
+    lv_label_set_recolor(s_net_status_label, true);
+    lv_obj_align(s_net_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + 30 + row_dy * 3);
+
+    // Keyboard occupies the bottom half. Hidden until a textarea is focused
+    // so the form is visible at first open.
+    s_net_keyboard = lv_keyboard_create(ov);
+    lv_obj_set_size(s_net_keyboard, SCREEN_W - 32, SCREEN_H / 2);
+    lv_obj_align(s_net_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void network_settings_open(void)
+{
+    if (!s_net_overlay) build_network_settings_overlay();
+    // Pre-fill from the current persisted values each time we open so the
+    // user sees the truth from NVS (in case they edited then cancelled).
+    lv_textarea_set_text(s_net_ssid_ta, app_config_wifi_ssid());
+    lv_textarea_set_text(s_net_pass_ta, app_config_wifi_pass());
+    lv_textarea_set_text(s_net_host_ta, app_config_ms_host());
+    char port_s[8];
+    snprintf(port_s, sizeof(port_s), "%u", (unsigned) app_config_ms_port());
+    lv_textarea_set_text(s_net_port_ta, port_s);
+    lv_textarea_set_password_mode(s_net_pass_ta, true);
+    lv_obj_remove_state(s_net_show_pass_cb, LV_STATE_CHECKED);
+    lv_label_set_text(s_net_status_label, "");
+    lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_remove_flag(s_net_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_net_overlay);
+}
+
+static void network_settings_close(void)
+{
+    if (s_net_overlay) {
+        lv_obj_add_flag(s_net_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

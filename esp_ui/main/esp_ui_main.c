@@ -9,12 +9,12 @@
 #include "app_ms_client.h"
 #include "app_ms_info.h"
 #include "app_prefs.h"
+#include "app_config.h"
 #include "app_state.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
 #include "app_ui.h"
 #include "app_wifi.h"
-#include "secrets.h"
 
 static const char *TAG = "esp_ui";
 
@@ -101,7 +101,7 @@ void app_main(void)
     app_ms_info_t info;
     bool info_ok = false;
     if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED &&
-        app_ms_info_fetch(APP_MS_HOST, APP_MS_PORT, &info) &&
+        app_ms_info_fetch(app_config_ms_host(), app_config_ms_port(), &info) &&
         info.input_count > 0) {
         info_ok = true;
         int ids[APP_CONFIG_MAX_CHANNELS];

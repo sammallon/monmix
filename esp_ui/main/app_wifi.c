@@ -1,7 +1,7 @@
 #include "app_wifi.h"
+#include "app_config.h"
 #include "app_logd.h"
 #include "app_ui.h"
-#include "secrets.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -104,8 +104,13 @@ void app_wifi_init_radio(void)
                                                         on_event, NULL, NULL));
 
     wifi_config_t cfg = {0};
-    strncpy((char *)cfg.sta.ssid,     APP_WIFI_SSID,     sizeof(cfg.sta.ssid));
-    strncpy((char *)cfg.sta.password, APP_WIFI_PASSWORD, sizeof(cfg.sta.password));
+    // strncpy(..., sizeof(dst)) trips -Wstringop-truncation with a runtime
+    // source. App config getters already enforce length bounds (33 / 65 with
+    // NUL), so a memcpy of strlen + the zero-init above is exact and safe.
+    const char *ssid = app_config_wifi_ssid();
+    const char *pass = app_config_wifi_pass();
+    memcpy(cfg.sta.ssid,     ssid, strlen(ssid));
+    memcpy(cfg.sta.password, pass, strlen(pass));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
@@ -126,9 +131,7 @@ app_wifi_state_t app_wifi_get_state(void)
 
 const char *app_wifi_get_ssid(void)
 {
-    // Read straight from secrets.h until the planned migration to prefs;
-    // the running config matches it byte-for-byte (set_config in init).
-    return APP_WIFI_SSID;
+    return app_config_wifi_ssid();
 }
 
 void app_wifi_format_ip(char *buf, size_t buflen)

@@ -1,7 +1,7 @@
+#include "app_config.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_state.h"
-#include "secrets.h"
 
 #include "esp_attr.h"
 
@@ -112,8 +112,8 @@ static void on_connected_subscribe_all(void);
 static void handle_broadcast(const char *json, size_t len);
 
 static app_ms_state_t ws_get_state(void)             { return s_state; }
-static const char    *ws_get_host(void)              { return APP_MS_HOST; }
-static int            ws_get_port(void)              { return APP_MS_PORT; }
+static const char    *ws_get_host(void)              { return app_config_ms_host(); }
+static int            ws_get_port(void)              { return (int) app_config_ms_port(); }
 static void           ws_register_on_change(app_ms_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -199,7 +199,8 @@ const ms_client_iface_t *app_ms_client_ws(void)
 static bool ws_create_and_start(void)
 {
     char uri[64];
-    snprintf(uri, sizeof(uri), "ws://%s:%d/", APP_MS_HOST, APP_MS_PORT);
+    snprintf(uri, sizeof(uri), "ws://%s:%u/",
+             app_config_ms_host(), (unsigned) app_config_ms_port());
 
     esp_websocket_client_config_t cfg = {
         .uri                  = uri,
@@ -526,7 +527,8 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
     switch (id) {
     case WEBSOCKET_EVENT_CONNECTED: {
         ESP_LOGI(TAG, "connected");
-        APP_LOGD_I("ms_ws", "connected to %s:%d", APP_MS_HOST, APP_MS_PORT);
+        APP_LOGD_I("ms_ws", "connected to %s:%u",
+                   app_config_ms_host(), (unsigned) app_config_ms_port());
         set_state(APP_MS_STATE_CONNECTED);
         on_connected_subscribe_all();
         break;
