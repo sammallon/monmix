@@ -57,6 +57,8 @@ BAUD = 921600
 
 BEGIN_RE = re.compile(rb"===BEGIN BASE64 (\S+) SIZE (\d+) ===")
 END_TAG  = b"===END BASE64==="
+B64_ALPHABET = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -73,11 +75,14 @@ def ms_get(host: str, port: int, path: str, timeout: float = 3.0) -> dict | None
         return None
 
 
-def ms_set(host: str, port: int, path: str, value, timeout: float = 3.0) -> bool:
+def ms_set(host: str, port: int, path: str, value,
+           timeout: float = 3.0, quiet: bool = False) -> bool:
     """POST to /console/data/set/<path>/<fmt> with {"value": ...}.
 
     The path argument is the full set-path including /<fmt> suffix
-    (e.g. "ch.0.levelData.0.lvl/norm").
+    (e.g. "ch.0.levelData.0.lvl/norm"). `quiet=True` suppresses error
+    printing — useful during route probing where 404s are expected on
+    un-routed mixes.
     """
     url  = f"http://{host}:{port}/console/data/set/{path}"
     body = json.dumps({"value": value}).encode()
@@ -87,7 +92,8 @@ def ms_set(host: str, port: int, path: str, value, timeout: float = 3.0) -> bool
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status == 200
     except Exception as e:
-        print(f"  ! SET {path} = {value!r} failed: {e}")
+        if not quiet:
+            print(f"  ! SET {path} = {value!r} failed: {e}")
         return False
 
 
@@ -145,21 +151,41 @@ def send_and_drain(ser: serial.Serial, line: str,
 def screenshot(ser: serial.Serial, name: str) -> bool:
     # Bumped max_wait from 30 → 60 s — under realistic WS-broadcast load
     # the device's snapshot + compress + b64-emit chain can stretch to
-    # ~10–20 s before the BEGIN marker arrives. idle_grace bumped 1.5 →
-    # 5.0 because under load the device can pause for 2–3 s between the
-    # initial echo and the first printf (LVGL render takes lvgl_port_lock
-    # which a still-draining sweep is contesting).
-    raw = send_and_drain(ser, "screenshot", idle_grace=5.0, max_wait=60)
+    # ~10–20 s before the BEGIN marker arrives. idle_grace bumped to 15 s
+    # because between the REPL echo and the first stats/BEGIN printf the
+    # device runs lv_snapshot_take_to_draw_buf (full-screen render into
+    # the PSRAM buffer) and tdefl_compress on 1.2 MB of pixels — that
+    # whole window is silent on UART, and a smaller idle_grace lets the
+    # host bail out before BEGIN arrives.
+    raw = send_and_drain(ser, "screenshot", idle_grace=15.0, max_wait=60)
     m = BEGIN_RE.search(raw)
     if not m:
-        print(f"  ! {name}: no BEGIN marker")
+        # Surface the first kilobyte of what we DID receive — if the
+        # device printed "screenshot: lvgl_port_lock timeout" or "PSRAM
+        # alloc failed", that signal is what we actually need, not just
+        # "no BEGIN marker". Strip the command echo prefix so the
+        # diagnostic is the first interesting bytes.
+        snippet = raw[:1024].decode(errors="replace")
+        print(f"  ! {name}: no BEGIN marker (got {len(raw)} bytes)\n"
+              f"      <<<{snippet!r}>>>")
         return False
     end_idx = raw.find(END_TAG, m.end())
     if end_idx < 0:
-        print(f"  ! {name}: no END marker")
+        print(f"  ! {name}: no END marker (got {len(raw)} bytes)")
         return False
+    # Filter the body to b64-valid lines only. Under load a printf from
+    # another task can land mid-stream (esp_log_level_set quiesces ESP_LOG
+    # but not raw printf), so an interleaved log line would otherwise pollute
+    # the joined payload and trip validate=True. Drop any line containing a
+    # non-b64 byte; if we lose a few bytes of payload, the header magic check
+    # below catches it.
+    body_lines = raw[m.end():end_idx].split()
+    clean = bytearray()
+    for line in body_lines:
+        if all(c in B64_ALPHABET for c in line):
+            clean.extend(line)
     try:
-        payload = base64.b64decode(b"".join(raw[m.end():end_idx].split()), validate=True)
+        payload = base64.b64decode(bytes(clean), validate=True)
     except Exception as e:
         print(f"  ! {name}: base64 decode failed: {e}")
         return False
@@ -197,7 +223,7 @@ def screenshot(ser: serial.Serial, name: str) -> bool:
             out[o + 2] = (b << 3) | (b >> 2)
     img = Image.frombytes("RGB", (w, h), bytes(out))
     img.save(SHOT_DIR / (name + ".png"))
-    print(f"  → {name}.png ({w}×{h}, {clen} comp)")
+    print(f"  -> {name}.png ({w}x{h}, {clen} comp)")
     return True
 
 
@@ -249,8 +275,10 @@ def main() -> None:
     routed_mixes = []
     for m in range(args.num_mixes):
         # 0.5 = mid-fader, harmless probe value; failure means non-routed.
+        # quiet=True so the typical 13-of-14 404s don't drown the log.
         if ms_set(args.ms_host, args.ms_port,
-                  f"ch.0.levelData.{m}.lvl/norm", 0.5, timeout=2.0):
+                  f"ch.0.levelData.{m}.lvl/norm", 0.5,
+                  timeout=2.0, quiet=True):
             routed_mixes.append(m)
     if not routed_mixes:
         print("no routed mixes found on MS — abort"); sys.exit(1)

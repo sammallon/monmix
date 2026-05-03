@@ -72,7 +72,7 @@ static int cmd_ls(int argc, char **argv)
 //   ===END BASE64===
 // ─────────────────────────────────────────────────────────────────────────
 
-static int cmd_cat_b64(int argc, char **argv)
+static int cmd_cat_b64_impl(int argc, char **argv)
 {
     if (argc < 2) {
         printf("usage: cat-b64 <path>\n");
@@ -111,13 +111,28 @@ static int cmd_cat_b64(int argc, char **argv)
     return 0;
 }
 
+// Wrap the cat-b64 emit with an ESP_LOG quiesce. Same reason as
+// cmd_screenshot: any ESP_LOG that fires from a non-console task
+// (ms_ws disconnect/reconnect, hb integrity probe, etc.) lands on the
+// same UART and pollutes the b64 stream. We can't recover a partial
+// line on the host, so we just suppress logs while the file's payload
+// is being emitted. The SD-side APP_LOGD continues normally.
+static int cmd_cat_b64(int argc, char **argv)
+{
+    esp_log_level_t prior = esp_log_level_get("*");
+    esp_log_level_set("*", ESP_LOG_NONE);
+    int rc = cmd_cat_b64_impl(argc, argv);
+    esp_log_level_set("*", prior);
+    return rc;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `coredump-b64` — emit the flash `coredump` partition as base64. Same
 // framing as cat-b64. Useful when SD failed to mount and we can't write
 // the dump to /sdcard — we read the partition directly over UART instead.
 // ─────────────────────────────────────────────────────────────────────────
 
-static int cmd_coredump_b64(int argc, char **argv)
+static int cmd_coredump_b64_impl(int argc, char **argv)
 {
     (void) argc; (void) argv;
 
@@ -171,6 +186,16 @@ static int cmd_coredump_b64(int argc, char **argv)
     return 0;
 }
 
+// Wrap with ESP_LOG quiesce — same reason as cmd_screenshot / cmd_cat_b64.
+static int cmd_coredump_b64(int argc, char **argv)
+{
+    esp_log_level_t prior = esp_log_level_get("*");
+    esp_log_level_set("*", ESP_LOG_NONE);
+    int rc = cmd_coredump_b64_impl(argc, argv);
+    esp_log_level_set("*", prior);
+    return rc;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // `screenshot` — capture the current LVGL screen as RGB565, prefix a small
 // magic+dimensions header, and base64-stream the lot through the same
@@ -218,11 +243,19 @@ static int cmd_screenshot_impl(void)
     const uint32_t snap_h = 600;
     const size_t   snap_pixels_size = snap_w * snap_h * 2;       // RGB565
     const size_t   snap_alloc_size  = snap_pixels_size + 256;    // alignment slack
+    // Trace-level entry log so the SD post-mortem can correlate
+    // screenshot attempts with heartbeat/heap state — caller's
+    // esp_log_level_set quiesce only suppresses ESP_LOGx, not APP_LOGD
+    // (which writes to /sdcard/monmix-NNNN.log directly).
+    APP_LOGD_T("screenshot", "begin");
+
     uint8_t *snap_raw = heap_caps_aligned_alloc(64, snap_alloc_size,
                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!snap_raw) {
         printf("screenshot: PSRAM alloc failed (need %u bytes)\n",
                (unsigned) snap_alloc_size);
+        APP_LOGD_E("screenshot", "PSRAM alloc failed (need %u)",
+                   (unsigned) snap_alloc_size);
         return 1;
     }
 
@@ -233,6 +266,7 @@ static int cmd_screenshot_impl(void)
     if (!lvgl_port_lock(2000)) {
         free(snap_raw);
         printf("screenshot: lvgl_port_lock timeout\n");
+        APP_LOGD_E("screenshot", "lvgl_port_lock timeout (2000 ms)");
         return 1;
     }
     lv_obj_t   *scr = lv_screen_active();
@@ -243,6 +277,8 @@ static int cmd_screenshot_impl(void)
     if (r != LV_RESULT_OK) {
         free(snap_raw);
         printf("screenshot: snapshot failed (scr=%p result=%d)\n", scr, (int) r);
+        APP_LOGD_E("screenshot", "snapshot failed scr=%p result=%d",
+                   scr, (int) r);
         return 1;
     }
 
@@ -260,6 +296,8 @@ static int cmd_screenshot_impl(void)
     if (!cbuf) {
         free(snap_raw);
         printf("screenshot: out of memory for compress buffer\n");
+        APP_LOGD_E("screenshot", "compress buffer alloc failed (need %u)",
+                   (unsigned) cap);
         return 1;
     }
     // tdefl_compress_mem_to_mem internally callocs a tdefl_compressor, but
@@ -275,6 +313,8 @@ static int cmd_screenshot_impl(void)
         free(snap_raw);
         printf("screenshot: tdefl_compressor alloc failed (need %u bytes)\n",
                (unsigned) sizeof(*comp));
+        APP_LOGD_E("screenshot", "tdefl_compressor alloc failed (need %u)",
+                   (unsigned) sizeof(*comp));
         return 1;
     }
     int64_t t0 = esp_timer_get_time();
@@ -289,6 +329,8 @@ static int cmd_screenshot_impl(void)
     if (st != TDEFL_STATUS_DONE) {
         printf("screenshot: deflate failed (status=%d in_consumed=%u out_used=%u)\n",
                (int) st, (unsigned) in_size, (unsigned) out_size);
+        APP_LOGD_E("screenshot", "deflate failed status=%d in=%u out=%u",
+                   (int) st, (unsigned) in_size, (unsigned) out_size);
         free(cbuf);
         free(snap_raw);
         return 1;

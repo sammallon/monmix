@@ -34,6 +34,8 @@ BAUD = 921600
 HB_RE = re.compile(
     r"\[(\d+)\] \[hb\] I int free=(\d+) largest=(\d+) min=(\d+) "
     r"\| spi free=(\d+) largest=(\d+)")
+B64_ALPHABET = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
 
 def open_port(port: str, timeout: float = 10.0) -> serial.Serial:
@@ -78,9 +80,17 @@ def fetch_b64(ser: serial.Serial, path: str) -> bytes | None:
     end = raw.find(b"===END BASE64===", m.end())
     if end < 0:
         return None
-    body = raw[m.end():end]
+    # Filter to b64-valid lines — cat-b64 doesn't quiesce ESP_LOG, so
+    # async events (ms_ws disconnect, hb, etc.) interleave into the body
+    # whenever they fire during the read. Drop polluted lines; the file's
+    # SHA at the device side isn't checked here, so we accept that a few
+    # bytes can slip if a line is partially overlapped.
+    clean = bytearray()
+    for line in raw[m.end():end].split():
+        if all(c in B64_ALPHABET for c in line):
+            clean.extend(line)
     try:
-        return base64.b64decode(b"".join(body.split()), validate=True)
+        return base64.b64decode(bytes(clean), validate=True)
     except Exception as e:
         print(f"  ! decode failed for {path}: {e}")
         return None
@@ -127,6 +137,12 @@ def main() -> None:
         boots = 0
         corruption_lines = []
         log_paths_local: list[Path] = []
+        screenshot_attempts = 0      # [screenshot] T begin
+        screenshot_errors: dict[str, int] = {}   # error message → count
+        ws_disconnects = 0
+        ws_errors = 0
+        wifi_disconnects = 0
+        wifi_retries_exhausted = 0
 
         for name in targets:
             data = fetch_b64(ser, f"/sdcard/{name}")
@@ -142,9 +158,27 @@ def main() -> None:
             boots += text.count("session start")
 
             # Corruption lines from heartbeat task's integrity check.
+            # Screenshot diagnostics emitted by cmd_screenshot_impl.
+            # WS reconnect signal — every disconnect is suspect during soak.
             for line in text.splitlines():
                 if "HEAP CORRUPTION" in line:
                     corruption_lines.append(f"{name}: {line.strip()}")
+                if "[screenshot] T begin" in line:
+                    screenshot_attempts += 1
+                elif "[screenshot] E " in line:
+                    # Take everything after "[screenshot] E " as the message
+                    # key, drop log timestamps so identical errors collapse.
+                    idx = line.find("[screenshot] E ")
+                    msg = line[idx + len("[screenshot] E "):].strip()
+                    screenshot_errors[msg] = screenshot_errors.get(msg, 0) + 1
+                if "[ms_ws] W disconnected" in line:
+                    ws_disconnects += 1
+                if "[ms_ws] E error event" in line:
+                    ws_errors += 1
+                if "[app_wifi] W disconnect reason=" in line:
+                    wifi_disconnects += 1
+                if "[app_wifi] E retries exhausted" in line:
+                    wifi_retries_exhausted += 1
 
             # Heartbeat extraction.
             for m in HB_RE.finditer(text):
@@ -163,6 +197,23 @@ def main() -> None:
             print(f"  {line}")
         if not corruption_lines:
             print("  (none — heap integrity check passed every cycle)")
+
+        print()
+        print(f"=== wifi stability: disconnects={wifi_disconnects} "
+              f"retries-exhausted={wifi_retries_exhausted} ===")
+        print(f"=== ws stability:   disconnects={ws_disconnects} "
+              f"errors={ws_errors} ===")
+
+        print()
+        total_failures = sum(screenshot_errors.values())
+        print(f"=== screenshots: attempts={screenshot_attempts} "
+              f"failures={total_failures} ===")
+        if screenshot_errors:
+            for msg, count in sorted(screenshot_errors.items(),
+                                     key=lambda x: -x[1]):
+                print(f"  {count:>4d}  {msg}")
+        elif screenshot_attempts == 0:
+            print("  (no screenshot attempts logged — older firmware?)")
 
         print()
         print(f"=== heartbeats analyzed: {len(all_hb)} ===")
