@@ -125,9 +125,10 @@ void app_main(void)
     // Hand the mix count to the UI so the selector populates with the
     // right number of buttons. 0 = no MS info → selector stays hidden.
     app_ui_set_mix_count(info_ok ? info.mix_count : 0);
-    // Hand the input-channel range to the UI so the channel picker can
-    // render a row per available input.
-    if (info_ok) app_ui_set_input_range(info.input_offset, info.input_count);
+    // Hand the total channel count to the UI so the picker can render a
+    // row per available channel id (any type -- inputs, mixes, aux, etc).
+    // User picks freely from the full set.
+    if (info_ok) app_ui_set_channel_total(info.total);
 
     // Tell the WS client where the mix strips live in the dotted-path
     // namespace so it can subscribe to their scribble-strip names. Names

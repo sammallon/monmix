@@ -20,17 +20,23 @@ void app_ui_present_channels(void);
 // Pass 0 to hide the selector entirely. Default before this is called: 0.
 void app_ui_set_mix_count(int count);
 
-// Tell the UI the input-channel range available on the connected console
-// (Input channelType from /console/information). The channel picker uses
-// this to render a row per available input. Pass 0 count to disable the
-// picker. Default before this is called: 0/0.
-void app_ui_set_input_range(int offset, int count);
+// Tell the UI the total channel count on the connected console (any
+// channel type, since the picker treats them uniformly -- the user just
+// wants to pick which 16 of the N strips they care about). The picker
+// renders one row per channel id 0..count-1.
+void app_ui_set_channel_total(int count);
 
 // User-facing maximum number of channels that can be tracked at once.
 // Currently 16 (per #33: typical monitor mix size + LVGL build-time bound
 // at boot). Storage cap APP_CONFIG_MAX_CHANNELS is higher; this is the
 // editable-UI cap.
 #define APP_UI_MAX_TRACKED_CHANNELS 16
+
+// Maximum number of channel rows the picker can render. The picker shows
+// every channel id reported by the connected console (any type), so this
+// has to cover the largest reasonable totalChannels value. Si Expression
+// reports 80; we allow some headroom for other consoles.
+#define APP_UI_MAX_PICKER_ROWS 128
 
 // Update the status line at the top of the screen. Safe to call from any
 // task; uses lv_async_call internally. Calls made before app_ui_init runs

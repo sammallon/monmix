@@ -184,27 +184,27 @@ static lv_obj_t *s_ssid_list_popup;
 static lv_obj_t *s_ssid_list;
 
 // Channel picker overlay (entry: Settings -> Edit Channels...).
-// Shows every input channel on the connected console as a row with a
-// checkbox; user picks up to APP_UI_MAX_TRACKED_CHANNELS to track on
-// faders. Save persists to NVS via app_config_set_channel_ids and
-// reboots; the rebuild path under live broadcast traffic is a known
-// race (see esp_ui_main.c safe_max comment), so reboot is the simpler
-// shape.
-static int       s_input_offset;          // first MS channel id in the input range
-static int       s_input_count;           // total inputs available on the console
+// Shows every channel on the connected console as a row with a checkbox;
+// user picks up to APP_UI_MAX_TRACKED_CHANNELS to track on faders. Save
+// persists to NVS via app_config_set_channel_ids and reboots; the rebuild
+// path under live broadcast traffic is a known race (see esp_ui_main.c
+// safe_max comment), so reboot is the simpler shape.
+static int       s_total_channels;        // totalChannels from /console/information
 static lv_obj_t *s_chpick_overlay;
 static lv_obj_t *s_chpick_list;
 static lv_obj_t *s_chpick_status_label;
 static lv_obj_t *s_chpick_count_label;
 static lv_obj_t *s_chpick_discard_confirm;
-// Per-input checkbox pointers, indexed 0..s_input_count-1. Sized to the
-// storage cap so we don't have to malloc; PSRAM since this can be 24+
-// pointers and the array is only used while the picker is open.
-EXT_RAM_BSS_ATTR static lv_obj_t *s_chpick_checks[APP_CONFIG_MAX_CHANNELS];
-// Working selection during edit -- bool per input, size = s_input_count.
-EXT_RAM_BSS_ATTR static bool      s_chpick_state[APP_CONFIG_MAX_CHANNELS];
+// Per-channel checkbox pointers, indexed by MS channel id. Sized to the
+// picker-row cap, in PSRAM (could be 80+ on a large console).
+EXT_RAM_BSS_ATTR static lv_obj_t *s_chpick_checks[APP_UI_MAX_PICKER_ROWS];
+// Edit Channels button in the Settings overlay; tracked here so we can
+// reveal it once the channel count arrives from MS.
+static lv_obj_t *s_edit_channels_btn;
+// Working selection during edit -- bool per id, sized like checks.
+EXT_RAM_BSS_ATTR static bool      s_chpick_state[APP_UI_MAX_PICKER_ROWS];
 // Originals at open-time, used for has-changes detection.
-EXT_RAM_BSS_ATTR static bool      s_chpick_orig[APP_CONFIG_MAX_CHANNELS];
+EXT_RAM_BSS_ATTR static bool      s_chpick_orig[APP_UI_MAX_PICKER_ROWS];
 
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
@@ -1067,16 +1067,22 @@ static void build_settings_overlay(void)
 
     // Edit-channels entry — opens the picker overlay (#33). Button sits to
     // the right of the section label so it doesn't push the existing list
-    // layout. The picker is the runtime way to change which inputs are
+    // layout. The picker is the runtime way to change which channels are
     // tracked; was previously only doable via channels-reset + reflash.
-    lv_obj_t *edit_btn = lv_button_create(ov);
-    lv_obj_set_size(edit_btn, 180, 36);
-    lv_obj_align(edit_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
-    lv_obj_t *edit_lbl = lv_label_create(edit_btn);
+    // Hidden if we don't know the connected console's channel count yet
+    // (info fetch hasn't completed or failed) -- the picker would be
+    // empty and tapping it would be confusing.
+    s_edit_channels_btn = lv_button_create(ov);
+    lv_obj_set_size(s_edit_channels_btn, 180, 36);
+    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
+    lv_obj_t *edit_lbl = lv_label_create(s_edit_channels_btn);
     lv_label_set_text(edit_lbl, LV_SYMBOL_LIST " Edit Channels...");
     lv_obj_center(edit_lbl);
-    lv_obj_add_event_cb(edit_btn, on_edit_channels_clicked,
+    lv_obj_add_event_cb(s_edit_channels_btn, on_edit_channels_clicked,
                         LV_EVENT_CLICKED, NULL);
+    if (s_total_channels <= 0) {
+        lv_obj_add_flag(s_edit_channels_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 
     lv_obj_t *list = lv_obj_create(ov);
     lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 220);
@@ -2219,8 +2225,8 @@ static void mcfg_close(void)
 static int chpick_count_selected(void)
 {
     int n = 0;
-    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
-                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
     for (int i = 0; i < bound; ++i) if (s_chpick_state[i]) n++;
     return n;
 }
@@ -2240,8 +2246,8 @@ static void chpick_refresh_count_label(void)
 static void chpick_apply_disable_state(void)
 {
     bool at_cap = chpick_count_selected() >= APP_UI_MAX_TRACKED_CHANNELS;
-    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
-                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
     for (int i = 0; i < bound; ++i) {
         if (!s_chpick_checks[i]) continue;
         if (s_chpick_state[i]) {
@@ -2256,8 +2262,8 @@ static void chpick_apply_disable_state(void)
 
 static bool chpick_has_unsaved_changes(void)
 {
-    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
-                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
     for (int i = 0; i < bound; ++i) {
         if (s_chpick_state[i] != s_chpick_orig[i]) return true;
     }
@@ -2268,7 +2274,7 @@ static void on_chpick_check_changed(lv_event_t *e)
 {
     lv_obj_t *cb  = lv_event_get_target_obj(e);
     int       idx = (int)(intptr_t) lv_event_get_user_data(e);
-    if (idx < 0 || idx >= s_input_count) return;
+    if (idx < 0 || idx >= s_total_channels) return;
     bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
     // Enforce cap: if the user just turned this on and we're now over the
     // cap, refuse the change and revert the visual state.
@@ -2359,10 +2365,11 @@ static void on_chpick_save_yes(lv_event_t *e)
     (void)e;
     int  ids[APP_CONFIG_MAX_CHANNELS];
     int  out = 0;
-    int bound = s_input_count < APP_CONFIG_MAX_CHANNELS
-                ? s_input_count : APP_CONFIG_MAX_CHANNELS;
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
     for (int i = 0; i < bound && out < APP_UI_MAX_TRACKED_CHANNELS; ++i) {
-        if (s_chpick_state[i]) ids[out++] = s_input_offset + i;
+        // i is the MS channel id directly -- the picker covers ids 0..total-1
+        if (s_chpick_state[i]) ids[out++] = i;
     }
     if (!app_config_set_channel_ids(ids, (size_t) out)) {
         if (s_chpick_save_confirm) lv_obj_add_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
@@ -2490,9 +2497,9 @@ static void build_chpick_overlay(void)
 
 static void chpick_open(void)
 {
-    if (s_input_count <= 0) {
-        // No range from MS yet -- we can't show a meaningful picker. Bail
-        // silently; the Channels button stays harmless.
+    if (s_total_channels <= 0) {
+        // No total from MS yet -- the picker would be empty. Bail silently;
+        // the Edit Channels button stays harmless.
         return;
     }
     if (!s_chpick_overlay) build_chpick_overlay();
@@ -2501,25 +2508,20 @@ static void chpick_open(void)
     // leave stale row count.
     lv_obj_clean(s_chpick_list);
     memset(s_chpick_checks, 0, sizeof(s_chpick_checks));
-    // Zero the state + orig arrays defensively. EXT_RAM_BSS_ATTR data lives
-    // in PSRAM and IDF does zero it at startup, but we touched these arrays
-    // in a prior open and the indices we don't iterate below would otherwise
-    // hold stale values that count_selected would read.
-    memset(s_chpick_state, 0, sizeof(s_chpick_state));
-    memset(s_chpick_orig,  0, sizeof(s_chpick_orig));
+    memset(s_chpick_state,  0, sizeof(s_chpick_state));
+    memset(s_chpick_orig,   0, sizeof(s_chpick_orig));
 
-    // Clamp s_input_count to the array size we actually allocated. Si
-    // Expression has 24, exactly APP_CONFIG_MAX_CHANNELS, so this is a
-    // belt-and-braces guard against future consoles with more inputs.
-    int n_inputs = s_input_count;
-    if (n_inputs > APP_CONFIG_MAX_CHANNELS) n_inputs = APP_CONFIG_MAX_CHANNELS;
+    // Clamp to our PSRAM array size. Si Expression: 80; cap is 128.
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
 
-    // Seed working state from the persisted selection.
+    // Seed working state from the persisted selection. cur entries are MS
+    // channel ids, which index directly into our 0..total-1 row layout.
     size_t cur_count = 0;
     const int *cur = app_config_channel_ids(&cur_count);
-    for (int i = 0; i < n_inputs; ++i) {
+    for (int i = 0; i < bound; ++i) {
         for (size_t j = 0; j < cur_count; ++j) {
-            if (cur[j] == s_input_offset + i) {
+            if (cur[j] == i) {
                 s_chpick_state[i] = true;
                 break;
             }
@@ -2527,10 +2529,10 @@ static void chpick_open(void)
         s_chpick_orig[i] = s_chpick_state[i];
     }
 
-    // 3 columns to fit 24 rows in a single scroll, but each cell wide
-    // enough to show the channel name comfortably.
-    const int row_w = (SCREEN_W - 32 - 12 - 16) / 3;  // pad + gaps
-    for (int i = 0; i < s_input_count && i < APP_CONFIG_MAX_CHANNELS; ++i) {
+    // 3 columns wide enough to render "CH NN" comfortably. With 80 rows
+    // that's ~27 rows per column -- the list scrolls vertically.
+    const int row_w = (SCREEN_W - 32 - 12 - 16) / 3;
+    for (int i = 0; i < bound; ++i) {
         lv_obj_t *row = lv_obj_create(s_chpick_list);
         lv_obj_set_size(row, row_w, 36);
         lv_obj_set_style_pad_all(row, 4, 0);
@@ -2538,7 +2540,7 @@ static void chpick_open(void)
 
         lv_obj_t *cb = lv_checkbox_create(row);
         char buf[24];
-        snprintf(buf, sizeof(buf), "CH %02d", s_input_offset + i + 1);
+        snprintf(buf, sizeof(buf), "CH %02d", i + 1);
         lv_checkbox_set_text(cb, buf);
         if (s_chpick_state[i]) lv_obj_add_state(cb, LV_STATE_CHECKED);
         lv_obj_align(cb, LV_ALIGN_LEFT_MID, 0, 0);
@@ -2559,10 +2561,18 @@ static void chpick_close(void)
     if (s_chpick_overlay) lv_obj_add_flag(s_chpick_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
-void app_ui_set_input_range(int offset, int count)
+void app_ui_set_channel_total(int count)
 {
-    s_input_offset = offset;
-    s_input_count  = count;
+    if (count < 0) count = 0;
+    s_total_channels = count;
+    // The Settings overlay may have been built before MS info arrived;
+    // reveal the Edit Channels button now if so. (If the overlay hasn't
+    // been built yet, build_settings_overlay reads s_total_channels and
+    // creates the button hidden/visible appropriately.)
+    if (s_edit_channels_btn) {
+        if (count > 0) lv_obj_remove_flag(s_edit_channels_btn, LV_OBJ_FLAG_HIDDEN);
+        else           lv_obj_add_flag   (s_edit_channels_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void on_edit_channels_clicked(lv_event_t *e)
