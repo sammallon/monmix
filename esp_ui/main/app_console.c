@@ -29,6 +29,8 @@
 #include "app_storage.h"
 #include "app_touch_inject.h"
 #include "app_ui.h"
+#include "app_wifi.h"
+#include "esp_wifi.h"
 
 static const char *TAG = "app_console";
 
@@ -663,6 +665,89 @@ static int cmd_set_mix(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `wifi-stats` — current radio state. RSSI/BSSID come from the live AP
+// record so we can correlate disconnect events with link-quality drops
+// in the SD ring log.
+// ─────────────────────────────────────────────────────────────────────────
+
+static const char *wifi_state_str(app_wifi_state_t s)
+{
+    switch (s) {
+    case APP_WIFI_STATE_BOOT:       return "BOOT";
+    case APP_WIFI_STATE_CONNECTING: return "CONNECTING";
+    case APP_WIFI_STATE_CONNECTED:  return "CONNECTED";
+    case APP_WIFI_STATE_FAILED:     return "FAILED";
+    }
+    return "?";
+}
+
+static int cmd_wifi_stats(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    char ip[16];
+    app_wifi_format_ip(ip, sizeof(ip));
+    printf("state=%s ssid=%s ip=%s\n",
+           wifi_state_str(app_wifi_get_state()),
+           app_wifi_get_ssid(), ip);
+
+    wifi_ap_record_t ap;
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err == ESP_OK) {
+        printf("ap rssi=%d ch=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x phy=%d\n",
+               ap.rssi, ap.primary,
+               ap.bssid[0], ap.bssid[1], ap.bssid[2],
+               ap.bssid[3], ap.bssid[4], ap.bssid[5],
+               (int) ap.phy_11n);
+    } else {
+        printf("ap info: %s\n", esp_err_to_name(err));
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `wifi-reassoc` — exercise the watchdog's recovery path on demand. Lets
+// us verify reconnection works without having to wait for a natural drop.
+// Times out after 8 s.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_wifi_reassoc(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    int64_t t0 = esp_timer_get_time();
+    bool ok = app_wifi_force_reassociate(8000);
+    int64_t dt_ms = (esp_timer_get_time() - t0) / 1000;
+    printf("reassoc %s in %lldms\n", ok ? "ok" : "TIMEOUT", (long long) dt_ms);
+    return ok ? 0 : 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// `ws-status` — Mixing Station client state + endpoint. Pairs with
+// wifi-stats to localize "where did it stop working".
+// ─────────────────────────────────────────────────────────────────────────
+
+static const char *ms_state_str(app_ms_state_t s)
+{
+    switch (s) {
+    case APP_MS_STATE_BOOT:         return "BOOT";
+    case APP_MS_STATE_CONNECTING:   return "CONNECTING";
+    case APP_MS_STATE_CONNECTED:    return "CONNECTED";
+    case APP_MS_STATE_DISCONNECTED: return "DISCONNECTED";
+    case APP_MS_STATE_ERROR:        return "ERROR";
+    }
+    return "?";
+}
+
+static int cmd_ws_status(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    const ms_client_iface_t *ms = app_ms_client_ws();
+    printf("ws state=%s endpoint=ws://%s:%d/ mix=%d\n",
+           ms_state_str(ms->get_state()),
+           ms->get_host(), ms->get_port(), ms->get_mix());
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // REPL bootstrap.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -681,9 +766,13 @@ void app_console_init(void)
         { .command = "channels-reset", .help = "clear channel selection NVS, default applies next boot", .func = cmd_channels_reset },
         { .command = "ms-info",      .help = "fetch /console/information from MS, print channel arch", .func = cmd_ms_info      },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
+<<<<<<< HEAD
         { .command = "prefs-dump",   .help = "dump effective + NVS + SD prefs state (P0 verify)", .func = cmd_prefs_dump   },
         { .command = "mix-show",     .help = "[on|off] force mix-indicator visible (diagnose P5)", .func = cmd_mix_show     },
         { .command = "set-mix",      .help = "<idx> drive ms->set_mix(idx) -- exercises unsubscribe/resubscribe", .func = cmd_set_mix },
+        { .command = "wifi-stats",   .help = "print STA state, IP, AP record (RSSI/BSSID)",   .func = cmd_wifi_stats   },
+        { .command = "wifi-reassoc", .help = "force STA disconnect+reconnect via watchdog API", .func = cmd_wifi_reassoc },
+        { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
