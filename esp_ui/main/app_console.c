@@ -2,6 +2,7 @@
 
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -22,6 +23,7 @@
 #include "freertos/task.h"
 
 #include "app_config.h"
+#include "app_display.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_ms_info.h"
@@ -747,6 +749,25 @@ static int cmd_ws_status(int argc, char **argv)
     return 0;
 }
 
+// Live LCD backlight control. Used to A/B-test brownout-vs-storm theory:
+// drop the backlight from the default 80% to a low single-digit percentage,
+// run the stress reproducer, see if the storm still fires. If dimming
+// suppresses the storm, the C6's power rail is implicated. If not, the
+// wedge isn't power-driven.
+static int cmd_set_bright(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("usage: set-bright <0..100>\n");
+        return 1;
+    }
+    int pct = atoi(argv[1]);
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    app_display_set_backlight_pct((uint8_t) pct);
+    printf("backlight = %d%%\n", pct);
+    return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // REPL bootstrap.
 // ─────────────────────────────────────────────────────────────────────────
@@ -766,13 +787,13 @@ void app_console_init(void)
         { .command = "channels-reset", .help = "clear channel selection NVS, default applies next boot", .func = cmd_channels_reset },
         { .command = "ms-info",      .help = "fetch /console/information from MS, print channel arch", .func = cmd_ms_info      },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
-<<<<<<< HEAD
         { .command = "prefs-dump",   .help = "dump effective + NVS + SD prefs state (P0 verify)", .func = cmd_prefs_dump   },
         { .command = "mix-show",     .help = "[on|off] force mix-indicator visible (diagnose P5)", .func = cmd_mix_show     },
         { .command = "set-mix",      .help = "<idx> drive ms->set_mix(idx) -- exercises unsubscribe/resubscribe", .func = cmd_set_mix },
         { .command = "wifi-stats",   .help = "print STA state, IP, AP record (RSSI/BSSID)",   .func = cmd_wifi_stats   },
         { .command = "wifi-reassoc", .help = "force STA disconnect+reconnect via watchdog API", .func = cmd_wifi_reassoc },
         { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
+        { .command = "set-bright",   .help = "<0..100> -- set LCD backlight % (default 80)",  .func = cmd_set_bright   },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
