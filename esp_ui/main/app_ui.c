@@ -163,6 +163,15 @@ static lv_obj_t *s_net_scan_btn_label;
 // SSID scan results popup. Built lazily, reused. Hidden until scan completes.
 static lv_obj_t *s_ssid_list_popup;
 static lv_obj_t *s_ssid_list;
+// Discard-changes confirm popup. Built lazily, opened by the X button only
+// when the user has unsaved edits relative to NVS.
+static lv_obj_t *s_net_discard_confirm;
+// Snapshot of textarea contents at open() time, used to detect whether the
+// user has unsaved edits when they tap X. Sized to the largest field bound.
+static char s_net_orig_ssid[APP_CONFIG_SSID_MAX];
+static char s_net_orig_pass[APP_CONFIG_PASS_MAX];
+static char s_net_orig_host[APP_CONFIG_HOST_MAX];
+static char s_net_orig_port[8];
 
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
@@ -1560,9 +1569,86 @@ static void on_name_clicked(lv_event_t *e)
 // "set up the device once" use case warrants).
 // ─────────────────────────────────────────────────────────────────────────
 
+static void net_hide_keyboard(void)
+{
+    if (s_net_keyboard) {
+        lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static bool net_has_unsaved_changes(void)
+{
+    return strcmp(lv_textarea_get_text(s_net_ssid_ta), s_net_orig_ssid) != 0 ||
+           strcmp(lv_textarea_get_text(s_net_pass_ta), s_net_orig_pass) != 0 ||
+           strcmp(lv_textarea_get_text(s_net_host_ta), s_net_orig_host) != 0 ||
+           strcmp(lv_textarea_get_text(s_net_port_ta), s_net_orig_port) != 0;
+}
+
+static void build_net_discard_confirm(void);
+
 static void on_net_close(lv_event_t *e)
 {
-    (void)e; network_settings_close();
+    (void)e;
+    net_hide_keyboard();
+    if (net_has_unsaved_changes()) {
+        if (!s_net_discard_confirm) build_net_discard_confirm();
+        lv_obj_remove_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_net_discard_confirm);
+        return;
+    }
+    network_settings_close();
+}
+
+static void on_net_discard_yes(lv_event_t *e)
+{
+    (void)e;
+    // Nothing to roll back -- Save is what writes NVS, so unsaved edits
+    // are purely textarea-local. Hide the confirm + the overlay, the next
+    // open will repopulate from app_config.
+    if (s_net_discard_confirm) lv_obj_add_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+    network_settings_close();
+}
+
+static void on_net_discard_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_net_discard_confirm) lv_obj_add_flag(s_net_discard_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_net_discard_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_net_discard_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg, "Unsaved changes will be lost.\nDiscard and close?");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Keep Editing");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_net_discard_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 160, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xC04040), 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes);
+    lv_label_set_text(yes_lbl, "Discard");
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes, on_net_discard_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void on_net_show_pass_changed(lv_event_t *e)
@@ -1570,6 +1656,9 @@ static void on_net_show_pass_changed(lv_event_t *e)
     (void)e;
     bool show = lv_obj_has_state(s_net_show_pass_cb, LV_STATE_CHECKED);
     lv_textarea_set_password_mode(s_net_pass_ta, !show);
+    // Tapping a non-text control -> the user is done with the keyboard
+    // for now. Hide it so the status line below the form is visible.
+    net_hide_keyboard();
 }
 
 static void on_net_textarea_focused(lv_event_t *e)
@@ -1588,9 +1677,21 @@ static void on_net_textarea_focused(lv_event_t *e)
     }
 }
 
+// LVGL keyboard fires READY on the checkmark/OK button and CANCEL on the
+// keyboard-X button. Either one means the user is done typing for now;
+// hide the keyboard and surface the form again.
+static void on_net_keyboard_event(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        net_hide_keyboard();
+    }
+}
+
 static void on_net_save(lv_event_t *e)
 {
     (void)e;
+    net_hide_keyboard();
     const char *ssid = lv_textarea_get_text(s_net_ssid_ta);
     const char *pass = lv_textarea_get_text(s_net_pass_ta);
     const char *host = lv_textarea_get_text(s_net_host_ta);
@@ -1612,16 +1713,18 @@ static void on_net_save(lv_event_t *e)
     else                   { ok = ok && app_config_set_ms_host(host); }
     ok = ok && app_config_set_ms_port((uint16_t) port);
 
-    if (ok) {
-        lv_label_set_text(s_net_status_label,
-                          "#40C060 Saved. Reboot to apply.#");
-        // Hide the keyboard so the status text isn't clipped under it. User
-        // can tap a field again to bring the keyboard back.
-        lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
-    } else {
+    if (!ok) {
         lv_label_set_text(s_net_status_label,
                           "#FF6060 Save failed (empty field or NVS error).#");
+        return;
     }
+
+    // Save + reboot. The brief delay lets the SD log flush + the user see
+    // the status text register before the chip resets and the screen blanks.
+    lv_label_set_text(s_net_status_label, "#40C060 Saved. Rebooting...#");
+    lv_refr_now(NULL);  // force the label flush before we block
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
 }
 
 // Triggered by the Scan button. Kicks off an async wifi scan; the done
@@ -1722,6 +1825,7 @@ static void on_ssid_row_clicked(lv_event_t *e)
 static void on_net_scan_clicked(lv_event_t *e)
 {
     (void)e;
+    net_hide_keyboard();
     if (!app_wifi_scan_start(on_wifi_scan_done, NULL)) {
         // Already in progress or failed to start. Surface in the status line.
         lv_label_set_text(s_net_status_label,
@@ -1866,6 +1970,9 @@ static void build_network_settings_overlay(void)
     lv_obj_set_size(s_net_keyboard, SCREEN_W - 32, SCREEN_H / 2);
     lv_obj_align(s_net_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_net_keyboard, LV_OBJ_FLAG_HIDDEN);
+    // Hook checkmark/cancel keys -> hide keyboard (instead of LVGL's
+    // default which is to delete the textarea binding without hiding).
+    lv_obj_add_event_cb(s_net_keyboard, on_net_keyboard_event, LV_EVENT_ALL, NULL);
 }
 
 static void network_settings_open(void)
@@ -1873,12 +1980,28 @@ static void network_settings_open(void)
     if (!s_net_overlay) build_network_settings_overlay();
     // Pre-fill from the current persisted values each time we open so the
     // user sees the truth from NVS (in case they edited then cancelled).
-    lv_textarea_set_text(s_net_ssid_ta, app_config_wifi_ssid());
-    lv_textarea_set_text(s_net_pass_ta, app_config_wifi_pass());
-    lv_textarea_set_text(s_net_host_ta, app_config_ms_host());
+    const char *ssid = app_config_wifi_ssid();
+    const char *pass = app_config_wifi_pass();
+    const char *host = app_config_ms_host();
     char port_s[8];
     snprintf(port_s, sizeof(port_s), "%u", (unsigned) app_config_ms_port());
+
+    lv_textarea_set_text(s_net_ssid_ta, ssid);
+    lv_textarea_set_text(s_net_pass_ta, pass);
+    lv_textarea_set_text(s_net_host_ta, host);
     lv_textarea_set_text(s_net_port_ta, port_s);
+
+    // Snapshot for has-changes detection on close (X confirms discard
+    // when there are unsaved edits relative to these originals).
+    strncpy(s_net_orig_ssid, ssid,    sizeof(s_net_orig_ssid) - 1);
+    s_net_orig_ssid[sizeof(s_net_orig_ssid) - 1] = '\0';
+    strncpy(s_net_orig_pass, pass,    sizeof(s_net_orig_pass) - 1);
+    s_net_orig_pass[sizeof(s_net_orig_pass) - 1] = '\0';
+    strncpy(s_net_orig_host, host,    sizeof(s_net_orig_host) - 1);
+    s_net_orig_host[sizeof(s_net_orig_host) - 1] = '\0';
+    strncpy(s_net_orig_port, port_s,  sizeof(s_net_orig_port) - 1);
+    s_net_orig_port[sizeof(s_net_orig_port) - 1] = '\0';
+
     lv_textarea_set_password_mode(s_net_pass_ta, true);
     lv_obj_remove_state(s_net_show_pass_cb, LV_STATE_CHECKED);
     lv_label_set_text(s_net_status_label, "");
@@ -2422,5 +2545,10 @@ static void ms_panel_close(void)
 static void on_ms_clicked(lv_event_t *e)
 {
     (void)e;
-    ms_panel_open();
+    // Like the WiFi icon, route to the editable network settings overlay
+    // rather than the read-only ms_panel popup. The overlay's Mixing
+    // Station column carries the same fields ms_panel was showing
+    // (host/port) plus the editing affordances. ms_panel build/refresh
+    // code is kept around but unreachable; cleanup is a follow-up.
+    network_settings_open();
 }
