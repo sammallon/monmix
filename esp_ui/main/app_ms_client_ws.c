@@ -205,6 +205,27 @@ static bool ws_create_and_start(void)
         .uri                  = uri,
         .reconnect_timeout_ms = 5000,
         .network_timeout_ms   = 10000,
+        // Two layers of liveness probing:
+        // 1) TCP keepalive: catches half-open sockets where the kernel
+        //    on the far side is gone but no RST was ever delivered. With
+        //    idle=10 / interval=5 / count=3 the kernel declares the
+        //    socket dead ~25 s after traffic stops.
+        // 2) WS ping/pong: catches the case where the TCP socket is
+        //    fine but the server-side WS handler is wedged. The client
+        //    sends PING every 10 s; if no PONG arrives within 20 s, the
+        //    client disconnects (which our watchdog then notices).
+        // Either path winds up firing EVENT_DISCONNECTED, which starts
+        // the watchdog's 60 s recovery clock. Without these, half-open
+        // detection is at the mercy of TCP retransmit timeout (often
+        // minutes) — observed during the host's Modern Standby in soak
+        // v4 where the device stayed "connected" long after the network
+        // pipe was effectively dead.
+        .keep_alive_enable    = true,
+        .keep_alive_idle      = 10,
+        .keep_alive_interval  = 5,
+        .keep_alive_count     = 3,
+        .ping_interval_sec    = 10,
+        .pingpong_timeout_sec = 20,
     };
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) {
