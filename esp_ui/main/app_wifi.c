@@ -44,6 +44,15 @@ static volatile bool      s_intentional_disconnect;
 // resets s_retry) for the duration of the wait.
 static TaskHandle_t       s_reconnect_task;
 
+// When set, reconnect_task skips its retry-backoff delay and connects
+// immediately. Used by the intentional-disconnect path so a watchdog
+// reassociate doesn't pay the 1 s wait twice. Equally important: it lets
+// us NOT call esp_wifi_connect from inside the wifi event handler --
+// under ESP-Hosted that's an SDIO RPC to the C6, which is slow enough
+// to starve IDLE0 (CPU 0) and trip the task watchdog if it lands inside
+// the system event task.
+static volatile bool      s_reconnect_immediate;
+
 #define MAX_SUBSCRIBERS 4
 static struct {
     app_wifi_on_change_t cb;
@@ -79,9 +88,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_ip.addr = 0;
 
         // Intentional path: caller (force_reassociate) just asked for this.
-        // Reconnect inline; no backoff, no retry-counter pollution. Clear
-        // the flag immediately so a real disconnect that races behind it
-        // takes the unexpected path.
+        // Defer to reconnect_task so we don't call esp_wifi_connect from
+        // the system event task -- that's an SDIO RPC under ESP-Hosted and
+        // can starve IDLE0 long enough to trip the task watchdog.
         if (s_intentional_disconnect) {
             s_intentional_disconnect = false;
             ESP_LOGI(TAG, "intentional disconnect (reason=%d), reconnecting",
@@ -89,7 +98,8 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             APP_LOGD_I("app_wifi", "intentional disconnect reason=%d",
                        e ? e->reason : -1);
             set_state(APP_WIFI_STATE_CONNECTING);
-            esp_wifi_connect();
+            s_reconnect_immediate = true;
+            if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
             return;
         }
 
@@ -131,7 +141,11 @@ static void reconnect_task(void *arg)
         // exactly what we want: multiple disconnects between sleeps just
         // become "one more reconnect attempt".
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        vTaskDelay(pdMS_TO_TICKS(RETRY_BACKOFF_MS));
+        bool immediate = s_reconnect_immediate;
+        s_reconnect_immediate = false;
+        if (!immediate) {
+            vTaskDelay(pdMS_TO_TICKS(RETRY_BACKOFF_MS));
+        }
         esp_wifi_connect();
     }
 }
