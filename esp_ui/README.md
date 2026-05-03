@@ -165,6 +165,8 @@ Pull a log file with `python tools/fetch_b64.py COM3 /sdcard/monmix-NNNN.log out
 - **M4**: 3D-printed mic-stand enclosure. Moved earlier so the print can run in the background while the firmware work continues — prints are slow and the device is currently exposed.
 - **M5**: configurable OSC backend (selectable at runtime via NVS).
 - **M6**: BLE/SoftAP provisioning.
+- **M7**: display power management. Idle-timeout blanks the panel with a 30-s warning dialog + live countdown that any touch cancels (resetting the timer). Timeout duration is picked at each wake from a fixed menu — 1 / 2 / 4 / 8 / 12 / 24 h, hard cap at 24 h, no persistent "always-on" preference. No selection within 30 s of wake = back to sleep, so accidental touch wakes don't leave the panel running. Scheduled always-on windows are configured via SD-card JSON only (no UI), defaulting to `Sun 08:15–11:45`; idle timer is paused inside any active window. When blank, backlight/MIPI-DSI/C6/SDIO drop to a power-saving state; GT911 touch IRQ wakes the device. Requires NTP-sourced wall clock for the schedule.
+- **M8**: display preferences. Settings panel gains a backlight brightness slider (LEDC PWM, sensible floor so a mis-tap can't render the panel unreadable) and a 180° rotation toggle (for mic-stand mounting orientation flexibility — 90/270 not offered, the fader UI is landscape-only). Both persisted to `/sdcard/monmix-prefs.json` and applied at boot.
 
 See `C:\Users\samallon\.claude\plans\fluffy-singing-moth.md` for the full project plan.
 
