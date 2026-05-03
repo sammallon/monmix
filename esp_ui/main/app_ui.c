@@ -1542,6 +1542,11 @@ static void toast_hide(lv_timer_t *t)
 {
     (void)t;
     if (s_toast) lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
+    // The timer was created with repeat_count=1 and is about to auto-delete
+    // itself once this callback returns. Drop our pointer so the next
+    // toast_show creates a fresh one instead of reusing a dangling handle —
+    // that bug is what kept "Mute disabled" pinned to the screen.
+    s_toast_timer = NULL;
 }
 
 static void build_toast(void)
