@@ -105,11 +105,12 @@ void app_main(void)
         info.input_count > 0) {
         info_ok = true;
         int ids[APP_CONFIG_MAX_CHANNELS];
-        // Cap at 12 for now — empirically the LVGL task starves IDLE0 when
-        // building >12 fader strips while WS broadcasts arrive. Channel
-        // selection (#33) will let the user grow this once the static
-        // arrays move to PSRAM and the rebuild path is hardened.
-        const int safe_max = 12;
+        // Per-channel arrays now live in PSRAM (#42), so we can safely
+        // expand. Si Expression has 24 inputs but the typical monitor mix
+        // is 8-16 channels; cap discovery at 16 to keep the boot UI build
+        // time bounded. Channel selection (#33) lets the user pick which
+        // 16 (or fewer) of the available inputs to track.
+        const int safe_max = 16;
         int  n = 0;
         for (int i = 0; i < info.input_count && i < safe_max; ++i) {
             ids[n++] = info.input_offset + i;

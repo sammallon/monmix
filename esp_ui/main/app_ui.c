@@ -95,7 +95,11 @@ static const uint32_t COLOR_PALETTE[8] = {
     0xE060A0,  // pink
 };
 
-static fader_widgets_t          s_widgets[APP_CONFIG_MAX_CHANNELS];
+// Per-channel widget arrays move to PSRAM (EXT_RAM_BSS_ATTR) so we can
+// scale the channel cap without eating internal SRAM that's already tight
+// (the FreeRTOS timer-task-stack alloc tipped over the edge once before
+// when the s_mix_names array landed in DRAM, see app_ms_client_ws.c).
+EXT_RAM_BSS_ATTR static fader_widgets_t s_widgets[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t                *s_status_label;
 static lv_obj_t                *s_tileview;
 static lv_obj_t                *s_page_tiles[MAX_PAGES];
@@ -106,8 +110,8 @@ static const ms_client_iface_t *s_ms;
 // Settings overlay — declared up here so the gear button's event handler
 // can reach it. Overlay is created lazily on first open.
 static lv_obj_t *s_settings_overlay;
-static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
-static lv_obj_t *s_row_name_labels[APP_CONFIG_MAX_CHANNELS];
+EXT_RAM_BSS_ATTR static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
+EXT_RAM_BSS_ATTR static lv_obj_t *s_row_name_labels[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t *s_lvl_norm_btn;
 static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
@@ -258,7 +262,7 @@ static void on_ms_state_change(void *ctx);
 // = 20 Hz feels live to the user but keeps the websocket task from
 // monopolizing its core.
 #define SET_MIN_INTERVAL_MS 50
-static uint32_t s_last_send_ms[APP_CONFIG_MAX_CHANNELS];
+EXT_RAM_BSS_ATTR static uint32_t s_last_send_ms[APP_CONFIG_MAX_CHANNELS];
 
 static void apply_status(void *arg)
 {
@@ -394,7 +398,7 @@ static void on_mute_clicked(lv_event_t *e)
 //
 // The dirty-flag scheme guarantees the last value wins (the sweep reads
 // fresh state at apply time) and only one async is ever in flight.
-static volatile bool s_dirty[APP_CONFIG_MAX_CHANNELS];
+EXT_RAM_BSS_ATTR static volatile bool s_dirty[APP_CONFIG_MAX_CHANNELS];
 static volatile bool s_sweep_queued;
 
 static void apply_pending(void *unused)
