@@ -136,7 +136,24 @@ otherwise b64-streaming a coredump takes 140s).
 
 ## Current milestones
 
-See README.md for the full list. As of this writing: M3 (full UX
-polish + dev tooling) is done; M4 = 3D-printed enclosure (moved
-forward so the print can run while firmware work continues); M5 =
-configurable OSC backend; M6 = BLE/SoftAP provisioning.
+See README.md for the full list. As of 2026-05-02: M3+ done, which
+covers on-device editing of WiFi/MS credentials, channel picker
+across the full strip count of the connected console (cap 16 on
+the fader UI), and the reliability hardening pass (heap heartbeat,
+WS reconnect watchdog with wifi-reassoc, TCP keepalive, WS ping/
+pong, error-event instrumentation). M4 = 3D-printed enclosure;
+M5 = OSC backend; M6 = BLE/SoftAP provisioning; M7 = display power
+mgmt; M8 = brightness + rotation prefs.
+
+Things on the radar but not started: #28 display flicker (deferred
+to end), #30 real metering (probe + wire format already validated;
+implementation pending), #35 ∞ symbol, #36 drag-to-reorder
+channels, #43 master fader strip, #51 pale-blue boot screen
+(replace with black or a splash).
+
+Outstanding investigation: spontaneous WS disconnect in normal
+operation — see memory `project_outstanding_wifi_investigation`.
+Workaround (watchdog + keepalive + wifi-reassoc) recovers in ~7 s
+but root cause is suspected to live in the C6 ESP-Hosted slave
+firmware. User plans to build C6 slave from current upstream
+against IDF 6.0.1 separately.
