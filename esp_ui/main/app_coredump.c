@@ -35,8 +35,16 @@ static int next_seq(const char *dir)
 
 bool app_coredump_flush_to_sd(void)
 {
+    // Silence IDF's "Failed to read data from core dump (260)!" / ESP_ERR_INVALID_SIZE
+    // chatter on the no-dump-present case — that's our normal clean-boot state.
+    // Restore the prior level afterwards so a real partition-corruption case
+    // still gets visibility on the next attempted dump.
+    esp_log_level_t prev = esp_log_level_get("esp_core_dump_flash");
+    esp_log_level_set("esp_core_dump_flash", ESP_LOG_NONE);
     esp_err_t err = esp_core_dump_image_check();
-    if (err == ESP_ERR_NOT_FOUND) {
+    esp_log_level_set("esp_core_dump_flash", prev);
+
+    if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_SIZE) {
         ESP_LOGI(TAG, "clean boot — no coredump in flash");
         return false;
     }
