@@ -47,11 +47,15 @@ static void set_state(app_wifi_state_t s)
     notify();
 }
 
+static void on_scan_done(void);
+
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         set_state(APP_WIFI_STATE_CONNECTING);
         esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_SCAN_DONE) {
+        on_scan_done();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
         s_ip.addr = 0;
@@ -146,4 +150,74 @@ void app_wifi_register_on_change(app_wifi_on_change_t cb, void *ctx)
     s_subscribers[s_subscriber_count].cb  = cb;
     s_subscribers[s_subscriber_count].ctx = ctx;
     s_subscriber_count++;
+}
+
+// SSID scan ------------------------------------------------------------------
+//
+// esp_wifi_scan_start fires WIFI_EVENT_SCAN_DONE on completion. We collect
+// records into a static buffer there (event-task context) so the UI can
+// pull them later without races. Hidden APs (empty SSID) are dropped: the
+// user will type those manually if they need them.
+
+static volatile bool          s_scan_in_progress;
+static app_wifi_scan_done_t   s_scan_done_cb;
+static void                  *s_scan_done_ctx;
+static char                   s_scan_results[APP_WIFI_SCAN_MAX_RESULTS][33];
+static size_t                 s_scan_result_count;
+
+static void on_scan_done(void)
+{
+    uint16_t num = APP_WIFI_SCAN_MAX_RESULTS;
+    static wifi_ap_record_t recs[APP_WIFI_SCAN_MAX_RESULTS];
+    if (esp_wifi_scan_get_ap_records(&num, recs) != ESP_OK) num = 0;
+
+    s_scan_result_count = 0;
+    for (uint16_t i = 0; i < num && s_scan_result_count < APP_WIFI_SCAN_MAX_RESULTS; ++i) {
+        if (recs[i].ssid[0] == '\0') continue;  // hidden — skip
+        // Dedup: same SSID can appear multiple times (multiple APs in same
+        // ESS). Keep the first (strongest, since records come back sorted
+        // by RSSI descending).
+        bool dup = false;
+        for (size_t j = 0; j < s_scan_result_count; ++j) {
+            if (strcmp(s_scan_results[j], (const char *) recs[i].ssid) == 0) {
+                dup = true; break;
+            }
+        }
+        if (dup) continue;
+        strncpy(s_scan_results[s_scan_result_count], (const char *) recs[i].ssid,
+                sizeof(s_scan_results[0]) - 1);
+        s_scan_results[s_scan_result_count][sizeof(s_scan_results[0]) - 1] = '\0';
+        s_scan_result_count++;
+    }
+    ESP_LOGI(TAG, "scan done: %u SSIDs", (unsigned) s_scan_result_count);
+    s_scan_in_progress = false;
+    if (s_scan_done_cb) s_scan_done_cb(s_scan_done_ctx);
+}
+
+bool app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx)
+{
+    if (s_scan_in_progress) return false;
+    s_scan_done_cb  = done_cb;
+    s_scan_done_ctx = ctx;
+    s_scan_in_progress = true;
+
+    wifi_scan_config_t cfg = {0};
+    esp_err_t err = esp_wifi_scan_start(&cfg, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
+        s_scan_in_progress = false;
+        return false;
+    }
+    return true;
+}
+
+size_t app_wifi_scan_results(char (*dst)[33], size_t max_count)
+{
+    if (!dst || max_count == 0) return 0;
+    size_t n = s_scan_result_count;
+    if (n > max_count) n = max_count;
+    for (size_t i = 0; i < n; ++i) {
+        memcpy(dst[i], s_scan_results[i], sizeof(s_scan_results[0]));
+    }
+    return n;
 }

@@ -34,3 +34,25 @@ void             app_wifi_format_ip(char *buf, size_t buflen);
 // Each callback fires from the WiFi/IP event task — keep it short, defer
 // LVGL work via lv_async_call.
 void app_wifi_register_on_change(app_wifi_on_change_t cb, void *ctx);
+
+// SSID scan support for the Network settings UI. The scan runs through the
+// C6 (ESP-Hosted) and briefly disrupts the active connection; the watchdog
+// + auto-reconnect path puts it back together within seconds.
+//
+// Result format: each entry is a NUL-terminated SSID. Hidden APs (empty
+// SSID) are skipped from the result list since the user picks them by
+// typing the SSID anyway. The list pointer remains valid until the next
+// scan_start.
+typedef void (*app_wifi_scan_done_t)(void *ctx);
+
+#define APP_WIFI_SCAN_MAX_RESULTS 24
+
+// Trigger an asynchronous scan. The done_cb fires from the WiFi event task
+// when results are ready; call app_wifi_scan_results to read them.
+// Returns false if a scan is already in progress.
+bool app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx);
+
+// Read the latest scan results. Returns the number of SSIDs filled in;
+// caller passes a `dst` of at least max_count strings each at least
+// 33 bytes. Safe to call from any task. Returns 0 if no scan completed.
+size_t app_wifi_scan_results(char (*dst)[33], size_t max_count);

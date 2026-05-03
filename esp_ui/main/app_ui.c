@@ -158,6 +158,11 @@ static lv_obj_t *s_net_port_ta;
 static lv_obj_t *s_net_show_pass_cb;
 static lv_obj_t *s_net_keyboard;
 static lv_obj_t *s_net_status_label;
+static lv_obj_t *s_net_scan_btn;
+static lv_obj_t *s_net_scan_btn_label;
+// SSID scan results popup. Built lazily, reused. Hidden until scan completes.
+static lv_obj_t *s_ssid_list_popup;
+static lv_obj_t *s_ssid_list;
 
 // Spinner shown when MS is not yet CONNECTED — replaces the fader strips
 // during boot / outage so the user sees an unambiguous "waiting on the
@@ -212,7 +217,6 @@ static void mix_picker_refresh_labels(void);
 static void mix_indicator_refresh(void);
 static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
-static void on_network_clicked(lv_event_t *e);
 static void network_settings_open(void);
 static void network_settings_close(void);
 
@@ -1006,17 +1010,6 @@ static void build_settings_overlay(void)
                             (void *)(uintptr_t) i);
     }
 
-    // Network settings entry button — opens a separate overlay for editing
-    // WiFi creds and MS host:port. Aligned with the Channels section header
-    // on the same row, far right, so it doesn't crowd the radio rows.
-    lv_obj_t *net_btn = lv_button_create(ov);
-    lv_obj_set_size(net_btn, 160, 36);
-    lv_obj_align(net_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
-    lv_obj_t *net_lbl = lv_label_create(net_btn);
-    lv_label_set_text(net_lbl, LV_SYMBOL_WIFI " Network...");
-    lv_obj_center(net_lbl);
-    lv_obj_add_event_cb(net_btn, on_network_clicked, LV_EVENT_CLICKED, NULL);
-
     // Section: Channels — 3 columns × N rows in a scrollable container so
     // the same layout works at 12 channels (default) and at the Si Expression
     // 2's full 60-channel count. Row is just [name] + [swatch] for now;
@@ -1567,11 +1560,6 @@ static void on_name_clicked(lv_event_t *e)
 // "set up the device once" use case warrants).
 // ─────────────────────────────────────────────────────────────────────────
 
-static void on_network_clicked(lv_event_t *e)
-{
-    (void)e; network_settings_open();
-}
-
 static void on_net_close(lv_event_t *e)
 {
     (void)e; network_settings_close();
@@ -1636,6 +1624,116 @@ static void on_net_save(lv_event_t *e)
     }
 }
 
+// Triggered by the Scan button. Kicks off an async wifi scan; the done
+// callback fires from the wifi event task and we hop into LVGL via
+// lv_async_call to actually populate the popup.
+static void ssid_list_populate_async(void *arg);
+static void on_ssid_row_clicked(lv_event_t *e);
+
+static void on_ssid_list_close(lv_event_t *e)
+{
+    (void)e;
+    if (s_ssid_list_popup) lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_wifi_scan_done(void *ctx)
+{
+    (void)ctx;
+    if (!lvgl_port_lock(100)) return;
+    lv_async_call(ssid_list_populate_async, NULL);
+    lvgl_port_unlock();
+}
+
+static void build_ssid_list_popup(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 360);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 12, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_ssid_list_popup = p;
+
+    lv_obj_t *title = lv_label_create(p);
+    lv_label_set_text(title, "Pick a network");
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *close_btn = lv_button_create(p);
+    lv_obj_set_size(close_btn, 36, 36);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_lbl);
+    lv_obj_add_event_cb(close_btn, on_ssid_list_close, LV_EVENT_CLICKED, NULL);
+
+    s_ssid_list = lv_list_create(p);
+    lv_obj_set_size(s_ssid_list, 436, 290);
+    lv_obj_align(s_ssid_list, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ssid_list_populate_async(void *arg)
+{
+    (void)arg;
+    if (!s_ssid_list_popup) build_ssid_list_popup();
+    lv_obj_clean(s_ssid_list);  // remove rows from prior scan
+
+    char results[APP_WIFI_SCAN_MAX_RESULTS][33];
+    size_t n = app_wifi_scan_results(results, APP_WIFI_SCAN_MAX_RESULTS);
+
+    if (n == 0) {
+        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WARNING,
+                                           "No networks found");
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        for (size_t i = 0; i < n; ++i) {
+            lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WIFI,
+                                               results[i]);
+            lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED,
+                                NULL);
+        }
+    }
+
+    // Re-enable the Scan button now that results are in.
+    if (s_net_scan_btn) {
+        lv_obj_remove_state(s_net_scan_btn, LV_STATE_DISABLED);
+        lv_label_set_text(s_net_scan_btn_label, "Scan");
+    }
+
+    lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ssid_list_popup);
+}
+
+static void on_ssid_row_clicked(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target_obj(e);
+    const char *txt = lv_list_get_button_text(s_ssid_list, btn);
+    if (txt && s_net_ssid_ta) {
+        lv_textarea_set_text(s_net_ssid_ta, txt);
+    }
+    if (s_ssid_list_popup) {
+        lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_net_scan_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (!app_wifi_scan_start(on_wifi_scan_done, NULL)) {
+        // Already in progress or failed to start. Surface in the status line.
+        lv_label_set_text(s_net_status_label,
+                          "#FF6060 Scan already in progress.#");
+        return;
+    }
+    // Visual feedback while scan runs — usually 1-3 s.
+    lv_obj_add_state(s_net_scan_btn, LV_STATE_DISABLED);
+    lv_label_set_text(s_net_scan_btn_label, "Scanning...");
+    lv_label_set_text(s_net_status_label, "");
+}
+
 static void build_network_settings_overlay(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -1685,13 +1783,26 @@ static void build_network_settings_overlay(void)
     lv_obj_t *ssid_lbl = lv_label_create(ov);
     lv_label_set_text(ssid_lbl, "SSID");
     lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 30);
+    // SSID textarea takes the row minus 90 px reserved for the Scan button
+    // on the right end of the row (label takes 60 px on the left).
+    const int scan_btn_w = 90;
     s_net_ssid_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_net_ssid_ta, col_w - 60, field_h);
+    lv_obj_set_size(s_net_ssid_ta, col_w - 60 - scan_btn_w - 6, field_h);
     lv_obj_align(s_net_ssid_ta, LV_ALIGN_TOP_LEFT, 60, 56 + 26);
     lv_textarea_set_one_line(s_net_ssid_ta, true);
     lv_textarea_set_max_length(s_net_ssid_ta, APP_CONFIG_SSID_MAX - 1);
     lv_obj_add_event_cb(s_net_ssid_ta, on_net_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
+
+    s_net_scan_btn = lv_button_create(ov);
+    lv_obj_set_size(s_net_scan_btn, scan_btn_w, field_h);
+    lv_obj_align(s_net_scan_btn, LV_ALIGN_TOP_LEFT,
+                 col_w - scan_btn_w, 56 + 26);
+    s_net_scan_btn_label = lv_label_create(s_net_scan_btn);
+    lv_label_set_text(s_net_scan_btn_label, "Scan");
+    lv_obj_center(s_net_scan_btn_label);
+    lv_obj_add_event_cb(s_net_scan_btn, on_net_scan_clicked,
+                        LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *pass_lbl = lv_label_create(ov);
     lv_label_set_text(pass_lbl, "Pass");
@@ -1809,12 +1920,18 @@ static void build_toast(void)
     lv_obj_align(t, LV_ALIGN_CENTER, 0, 100);
     lv_obj_set_style_pad_all(t, 16, 0);
     lv_obj_set_style_radius(t, 8, 0);
-    lv_obj_set_style_border_width(t, 1, 0);
+    lv_obj_set_style_border_width(t, 0, 0);
     lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
-    s_toast = t;
+    // Bright amber on dark text — high contrast against the dark theme's
+    // near-black backgrounds and the saturated slider colors. Default theme
+    // styling rendered as dark-grey-on-dark-grey, which user reported as
+    // hard to see when a slider was nearby.
+    lv_obj_set_style_bg_color(t, lv_color_hex(0xF0B030), 0);
+    lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
 
     s_toast_label = lv_label_create(t);
     lv_label_set_text(s_toast_label, "");
+    lv_obj_set_style_text_color(s_toast_label, lv_color_hex(0x101010), 0);
     lv_obj_center(s_toast_label);
     lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2094,7 +2211,11 @@ static void wifi_panel_close(void)
 static void on_wifi_clicked(lv_event_t *e)
 {
     (void)e;
-    wifi_panel_open();
+    // Tapping the WiFi icon opens the editable network settings overlay.
+    // The old read-only wifi_panel is still around but unreferenced --
+    // dead-code removal is a follow-up; kept here so wifi_panel_refresh
+    // (called from the state-change subscriber) remains a no-op-safe.
+    network_settings_open();
 }
 
 // ─────────────────────────────────────────────────────────────────────────
