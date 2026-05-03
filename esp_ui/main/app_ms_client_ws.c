@@ -11,7 +11,10 @@
 #include "cJSON.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "ms_ws";
 
@@ -48,6 +51,21 @@ EXT_RAM_BSS_ATTR static char s_mix_names[MAX_MIX_BUSES][32];
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
 
+// Reconnect-watchdog state. Per soak v4 logs, esp_websocket_client can wedge
+// in a state where every internal retry fires EVENT_DISCONNECTED + EVENT_ERROR
+// every ~15 s but never EVENT_CONNECTED, indefinitely. The watchdog detects
+// this by tracking how long we've been in a non-CONNECTED state and forcibly
+// destroys+recreates the client when it crosses the threshold.
+//
+// 60 s is a comfortable bound — esp_websocket_client's own reconnect timer is
+// 5 s, so a healthy client should successfully reconnect within ~10 s. 60 s
+// means we wait for ≥6 internal retries before escalating, avoiding spurious
+// recreates during a brief network blip.
+#define WS_STUCK_THRESHOLD_US (60LL * 1000 * 1000)
+
+static int64_t  s_state_entered_us;
+static uint32_t s_watchdog_recreations;
+
 #define MAX_SUBSCRIBERS 4
 static struct {
     app_ms_on_change_t cb;
@@ -65,7 +83,20 @@ static void notify_subscribers(void)
 static void set_state(app_ms_state_t s)
 {
     if (s_state == s) return;
+    bool was_connected = (s_state == APP_MS_STATE_CONNECTED);
+    bool was_boot      = (s_state == APP_MS_STATE_BOOT);
     s_state = s;
+    // Only reset the watchdog age timer when we actually CROSS the
+    // CONNECTED boundary (or on the first transition out of BOOT). The
+    // soak v4 + #49 test data shows the state oscillates between
+    // CONNECTING / DISCONNECTED / ERROR every ~15 s when the underlying
+    // socket is dead — resetting on every bounce means the timer never
+    // ages, so the watchdog never fires. Aging is what we actually want
+    // to detect: "how long has it been since we last saw a successful
+    // connection".
+    if (s == APP_MS_STATE_CONNECTED || was_connected || was_boot) {
+        s_state_entered_us = esp_timer_get_time();
+    }
     notify_subscribers();
 }
 
@@ -162,7 +193,10 @@ const ms_client_iface_t *app_ms_client_ws(void)
     return &s_iface;
 }
 
-static bool ws_start(void)
+// Build + start the websocket client. Shared by ws_start (initial bring-up)
+// and the watchdog (forced recreate after a stuck disconnect). Caller owns
+// the prior s_ws lifecycle if any.
+static bool ws_create_and_start(void)
 {
     char uri[64];
     snprintf(uri, sizeof(uri), "ws://%s:%d/", APP_MS_HOST, APP_MS_PORT);
@@ -186,6 +220,63 @@ static bool ws_start(void)
     }
     ESP_LOGI(TAG, "ws starting -> %s", uri);
     set_state(APP_MS_STATE_CONNECTING);
+    return true;
+}
+
+// Watchdog escalation — invoked when a non-CONNECTED state has persisted
+// past WS_STUCK_THRESHOLD_US. Tears the client down and recreates it from
+// scratch. Soak v4 showed esp_websocket_client can sit in an infinite
+// internal retry loop where every retry fires DISCONNECTED+ERROR but never
+// CONNECTED; only a fresh client recovers.
+static void ws_force_recreate(void)
+{
+    int64_t age_ms = (esp_timer_get_time() - s_state_entered_us) / 1000;
+    APP_LOGD_W("ms_ws", "watchdog: recreating client (state=%d age=%lldms count=%u)",
+               (int) s_state, (long long) age_ms,
+               (unsigned)(s_watchdog_recreations + 1));
+    ESP_LOGW(TAG, "watchdog: recreating client (state=%d age=%lldms)",
+             (int) s_state, (long long) age_ms);
+
+    if (s_ws) {
+        esp_websocket_client_stop(s_ws);
+        esp_websocket_client_destroy(s_ws);
+        s_ws = NULL;
+    }
+    s_watchdog_recreations++;
+    ws_create_and_start();
+    // Give the freshly-created client a full WS_STUCK_THRESHOLD_US window
+    // to actually establish a connection before we'd recreate again. Without
+    // this, the watchdog fires every 5 s once the threshold is crossed (the
+    // CONNECTING state set by ws_create_and_start doesn't reset the age
+    // timer per set_state's "only on CONNECTED-boundary" rule). Saw 24
+    // recreates in a row during #49 because of this — each one usable but
+    // wasteful.
+    s_state_entered_us = esp_timer_get_time();
+}
+
+static void ws_watchdog_task(void *arg)
+{
+    (void) arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        // CONNECTED is the success state; BOOT means we haven't tried yet.
+        // CONNECTING or DISCONNECTED or ERROR for >threshold means stuck.
+        if (s_state == APP_MS_STATE_CONNECTED || s_state == APP_MS_STATE_BOOT)
+            continue;
+        int64_t age_us = esp_timer_get_time() - s_state_entered_us;
+        if (age_us > WS_STUCK_THRESHOLD_US) {
+            ws_force_recreate();
+        }
+    }
+}
+
+static bool ws_start(void)
+{
+    if (!ws_create_and_start()) return false;
+
+    // Spin up the reconnect watchdog once. ws_start is called once from
+    // app_main; if that ever changes we'd need a one-shot guard here.
+    xTaskCreate(ws_watchdog_task, "ms_ws_wdt", 4096, NULL, 5, NULL);
     return true;
 }
 
