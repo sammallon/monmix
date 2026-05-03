@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -61,6 +62,7 @@ static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
 // 5 s, so a healthy client should successfully reconnect within ~10 s. 60 s
 // means we wait for ≥6 internal retries before escalating, avoiding spurious
 // recreates during a brief network blip.
+//
 #define WS_STUCK_THRESHOLD_US (60LL * 1000 * 1000)
 
 static int64_t  s_state_entered_us;
@@ -265,6 +267,30 @@ static void ws_force_recreate(void)
         s_ws = NULL;
     }
     s_watchdog_recreations++;
+
+    // Force a WiFi re-association through the C6. Field testing showed
+    // that a fresh esp_websocket_client + new TCP connect alone doesn't
+    // recover the wedged state -- only a full chip reset did. The most
+    // likely culprit is ESP-Hosted's per-association socket bookkeeping
+    // on the C6 side; bouncing the STA association re-handshakes with
+    // the AP through the C6, which clears that state without needing a
+    // full reset. The wifi event handler in app_wifi.c will set the UI
+    // back to CONNECTING, then CONNECTED once the IP is reassigned. The
+    // watchdog blocks for the full reassociate (~3-5 s typical) so the
+    // new WS client below is created against a freshly-up wifi.
+    APP_LOGD_W("ms_ws", "watchdog: forcing wifi re-associate before WS recreate");
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_wifi_connect();
+    // Wait for the wifi handler to flip back to CONNECTED (got_ip event)
+    // before we try the WS connect, otherwise the new client will fire a
+    // burst of TCP_TRANSPORT errors against a still-disassociated radio.
+    for (int i = 0; i < 60; ++i) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
     ws_create_and_start();
     // Give the freshly-created client a full WS_STUCK_THRESHOLD_US window
     // to actually establish a connection before we'd recreate again. Without
@@ -550,8 +576,24 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
         break;
 
     case WEBSOCKET_EVENT_ERROR:
+        // Surface the underlying errno + handshake status so post-mortem can
+        // tell us whether the recreate's connect attempt failed at TCP
+        // (ECONNREFUSED / EHOSTUNREACH / ETIMEDOUT etc.), at HTTP upgrade
+        // (non-101 status), or somewhere else. Without this we only see the
+        // event fired with no context.
         ESP_LOGE(TAG, "error");
-        APP_LOGD_E("ms_ws", "error event");
+        if (evt) {
+            APP_LOGD_E("ms_ws", "error event "
+                       "type=%d sock_errno=%d handshake_status=%d "
+                       "tls_err=%d tls_stack=%d",
+                       (int) evt->error_handle.error_type,
+                       (int) evt->error_handle.esp_transport_sock_errno,
+                       (int) evt->error_handle.esp_ws_handshake_status_code,
+                       (int) evt->error_handle.esp_tls_last_esp_err,
+                       (int) evt->error_handle.esp_tls_stack_err);
+        } else {
+            APP_LOGD_E("ms_ws", "error event (no data)");
+        }
         set_state(APP_MS_STATE_ERROR);
         break;
 
