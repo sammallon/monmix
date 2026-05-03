@@ -2482,17 +2482,24 @@ static void build_chpick_overlay(void)
     lv_label_set_recolor(s_chpick_status_label, true);
     lv_obj_align(s_chpick_status_label, LV_ALIGN_BOTTOM_LEFT, 0, -4);
 
-    // Scrollable list of N rows in 3 columns. Each cell is checkbox +
-    // label "CH NN <name>"; layout mirrors the Settings overlay's
-    // existing 3-col channel list.
+    // Tight 4-col layout so 80 channels fit on one screen (20 rows tall).
+    // Si Expression: total=80, so 4*20 fills exactly; smaller boards
+    // wrap into fewer rows. Status label sits at the bottom edge of
+    // the overlay so the list can claim the full vertical band.
+    //
+    // COLUMN_WRAP layout: cells fill top-to-bottom in the first column,
+    // then wrap into the second column, etc. -- channel order reads
+    // CH 01..CH 20 down col 1, CH 21..CH 40 down col 2, and so on.
+    // Matches the user's mental model of "channel 17 is just below 16,
+    // not way over to the right".
     s_chpick_list = lv_obj_create(ov);
-    lv_obj_set_size(s_chpick_list, SCREEN_W - 32, SCREEN_H - 96);
-    lv_obj_align(s_chpick_list, LV_ALIGN_TOP_LEFT, 0, 60);
-    lv_obj_set_style_pad_all(s_chpick_list, 6, 0);
-    lv_obj_set_style_pad_row(s_chpick_list, 4, 0);
-    lv_obj_set_style_pad_column(s_chpick_list, 8, 0);
+    lv_obj_set_size(s_chpick_list, SCREEN_W - 32, SCREEN_H - 92);
+    lv_obj_align(s_chpick_list, LV_ALIGN_TOP_LEFT, 0, 56);
+    lv_obj_set_style_pad_all(s_chpick_list, 4, 0);
+    lv_obj_set_style_pad_row(s_chpick_list, 2, 0);
+    lv_obj_set_style_pad_column(s_chpick_list, 6, 0);
     lv_obj_set_layout(s_chpick_list, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(s_chpick_list, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_flow(s_chpick_list, LV_FLEX_FLOW_COLUMN_WRAP);
 }
 
 static void chpick_open(void)
@@ -2529,13 +2536,18 @@ static void chpick_open(void)
         s_chpick_orig[i] = s_chpick_state[i];
     }
 
-    // 3 columns wide enough to render "CH NN" comfortably. With 80 rows
-    // that's ~27 rows per column -- the list scrolls vertically.
-    const int row_w = (SCREEN_W - 32 - 12 - 16) / 3;
+    // 4 columns × 20 rows fits Si Expression's 80 channels with no scroll.
+    // Row width math: list inner = SCREEN_W - 32 - 8 (pad_all*2) = 984;
+    // minus 3 column gaps × 6 px = 18 → 966 / 4 = 241 per cell.
+    // Row height 22 + pad_row 2 = 24 each; 20 × 24 - 2 = 478 < list inner
+    // height (~496) so 20 rows fit.
+    const int row_w = (SCREEN_W - 32 - 8 - 18) / 4;
+    const int row_h = 22;
     for (int i = 0; i < bound; ++i) {
         lv_obj_t *row = lv_obj_create(s_chpick_list);
-        lv_obj_set_size(row, row_w, 36);
-        lv_obj_set_style_pad_all(row, 4, 0);
+        lv_obj_set_size(row, row_w, row_h);
+        lv_obj_set_style_pad_all(row, 2, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *cb = lv_checkbox_create(row);

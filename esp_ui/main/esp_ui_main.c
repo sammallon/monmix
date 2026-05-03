@@ -102,24 +102,17 @@ void app_main(void)
     bool info_ok = false;
     if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED &&
         app_ms_info_fetch(app_config_ms_host(), app_config_ms_port(), &info) &&
-        info.input_count > 0) {
+        info.total > 0) {
         info_ok = true;
-        int ids[APP_CONFIG_MAX_CHANNELS];
-        // Per-channel arrays now live in PSRAM (#42), so we can safely
-        // expand. Si Expression has 24 inputs but the typical monitor mix
-        // is 8-16 channels; cap discovery at 16 to keep the boot UI build
-        // time bounded. Channel selection (#33) lets the user pick which
-        // 16 (or fewer) of the available inputs to track.
-        const int safe_max = 16;
-        int  n = 0;
-        for (int i = 0; i < info.input_count && i < safe_max; ++i) {
-            ids[n++] = info.input_offset + i;
-        }
-        app_state_init(ids, (size_t) n);
-        ESP_LOGI(TAG, "discovery: %d MS inputs available, using first %d",
-                 info.input_count, n);
+        // The user's persisted channel selection (NVS via app_config) is
+        // authoritative. Discovery is no longer used to overwrite that --
+        // before the picker (#33) existed, the auto-pick-first-N here was
+        // the only way to scale up to a board with more inputs than the
+        // hard-coded default of 12, but now the user picks via the UI and
+        // we'd be silently undoing their choice on every boot.
+        ESP_LOGI(TAG, "discovery: total=%d on connected console", info.total);
     } else {
-        ESP_LOGW(TAG, "discovery: /console/information unavailable, using fallback");
+        ESP_LOGW(TAG, "discovery: /console/information unavailable");
     }
 
     // Hand the mix count to the UI so the selector populates with the
