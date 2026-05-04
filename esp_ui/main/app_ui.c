@@ -1562,11 +1562,15 @@ static void build_settings_overlay(void)
     const int row_w     = (SCREEN_W - 32 - 2 * 6 - (cols - 1) * col_gap) / cols;
     const int swatch_sz = 22;
     size_t total = app_state_count();
+    // Column-major iteration: fill column 0 top-to-bottom, then column 1,
+    // then column 2. Reads more naturally for a list of channel slots.
+    int rows_per_col = (int)((total + cols - 1) / cols);
+    if (rows_per_col < 1) rows_per_col = 1;
     for (size_t i = 0; i < total; ++i) {
         app_channel_t ch;
         if (!app_state_get(i, &ch)) continue;
-        int col = (int)(i % cols);
-        int row = (int)(i / cols);
+        int col = (int)(i / rows_per_col);
+        int row = (int)(i % rows_per_col);
         int x = col * (row_w + col_gap);
         int y = row * (row_h + row_gap);
 
