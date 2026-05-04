@@ -18,7 +18,7 @@
 
 typedef enum {
     APP_LEVEL_FORMAT_NORM = 0,    // 0..100 raw integer (matches the slider)
-    APP_LEVEL_FORMAT_DB,           // dB string; floor renders "-INF dB"
+    APP_LEVEL_FORMAT_DB,           // dB string; floor renders "-inf dB"
 } app_level_format_t;
 
 typedef enum {

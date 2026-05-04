@@ -15,6 +15,7 @@ idf_component_register(
         "app_touch_inject.c"
         "app_prefs.c"
         "images/splash_logo.c"
+        "fonts/font_monmix_level.c"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES
