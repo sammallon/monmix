@@ -9,7 +9,9 @@
 #include <string.h>
 
 #include "cJSON.h"
+#include "esp_err.h"
 #include "esp_event.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -74,6 +76,26 @@ static struct {
     void              *ctx;
 } s_subscribers[MAX_SUBSCRIBERS];
 static size_t s_subscriber_count;
+
+// P8: outstanding-SET tracker per channel. When a SET is emitted we stamp
+// the time + value + retry-budget; when the matching server-snap echo for
+// the same `lvl` path arrives we clear it. The poll watchdog scans for
+// entries past the 500 ms deadline, fires a REST GET, and routes the
+// returned value through app_state (so the existing dirty-sweep redraws).
+// If REST fails too, we re-send the lost SET once before giving up.
+//
+// 500 ms is well above MS's normal echo latency (~10-50 ms in soak logs)
+// and well below the threshold a user would notice as a stuck slider.
+#define POLL_DEADLINE_US     (500LL * 1000)
+#define POLL_SCAN_PERIOD_MS  100
+#define POLL_HTTP_TIMEOUT_MS 1500
+#define POLL_HTTP_BUF_LEN    256
+#define POLL_RESEND_BUDGET   1
+
+static int64_t s_pending_set_at_us[APP_CONFIG_MAX_CHANNELS];
+static float   s_pending_set_value[APP_CONFIG_MAX_CHANNELS];
+static int     s_pending_set_mix  [APP_CONFIG_MAX_CHANNELS];
+static uint8_t s_pending_resends  [APP_CONFIG_MAX_CHANNELS];
 
 static void notify_subscribers(void)
 {
@@ -333,13 +355,141 @@ static void ws_watchdog_task(void *arg)
     }
 }
 
+// P8: REST GET the current `lvl` for one channel/mix and parse the value.
+// Returns true + writes *out_level on 200 OK with a numeric body.value.
+typedef struct {
+    char   buf[POLL_HTTP_BUF_LEN];
+    size_t len;
+} poll_sink_t;
+
+static esp_err_t poll_http_event(esp_http_client_event_t *evt)
+{
+    poll_sink_t *sink = (poll_sink_t *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && evt->data && evt->data_len > 0) {
+        if (sink->len + (size_t) evt->data_len < sizeof(sink->buf)) {
+            memcpy(sink->buf + sink->len, evt->data, evt->data_len);
+            sink->len += evt->data_len;
+        }
+    }
+    return ESP_OK;
+}
+
+static bool poll_fetch_level(int ms_channel_id, int mix_idx, float *out_level)
+{
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://%s:%u/console/data/get/ch.%d.levelData.%d.lvl/norm",
+             app_config_ms_host(), (unsigned) app_config_ms_port(),
+             ms_channel_id, mix_idx);
+
+    poll_sink_t sink = {0};
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = poll_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = POLL_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+
+    if (err != ESP_OK || status != 200 || sink.len == 0) {
+        APP_LOGD_W("ms_ws", "poll GET failed ch=%d mix=%d err=%s status=%d",
+                   ms_channel_id, mix_idx, esp_err_to_name(err), status);
+        return false;
+    }
+    sink.buf[sink.len < sizeof(sink.buf) ? sink.len : sizeof(sink.buf) - 1] = '\0';
+
+    cJSON *root = cJSON_Parse(sink.buf);
+    if (!root) return false;
+    cJSON *jv = cJSON_GetObjectItem(root, "value");
+    bool ok = cJSON_IsNumber(jv);
+    if (ok) *out_level = (float) jv->valuedouble;
+    cJSON_Delete(root);
+    return ok;
+}
+
+// P8: scan the outstanding-SET tracker, escalate any past-deadline entry
+// via REST poll. On REST success the corrected value flows back through
+// app_state_set_level (notify=true) → existing dirty-flag sweep redraws
+// the slider. On REST failure, re-send the lost SET once. Either path
+// clears the tracker so we don't loop on the same slot.
+static void poll_watchdog_scan(void)
+{
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
+    int64_t now = esp_timer_get_time();
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total && i < APP_CONFIG_MAX_CHANNELS; ++i) {
+        int64_t at = s_pending_set_at_us[i];
+        if (at == 0) continue;
+        if (now - at < POLL_DEADLINE_US) continue;
+
+        int ch_id = app_state_id_for_idx(i);
+        int mix   = s_pending_set_mix[i];
+        float sent = s_pending_set_value[i];
+        // Clear early so a new SET arriving mid-scan doesn't get clobbered
+        // by the value we read here. If the poll/resend fails to land we
+        // accept the gap — the next user touch re-arms.
+        s_pending_set_at_us[i] = 0;
+
+        if (ch_id < 0) continue;
+
+        float board = 0.0f;
+        if (poll_fetch_level(ch_id, mix, &board)) {
+            ESP_LOGI(TAG, "ch %d: poll resync (sent=%.3f -> board=%.3f)",
+                     ch_id, (double) sent, (double) board);
+            APP_LOGD_I("ms_ws", "poll resync ch=%d mix=%d sent=%.3f board=%.3f",
+                       ch_id, mix, (double) sent, (double) board);
+            // Server-snap is source of truth — route through app_state with
+            // notify=true so the dirty-sweep redraws the slider, exactly
+            // like a normal WS broadcast would.
+            app_state_set_level(i, board, true);
+        } else if (s_pending_resends[i] < POLL_RESEND_BUDGET) {
+            // Tertiary fallback: re-send the SET. Bounded to one retry to
+            // avoid pinning the WS task on a stuck connection.
+            uint8_t next_try = s_pending_resends[i] + 1;
+            ESP_LOGW(TAG, "ch %d: poll failed, re-sending SET %.3f (try %u)",
+                     ch_id, (double) sent, (unsigned) next_try);
+            APP_LOGD_W("ms_ws", "poll failed ch=%d resend=%.3f try=%u",
+                       ch_id, (double) sent, (unsigned) next_try);
+            ws_set_level(ch_id, sent);
+            // ws_set_level rearms the tracker with retries=0 — restore the
+            // budget counter so we honor POLL_RESEND_BUDGET across the
+            // retry window instead of looping forever.
+            s_pending_resends[i] = next_try;
+        } else {
+            ESP_LOGW(TAG, "ch %d: poll + resend exhausted, giving up", ch_id);
+            APP_LOGD_W("ms_ws", "poll exhausted ch=%d", ch_id);
+        }
+    }
+}
+
+// Separate task from ws_watchdog_task because the cadences differ by 50x
+// (5 s vs 100 ms) and the poll task issues blocking HTTP calls. Stack is
+// sized for esp_http_client + cJSON parse on the small response body.
+static void poll_watchdog_task(void *arg)
+{
+    (void) arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(POLL_SCAN_PERIOD_MS));
+        poll_watchdog_scan();
+    }
+}
+
 static bool ws_start(void)
 {
     if (!ws_create_and_start()) return false;
 
     // Spin up the reconnect watchdog once. ws_start is called once from
     // app_main; if that ever changes we'd need a one-shot guard here.
-    xTaskCreate(ws_watchdog_task, "ms_ws_wdt", 4096, NULL, 5, NULL);
+    xTaskCreate(ws_watchdog_task,   "ms_ws_wdt",   4096, NULL, 5, NULL);
+    // Poll watchdog: catches dropped/missing SET echoes and resyncs the UI
+    // to the board's actual value (or re-sends the SET). 5 KB stack covers
+    // esp_http_client + cJSON_Parse on the ~80-byte response body.
+    xTaskCreate(poll_watchdog_task, "ms_ws_poll",  5120, NULL, 4, NULL);
     return true;
 }
 
@@ -362,6 +512,20 @@ static void ws_set_level(int ms_channel_id, float level)
     snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)level);
 
     send_envelope("POST", path, body);
+
+    // Arm the outstanding-SET tracker. Cleared in handle_broadcast on the
+    // matching `lvl` echo, escalated by the poll watchdog otherwise. Stamp
+    // by slot index, not channel id, so reordered slots stay aligned with
+    // the broadcast handler's lookup. Reset retry budget on every fresh
+    // user-driven SET so a re-send earlier in the session doesn't poison
+    // a later legit drop.
+    int idx = app_state_idx_for_id(ms_channel_id);
+    if (idx >= 0 && idx < APP_CONFIG_MAX_CHANNELS) {
+        s_pending_set_at_us[idx] = esp_timer_get_time();
+        s_pending_set_value[idx] = level;
+        s_pending_set_mix  [idx] = s_mix_bus_idx;
+        s_pending_resends  [idx] = 0;
+    }
 }
 
 static void ws_set_mute(int ms_channel_id, bool mute)
@@ -528,6 +692,11 @@ static void handle_broadcast(const char *json, size_t len)
         int idx = app_state_idx_for_id(ch);
         if (idx >= 0) {
             if (strcmp(suffix, "lvl") == 0 && cJSON_IsNumber(jvalue)) {
+                // Echo arrived — clear the outstanding-SET tracker for
+                // this slot so the poll watchdog leaves it alone.
+                if (idx < APP_CONFIG_MAX_CHANNELS) {
+                    s_pending_set_at_us[idx] = 0;
+                }
                 app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
             } else if (strcmp(suffix, "level") == 0 && cJSON_IsNumber(jvalue)) {
                 app_state_set_level_db((size_t)idx, (float)jvalue->valuedouble, true);
