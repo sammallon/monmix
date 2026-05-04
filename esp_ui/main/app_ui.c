@@ -2784,10 +2784,13 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
 {
     lv_obj_t *ta = lv_event_get_target_obj(e);
     if (s_mcfg_keyboard) {
+        // Host is an IPv4 dotted literal -- 0-9 and '.' is exactly the
+        // existing NUMBER keymap, no custom map needed.
+        bool numeric = (ta == s_mcfg_port_ta || ta == s_mcfg_host_ta);
         lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
         lv_keyboard_set_mode(s_mcfg_keyboard,
-                             ta == s_mcfg_port_ta ? LV_KEYBOARD_MODE_NUMBER
-                                                  : LV_KEYBOARD_MODE_TEXT_LOWER);
+                             numeric ? LV_KEYBOARD_MODE_NUMBER
+                                     : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 }
