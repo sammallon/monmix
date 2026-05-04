@@ -267,13 +267,13 @@ bool app_display_init(void)
         return false;
     }
 
-    // 180° rotation so the cable exits opposite the user. With sw_rotate
-    // enabled and full-frame buffers, LVGL flips pixels during flush.
-    // Touch is registered against this same display below, so lvgl_port
-    // applies the inverse transform to touch coordinates automatically.
-    lvgl_port_lock(0);
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
-    lvgl_port_unlock();
+    // Rotation is user-configurable (0 or 180). LVGL applies the inverse
+    // transform to touch coordinates automatically when an indev shares the
+    // display, so registering the GT911 below picks the rotation up for free
+    // (see lv_indev.c indev_pointer_proc). sw_rotate + full-frame buffers
+    // are required for the framebuffer flip during flush; partial buffers
+    // crash the renderer.
+    app_display_apply_rotation(app_prefs_get_display_rotation());
 
     app_display_apply_theme(app_prefs_get_theme());
 
@@ -285,6 +285,22 @@ bool app_display_init(void)
 
     ESP_LOGI(TAG, "display + touch up @ %dx%d", LCD_H_RES, LCD_V_RES);
     return true;
+}
+
+void app_display_apply_rotation(app_display_rotation_t rot)
+{
+    lv_display_t *disp = lv_display_get_default();
+    if (!disp) return;
+    lv_display_rotation_t lv_rot = (rot == APP_DISPLAY_ROTATION_180)
+                                       ? LV_DISPLAY_ROTATION_180
+                                       : LV_DISPLAY_ROTATION_0;
+    if (!lvgl_port_lock(1000)) {
+        ESP_LOGW(TAG, "apply_rotation: lvgl_port_lock timeout");
+        return;
+    }
+    lv_display_set_rotation(disp, lv_rot);
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "rotation applied: %u deg", (unsigned) rot);
 }
 
 void app_display_apply_theme(app_theme_t theme)

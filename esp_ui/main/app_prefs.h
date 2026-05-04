@@ -32,6 +32,13 @@ typedef enum {
     APP_THEME_LIGHT,
 } app_theme_t;
 
+// Display rotation in degrees. Only 0 and 180 supported -- the panel is
+// landscape and 90/270 would reflow the entire fader UI.
+typedef enum {
+    APP_DISPLAY_ROTATION_0   = 0,
+    APP_DISPLAY_ROTATION_180 = 180,
+} app_display_rotation_t;
+
 // Notification fired whenever any preference changes. Multiple
 // subscribers allowed; each callback receives its registered ctx pointer.
 typedef void (*app_prefs_on_change_t)(void *ctx);
@@ -50,6 +57,9 @@ void                   app_prefs_set_signal_indicator(app_signal_indicator_t s);
 
 app_theme_t app_prefs_get_theme(void);
 void        app_prefs_set_theme(app_theme_t t);
+
+app_display_rotation_t app_prefs_get_display_rotation(void);
+void                   app_prefs_set_display_rotation(app_display_rotation_t r);
 
 // Per-channel color tag (palette index 0..7). Returns -1 if no preference
 // is set; callers should fall back to a default palette derived from the
