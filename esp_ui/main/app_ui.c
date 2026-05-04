@@ -314,6 +314,7 @@ static void on_gear_clicked(lv_event_t *e);
 static void on_reboot_clicked(lv_event_t *e);
 static void picker_open(size_t channel_idx);
 static void picker_close(void);
+static void picker_refresh_title(void);
 static void rename_open(size_t channel_idx);
 static void rename_close(void);
 static void mix_picker_open(void);
@@ -497,12 +498,27 @@ static void apply_pending(void *unused)
     // during the sweep (and after we've passed its index) re-arms a fresh
     // sweep rather than getting silently swallowed.
     s_sweep_queued = false;
+    // Settings overlay + color picker show channel names sourced from
+    // app_state. P9: when a scribble-strip rename arrives, the same dirty
+    // bit that drives the fader-strip refresh below also re-syncs the open
+    // overlays so names update live (no overlay re-open required). Gated
+    // by visibility so closed overlays cost nothing.
+    bool settings_visible = s_settings_overlay &&
+        !lv_obj_has_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    bool picker_visible   = s_picker_popup &&
+        !lv_obj_has_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) {
         if (!s_dirty[i]) continue;
         s_dirty[i] = false;
         app_channel_t ch;
         if (!app_state_get(i, &ch)) continue;
+        if (settings_visible && s_row_name_labels[i]) {
+            lv_label_set_text(s_row_name_labels[i], ch.name);
+        }
+        if (picker_visible && i == s_picker_target_idx) {
+            picker_refresh_title();
+        }
         int v = (int)(ch.level * 100.0f);
         // LV_ANIM_OFF: network echoes can arrive every ~10ms during a drag;
         // queueing/cancelling 200ms animations on each one trashes LVGL.
@@ -1609,6 +1625,20 @@ static void build_settings_overlay(void)
     }
 }
 
+// Pull the name labels back from app_state. Cheaper than the full
+// settings_refresh_state — the dirty-sweep calls this on every channel
+// notify so we don't want to thrash the radios/swatches too.
+static void settings_refresh_names(void)
+{
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        app_channel_t ch;
+        if (s_row_name_labels[i] && app_state_get(i, &ch)) {
+            lv_label_set_text(s_row_name_labels[i], ch.name);
+        }
+    }
+}
+
 static void settings_refresh_state(void)
 {
     lv_obj_t *lvl_btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
@@ -1805,20 +1835,25 @@ static void build_picker_popup(void)
     }
 }
 
-static void picker_open(size_t channel_idx)
+// Title shows the channel name so a glance confirms the right strip
+// is being recolored. Pulled out so apply_pending can re-run it when a
+// scribble-strip rename lands while the picker is open.
+static void picker_refresh_title(void)
 {
-    if (!s_picker_popup) build_picker_popup();
-    s_picker_target_idx = channel_idx;
-
-    // Title shows the channel name so a glance confirms the right strip
-    // is being recolored — useful when channel labels are dotted off in
-    // the compact rows.
+    if (!s_picker_title) return;
     app_channel_t ch;
-    if (app_state_get(channel_idx, &ch)) {
+    if (app_state_get(s_picker_target_idx, &ch)) {
         char buf[48];
         snprintf(buf, sizeof(buf), "Color: %s", ch.name);
         lv_label_set_text(s_picker_title, buf);
     }
+}
+
+static void picker_open(size_t channel_idx)
+{
+    if (!s_picker_popup) build_picker_popup();
+    s_picker_target_idx = channel_idx;
+    picker_refresh_title();
 
     lv_obj_remove_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_picker_popup);
