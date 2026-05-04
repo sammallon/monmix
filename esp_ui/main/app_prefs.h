@@ -1,21 +1,24 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
 
-// Local-only preferences persisted to `/sdcard/monmix-prefs.json`. These
-// are the user's UI choices (level readout format, channel colors, signal
-// indicator mode, ...) that should NOT live in NVS or come from Mixing
-// Station — they belong on the SD card so they survive NVS erase /
-// reflash and can be copied off.
+// Persistent local preferences. NVS is primary (one blob per key plus a
+// parallel u64 mtime). SD-mirror at /sdcard/monmix-prefs.json is a backup
+// that lets the user copy or edit prefs offline. On boot, per-key newest
+// mtime wins; the loser side is overwritten. If neither side has a value
+// the compile-time default is installed and explicitly persisted to both
+// places so the next boot finds an authoritative entry.
 //
-// Falls back to compile-time defaults when SD didn't mount or the file is
-// missing/malformed. Init may be called before SD bring-up; in that case
-// it's a no-op and the file gets written on the first set_*() call after
-// the SD is up.
+// mtimes are uptime-relative monotonic counters — wall-clock isn't
+// available without NTP. The implementation guarantees per-source
+// monotonicity by seeding `s_mtime_floor` from the max mtime seen across
+// NVS+SD at init and incrementing past it on every commit.
 
 typedef enum {
-    APP_LEVEL_FORMAT_NORM = 0,   // 0..100 raw integer (matches the slider)
-    APP_LEVEL_FORMAT_DB,          // dB string; "-∞ dB" at the channel's min
+    APP_LEVEL_FORMAT_NORM = 0,    // 0..100 raw integer (matches the slider)
+    APP_LEVEL_FORMAT_DB,           // dB string; floor renders "-INF dB"
 } app_level_format_t;
 
 typedef enum {
@@ -33,9 +36,10 @@ typedef enum {
 // subscribers allowed; each callback receives its registered ctx pointer.
 typedef void (*app_prefs_on_change_t)(void *ctx);
 
-// Load (or create with defaults) `/sdcard/monmix-prefs.json`. Safe to
-// call when SD is unmounted — values stay at defaults until the next
-// init that succeeds.
+// Reconcile NVS + SD at boot. Per-key mtime comparison; loser side gets
+// rewritten. Missing keys get the default and are committed. Safe to call
+// before SD is mounted (NVS-only path) -- but call it AFTER app_storage
+// so the SD mirror gets seeded.
 void app_prefs_init(void);
 
 app_level_format_t app_prefs_get_level_format(void);
@@ -53,6 +57,11 @@ void        app_prefs_set_theme(app_theme_t t);
 int  app_prefs_get_channel_color(int ms_channel_id);
 void app_prefs_set_channel_color(int ms_channel_id, int index);
 
-// Subscribe to pref changes — typically the UI registers once at init
+// Subscribe to pref changes -- typically the UI registers once at init
 // time and re-reads whatever it cares about on each notification.
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx);
+
+// Diagnostic dump used by the `prefs-dump` console command. Prints each
+// key's NVS-side and SD-side state (value + mtime) so the verification
+// scripts can confirm conflict-resolution + missing-key paths landed.
+void app_prefs_debug_dump(void);

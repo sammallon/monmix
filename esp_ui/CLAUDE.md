@@ -89,10 +89,23 @@ otherwise b64-streaming a coredump takes 140s).
 
 ## Preferences boundary
 
-- **`/sdcard/monmix-prefs.json`** holds local UI choices: level format
-  (norm/dB), signal indicator mode, channel color tags, theme. Visible
-  to the user, easy to copy off the card. **Not for credentials.**
-- **NVS** holds the channel selection (ids that show up as faders).
+- **NVS is primary** for local UI prefs (level format, signal indicator
+  mode, channel color tags, theme). Each key has a parallel `_mt` u64
+  mtime (uptime-ms basis, monotonic across reboots via a stored floor).
+  See `app_prefs.c`.
+- **`/sdcard/monmix-prefs.json`** is an NVS-mirror backup — written
+  after every NVS commit. Lets the user copy prefs off the card or
+  edit offline. Per-key `_mt` fields in the JSON carry the mtime so
+  conflict resolution at boot picks the newer side. **Not for
+  credentials.** Atomic write via tmp + rename (FATFS doesn't do
+  POSIX rename-overwrite, so unlink-first).
+- **Boot reconcile rule** (see `merge_bags` in `app_prefs.c`): newer
+  mtime wins per key; missing on both -> install default and persist
+  to both. Migration: a legacy SD-only JSON without `_mt` fields parses
+  with mtime=0 and seeds NVS on the first boot of the new model.
+- **NVS** also holds the channel selection (ids that show up as
+  faders) -- owned by `app_config.c`, separate code path from the
+  prefs above.
 - **`main/secrets.h`** (gitignored, copy of `secrets.h.template`) holds
   `APP_WIFI_SSID`, `APP_WIFI_PASSWORD`, `APP_MS_HOST`, `APP_MS_PORT`.
   Migrating these to runtime-editable storage is queued (#38) — the
@@ -136,24 +149,27 @@ otherwise b64-streaming a coredump takes 140s).
 
 ## Current milestones
 
-See README.md for the full list. As of 2026-05-02: M3+ done, which
-covers on-device editing of WiFi/MS credentials, channel picker
-across the full strip count of the connected console (cap 16 on
-the fader UI), and the reliability hardening pass (heap heartbeat,
-WS reconnect watchdog with wifi-reassoc, TCP keepalive, WS ping/
-pong, error-event instrumentation). M4 = 3D-printed enclosure;
-M5 = OSC backend; M6 = BLE/SoftAP provisioning; M7 = display power
-mgmt; M8 = brightness + rotation prefs.
+See README.md for the full list. As of 2026-05-04: M3+ done, M4 done
+(3D-printed enclosure complete). M3+ covers on-device editing of
+WiFi/MS credentials, channel picker across the full strip count of
+the connected console (cap 16 on the fader UI), and the reliability
+hardening pass (heap heartbeat, WS reconnect watchdog with
+wifi-reassoc, TCP keepalive, WS ping/pong, error-event
+instrumentation). M5 = OSC backend; M6 = BLE/SoftAP provisioning;
+M7 = display power mgmt; M8 = brightness + rotation prefs (pulled
+forward into the 2026-05-04 UI polish batch — see plan
+`during-and-after-yesterday-s-adaptive-fog.md`).
 
-Things on the radar but not started: #28 display flicker (deferred
-to end), #30 real metering (probe + wire format already validated;
-implementation pending), #35 ∞ symbol, #36 drag-to-reorder
-channels, #43 master fader strip, #51 pale-blue boot screen
-(replace with black or a splash).
+UI polish batch in flight (plan `during-and-after-yesterday-s-adaptive-fog.md`):
+pilot-recovered items P1–P11 + open issues #30, #35, #36, #43, #51 +
+M8 brightness/rotation. Includes a foundational persistence rework
+(NVS-primary, SD as backup with mtime-based conflict resolution) —
+this reverses the prior "SD-only prefs" direction. M2.5b
+crash-since-poweron indicator dropped (reliability sufficient).
+#28 display flicker stays deferred (bench-only).
 
-Outstanding investigation: spontaneous WS disconnect in normal
-operation — see memory `project_outstanding_wifi_investigation`.
-Workaround (watchdog + keepalive + wifi-reassoc) recovers in ~7 s
-but root cause is suspected to live in the C6 ESP-Hosted slave
-firmware. User plans to build C6 slave from current upstream
-against IDF 6.0.1 separately.
+SDIO storm investigation (the "spontaneous WS disconnect" workstream)
+is **resolved 2026-05-03** — root cause was a CMD53-byte-mode wedge in
+the C6 SLC HOST peripheral; workaround landed via CMD52 fallback for
+TOKEN_RDATA polling. No further action needed. See memory
+`project_outstanding_wifi_investigation` for the full forensic record.

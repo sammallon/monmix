@@ -582,6 +582,19 @@ static int cmd_ms_info(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `prefs-dump` — print effective + per-source (NVS, SD) prefs state with
+// per-key mtimes. Used by P0 verification to confirm conflict-resolution
+// + missing-key paths land correctly.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_prefs_dump(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    app_prefs_debug_dump();
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `log-trace [on|off]` — query or toggle the disk-logger's trace gate.
 // Persisted in NVS so the choice survives reboots.
 // ─────────────────────────────────────────────────────────────────────────
@@ -625,6 +638,7 @@ void app_console_init(void)
         { .command = "channels-reset", .help = "clear channel selection NVS, default applies next boot", .func = cmd_channels_reset },
         { .command = "ms-info",      .help = "fetch /console/information from MS, print channel arch", .func = cmd_ms_info      },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
+        { .command = "prefs-dump",   .help = "dump effective + NVS + SD prefs state (P0 verify)", .func = cmd_prefs_dump   },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
