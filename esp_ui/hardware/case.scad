@@ -123,11 +123,16 @@ screen_overhang = 1.0;     // case lip extends this far inward over the black
                            // glass border, beyond the active-area edge.
 
 // Corner blocks — rectangular, hugging the inner case-wall corner. Each block
-// extends from the wall inward and contains a pilot at the PCB mount-hole
-// location. Standoff male thread engages this pilot from below.
-post_length        = 8.0;             // block height (was the post length)
-post_pilot_d       = 2.5;             // M3 self-tap pilot for the standoff
-post_pilot_depth   = 6.0;
+// extends from the wall inward and contains a heat-set M3 insert at the PCB
+// mount-hole location. Standoff male thread (machine-cut M3) engages this
+// insert from below; back-cover screws engage the standoff female end.
+//
+// NOTE: PCB mount hole sits 2.8 mm from the metal frame edge, so the insert
+// wall on the frame side comes out ~0.6 mm thick. Heat-set at low iron
+// temperature with gentle pressure to avoid splitting that wall.
+post_length        = 8.0;             // block height
+m3_insert_d        = 3.6;             // bore for 4 mm OD M3 heat-set insert
+m3_insert_h        = 5.0;             // insert length / bore depth
 block_x_clearance  = 0.2;             // gap between block edge and frame X edge
 block_y_extent     = 8.0;             // how far inward in Y from the case wall
 
@@ -142,9 +147,11 @@ lip_clear     = 0.4;
 
 // VESA 75.
 vesa_pitch        = 75.0;
-vesa_insert_d     = 5.1;     // bore in the cover sized for ~5.5 mm OD inserts
-vesa_boss_OD      = 7.5;     // solid backstop boss on the inside of the cover
-vesa_boss_h       = 2.0;     // boss height into the cavity
+vesa_insert_d     = 5.6;     // bore for 6 mm OD M4 inserts
+vesa_insert_h     = 6.0;     // insert length (1 mm extends into boss)
+vesa_boss_OD      = 9.0;     // solid backstop boss; sized for ~1.7 mm wall
+                             // around the larger 5.6 mm bore
+vesa_boss_h       = 2.0;     // 1 mm bore extension + 1 mm solid backstop
 
 // Vents — through the back cover (positioned to avoid engraving, VESA
 // pattern, mount holes, and reset hole).
@@ -349,14 +356,14 @@ module corner_blocks() {
         }
 }
 
-module post_pilots() {
-    // Pilot hole drilled from each post's bottom face going UP into the post
-    // body. Screw enters from the back cover, traverses the cavity through
-    // the PCB clearance hole, and threads here.
+module post_inserts() {
+    // M3 heat-set insert bores in each corner block. Installed from the
+    // bottom face of the block (z = post_bot_z); insert seats with knurls
+    // gripped into the bore wall, threaded body extending up into the block.
     for (h = mount_holes)
-        translate([h[0], h[1], post_bot_z + post_pilot_depth / 2])
-            cylinder(d = post_pilot_d,
-                     h = post_pilot_depth + 0.02, center = true);
+        translate([h[0], h[1], post_bot_z - 0.01])
+            cylinder(d = m3_insert_d,
+                     h = m3_insert_h + 0.02);
 }
 
 module shell_body() {
@@ -376,7 +383,7 @@ module front_shell() {
             shell_body();
             corner_blocks();
         }
-        post_pilots();
+        post_inserts();
     }
 }
 
@@ -493,11 +500,12 @@ module back_cover(engrave = true) {
                          h = csk_depth + 0.02);
         }
 
-        // VESA 75 heat-set insert through-holes.
+        // VESA 75 heat-set insert bores. Extend 1 mm into the backstop boss
+        // for the full 6 mm insert depth.
         for (v = vesa_holes)
-            translate([v[0], v[1], -(stack_thk + back_cover_t / 2)])
+            translate([v[0], v[1], -(stack_thk + back_cover_t) - 0.01])
                 cylinder(d = vesa_insert_d,
-                         h = back_cover_t + 0.04, center = true);
+                         h = vesa_insert_h + 0.02);
 
         // Reset paperclip hole.
         translate([reset_x, reset_y, -(stack_thk + back_cover_t / 2)])
