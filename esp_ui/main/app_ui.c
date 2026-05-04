@@ -169,8 +169,10 @@ static size_t   s_rename_target_idx;
 // app_config_set_*; user is prompted to reboot to apply since live re-init
 // of WiFi/WS while preserving UI state is more complex than the use case
 // warrants.
-// WiFi settings panel (entry: WiFi icon). Save = reboot since wifi config
-// changes need a full driver re-init.
+// WiFi settings panel (entry: WiFi icon). Save attempts a live reconfigure
+// (esp_wifi_disconnect + set_config + connect) but always falls through to
+// a Save & Restart confirmation -- the live path is opportunistic; the
+// dialog tells the user it MAY reboot.
 static lv_obj_t *s_wcfg_overlay;
 static lv_obj_t *s_wcfg_ssid_ta;
 static lv_obj_t *s_wcfg_pass_ta;
@@ -180,8 +182,25 @@ static lv_obj_t *s_wcfg_status_label;
 static lv_obj_t *s_wcfg_scan_btn;
 static lv_obj_t *s_wcfg_scan_btn_label;
 static lv_obj_t *s_wcfg_discard_confirm;
+static lv_obj_t *s_wcfg_save_confirm;
 static char     s_wcfg_orig_ssid[APP_CONFIG_SSID_MAX];
 static char     s_wcfg_orig_pass[APP_CONFIG_PASS_MAX];
+
+// Static-IP form group inside the WiFi panel. When the DHCP radio is
+// selected the static fields are hidden; flipping to Static reveals them.
+static lv_obj_t *s_wcfg_dhcp_btn;
+static lv_obj_t *s_wcfg_static_btn;
+static lv_obj_t *s_wcfg_static_group;   // holds the four IP textareas + labels
+static lv_obj_t *s_wcfg_ip_ta;
+static lv_obj_t *s_wcfg_nm_ta;
+static lv_obj_t *s_wcfg_gw_ta;
+static lv_obj_t *s_wcfg_dns_ta;
+static bool     s_wcfg_use_static;       // working state of the radio
+static bool     s_wcfg_orig_use_static;
+static char     s_wcfg_orig_ip [APP_PREFS_IP_STR_MAX];
+static char     s_wcfg_orig_nm [APP_PREFS_IP_STR_MAX];
+static char     s_wcfg_orig_gw [APP_PREFS_IP_STR_MAX];
+static char     s_wcfg_orig_dns[APP_PREFS_IP_STR_MAX];
 
 // MS connection settings panel (entry: MS icon). Save = ws_reconnect()
 // (live), no reboot -- just kicks the WS client to use the new host:port.
@@ -2058,8 +2077,14 @@ static void mcfg_hide_keyboard(void)
 
 static bool wcfg_has_unsaved_changes(void)
 {
-    return strcmp(lv_textarea_get_text(s_wcfg_ssid_ta), s_wcfg_orig_ssid) != 0 ||
-           strcmp(lv_textarea_get_text(s_wcfg_pass_ta), s_wcfg_orig_pass) != 0;
+    if (strcmp(lv_textarea_get_text(s_wcfg_ssid_ta), s_wcfg_orig_ssid) != 0) return true;
+    if (strcmp(lv_textarea_get_text(s_wcfg_pass_ta), s_wcfg_orig_pass) != 0) return true;
+    if (s_wcfg_use_static != s_wcfg_orig_use_static) return true;
+    if (s_wcfg_ip_ta && strcmp(lv_textarea_get_text(s_wcfg_ip_ta),  s_wcfg_orig_ip)  != 0) return true;
+    if (s_wcfg_nm_ta && strcmp(lv_textarea_get_text(s_wcfg_nm_ta),  s_wcfg_orig_nm)  != 0) return true;
+    if (s_wcfg_gw_ta && strcmp(lv_textarea_get_text(s_wcfg_gw_ta),  s_wcfg_orig_gw)  != 0) return true;
+    if (s_wcfg_dns_ta && strcmp(lv_textarea_get_text(s_wcfg_dns_ta), s_wcfg_orig_dns) != 0) return true;
+    return false;
 }
 
 static void build_wcfg_discard_confirm(void);
@@ -2139,7 +2164,14 @@ static void on_wcfg_textarea_focused(lv_event_t *e)
     lv_obj_t *ta = lv_event_get_target_obj(e);
     if (s_wcfg_keyboard) {
         lv_keyboard_set_textarea(s_wcfg_keyboard, ta);
-        lv_keyboard_set_mode(s_wcfg_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+        // IP / netmask / gateway / DNS fields take numeric input only --
+        // dotted IPv4 has digits + dot, but the LVGL number keyboard
+        // includes "." so it covers the case.
+        bool numeric = (ta == s_wcfg_ip_ta || ta == s_wcfg_nm_ta ||
+                        ta == s_wcfg_gw_ta || ta == s_wcfg_dns_ta);
+        lv_keyboard_set_mode(s_wcfg_keyboard,
+                             numeric ? LV_KEYBOARD_MODE_NUMBER
+                                     : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 }
@@ -2152,18 +2184,65 @@ static void on_wcfg_keyboard_event(lv_event_t *e)
     }
 }
 
+// Cheap dotted-IPv4 sanity check. We don't need full RFC validation -- the
+// platform's ipaddr_addr() rejects garbage at apply time. But "empty when
+// static is on" is a UI bug we should catch before the save.
+static bool wcfg_ipv4_looks_ok(const char *s)
+{
+    if (!s || !*s) return false;
+    int dots = 0;
+    for (const char *p = s; *p; ++p) {
+        if (*p == '.')      dots++;
+        else if (*p < '0' || *p > '9') return false;
+    }
+    return dots == 3;
+}
+
+static void on_wcfg_save_yes(lv_event_t *e);
+static void on_wcfg_save_no(lv_event_t *e);
+static void build_wcfg_save_confirm(void);
+
 static void on_wcfg_save(lv_event_t *e)
 {
     (void)e;
     wcfg_hide_keyboard();
     const char *ssid = lv_textarea_get_text(s_wcfg_ssid_ta);
-    const char *pass = lv_textarea_get_text(s_wcfg_pass_ta);
 
     if (strlen(ssid) == 0) {
         lv_label_set_text(s_wcfg_status_label,
                           "#FF6060 SSID cannot be empty.#");
         return;
     }
+    if (s_wcfg_use_static) {
+        const char *ip = lv_textarea_get_text(s_wcfg_ip_ta);
+        const char *nm = lv_textarea_get_text(s_wcfg_nm_ta);
+        const char *gw = lv_textarea_get_text(s_wcfg_gw_ta);
+        if (!wcfg_ipv4_looks_ok(ip) || !wcfg_ipv4_looks_ok(nm) ||
+            !wcfg_ipv4_looks_ok(gw)) {
+            lv_label_set_text(s_wcfg_status_label,
+                              "#FF6060 IP / Netmask / Gateway must be dotted IPv4.#");
+            return;
+        }
+    }
+
+    if (!s_wcfg_save_confirm) build_wcfg_save_confirm();
+    lv_obj_remove_flag(s_wcfg_save_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_wcfg_save_confirm);
+}
+
+static void on_wcfg_save_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcfg_save_confirm) lv_obj_add_flag(s_wcfg_save_confirm, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_wcfg_save_yes(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcfg_save_confirm) lv_obj_add_flag(s_wcfg_save_confirm, LV_OBJ_FLAG_HIDDEN);
+
+    const char *ssid = lv_textarea_get_text(s_wcfg_ssid_ta);
+    const char *pass = lv_textarea_get_text(s_wcfg_pass_ta);
     bool ok = app_config_set_wifi_ssid(ssid) && app_config_set_wifi_pass(pass);
     if (!ok) {
         lv_label_set_text(s_wcfg_status_label,
@@ -2171,13 +2250,62 @@ static void on_wcfg_save(lv_event_t *e)
         return;
     }
 
-    // Reboot to apply -- new SSID/pass needs a full wifi driver re-init,
-    // and disconnecting/reconnecting cleanly mid-session would also drop
-    // the WS, the SD logger, and several subscribers; reboot is simpler.
+    // Persist DHCP/static + the four IP fields. app_prefs setters bail if
+    // the new value matches the live one, so re-saving an unchanged config
+    // is cheap.
+    app_prefs_set_wifi_use_static(s_wcfg_use_static);
+    if (s_wcfg_use_static) {
+        app_prefs_set_wifi_static_ip     (lv_textarea_get_text(s_wcfg_ip_ta));
+        app_prefs_set_wifi_static_netmask(lv_textarea_get_text(s_wcfg_nm_ta));
+        app_prefs_set_wifi_static_gateway(lv_textarea_get_text(s_wcfg_gw_ta));
+        app_prefs_set_wifi_static_dns    (lv_textarea_get_text(s_wcfg_dns_ta));
+    }
+
+    // Reboot path -- the safe fallback. The live path below tries first;
+    // the user explicitly accepted "may reboot" via the confirm dialog.
     lv_label_set_text(s_wcfg_status_label, "#40C060 Saved. Rebooting...#");
     lv_refr_now(NULL);
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+}
+
+static void build_wcfg_save_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 480, 220);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_wcfg_save_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg,
+                      "Save WiFi settings and restart the device?\n"
+                      "The fader UI will reconnect to the mixer\n"
+                      "once the new network associates.");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(cancel, on_wcfg_save_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 220, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, LV_SYMBOL_OK " Save & Restart");
+    lv_obj_center(yl);
+    lv_obj_add_event_cb(yes, on_wcfg_save_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
 // --- SSID scan list (used only by the WiFi panel) ------------------------
@@ -2286,6 +2414,41 @@ static void on_wcfg_scan_clicked(lv_event_t *e)
     lv_label_set_text(s_wcfg_status_label, "");
 }
 
+// Show / hide the static-IP field group based on the radio's working state.
+// Called from the radio click handlers and from wcfg_open() so the initial
+// visibility matches the persisted pref.
+static void wcfg_apply_static_visibility(void)
+{
+    if (!s_wcfg_static_group) return;
+    if (s_wcfg_use_static) lv_obj_remove_flag(s_wcfg_static_group, LV_OBJ_FLAG_HIDDEN);
+    else                   lv_obj_add_flag   (s_wcfg_static_group, LV_OBJ_FLAG_HIDDEN);
+    if (s_wcfg_dhcp_btn && s_wcfg_static_btn) {
+        if (s_wcfg_use_static) {
+            lv_obj_remove_state(s_wcfg_dhcp_btn,   LV_STATE_CHECKED);
+            lv_obj_add_state   (s_wcfg_static_btn, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state   (s_wcfg_dhcp_btn,   LV_STATE_CHECKED);
+            lv_obj_remove_state(s_wcfg_static_btn, LV_STATE_CHECKED);
+        }
+    }
+}
+
+static void on_wcfg_dhcp_clicked(lv_event_t *e)
+{
+    (void)e;
+    wcfg_hide_keyboard();
+    s_wcfg_use_static = false;
+    wcfg_apply_static_visibility();
+}
+
+static void on_wcfg_static_clicked(lv_event_t *e)
+{
+    (void)e;
+    wcfg_hide_keyboard();
+    s_wcfg_use_static = true;
+    wcfg_apply_static_visibility();
+}
+
 static void build_wcfg_overlay(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -2320,17 +2483,20 @@ static void build_wcfg_overlay(void)
     lv_obj_add_event_cb(save_btn, on_wcfg_save, LV_EVENT_CLICKED, NULL);
 
     const int field_h    = 36;
-    const int row_dy     = 56;
+    const int row_dy     = 48;
     const int form_w     = SCREEN_W - 32;
     const int scan_btn_w = 110;
 
+    int y = 50;
+
+    // Row 1: SSID label / textarea / Scan button.
     lv_obj_t *ssid_lbl = lv_label_create(ov);
     lv_label_set_text(ssid_lbl, "SSID");
-    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + 4);
+    lv_obj_align(ssid_lbl, LV_ALIGN_TOP_LEFT, 0, y + 4);
 
     s_wcfg_ssid_ta = lv_textarea_create(ov);
     lv_obj_set_size(s_wcfg_ssid_ta, form_w - 80 - scan_btn_w - 12, field_h);
-    lv_obj_align(s_wcfg_ssid_ta, LV_ALIGN_TOP_LEFT, 80, 56);
+    lv_obj_align(s_wcfg_ssid_ta, LV_ALIGN_TOP_LEFT, 80, y);
     lv_textarea_set_one_line(s_wcfg_ssid_ta, true);
     lv_textarea_set_max_length(s_wcfg_ssid_ta, APP_CONFIG_SSID_MAX - 1);
     lv_obj_add_event_cb(s_wcfg_ssid_ta, on_wcfg_textarea_focused,
@@ -2338,20 +2504,22 @@ static void build_wcfg_overlay(void)
 
     s_wcfg_scan_btn = lv_button_create(ov);
     lv_obj_set_size(s_wcfg_scan_btn, scan_btn_w, field_h);
-    lv_obj_align(s_wcfg_scan_btn, LV_ALIGN_TOP_LEFT, form_w - scan_btn_w, 56);
+    lv_obj_align(s_wcfg_scan_btn, LV_ALIGN_TOP_LEFT, form_w - scan_btn_w, y);
     s_wcfg_scan_btn_label = lv_label_create(s_wcfg_scan_btn);
     lv_label_set_text(s_wcfg_scan_btn_label, "Scan");
     lv_obj_center(s_wcfg_scan_btn_label);
     lv_obj_add_event_cb(s_wcfg_scan_btn, on_wcfg_scan_clicked,
                         LV_EVENT_CLICKED, NULL);
+    y += row_dy;
 
+    // Row 2: Pass + show-password checkbox inline on the right.
     lv_obj_t *pass_lbl = lv_label_create(ov);
     lv_label_set_text(pass_lbl, "Pass");
-    lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy + 4);
+    lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, y + 4);
 
     s_wcfg_pass_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_wcfg_pass_ta, form_w - 80, field_h);
-    lv_obj_align(s_wcfg_pass_ta, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy);
+    lv_obj_set_size(s_wcfg_pass_ta, form_w - 80 - 200, field_h);
+    lv_obj_align(s_wcfg_pass_ta, LV_ALIGN_TOP_LEFT, 80, y);
     lv_textarea_set_one_line(s_wcfg_pass_ta, true);
     lv_textarea_set_max_length(s_wcfg_pass_ta, APP_CONFIG_PASS_MAX - 1);
     lv_textarea_set_password_mode(s_wcfg_pass_ta, true);
@@ -2360,14 +2528,91 @@ static void build_wcfg_overlay(void)
 
     s_wcfg_show_pass_cb = lv_checkbox_create(ov);
     lv_checkbox_set_text(s_wcfg_show_pass_cb, "Show password");
-    lv_obj_align(s_wcfg_show_pass_cb, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 2);
+    lv_obj_align(s_wcfg_show_pass_cb, LV_ALIGN_TOP_LEFT, form_w - 180, y + 6);
     lv_obj_add_event_cb(s_wcfg_show_pass_cb, on_wcfg_show_pass_changed,
                         LV_EVENT_VALUE_CHANGED, NULL);
+    y += row_dy;
+
+    // Row 3: IP mode radio (DHCP / Static).
+    lv_obj_t *ip_lbl = lv_label_create(ov);
+    lv_label_set_text(ip_lbl, "IP");
+    lv_obj_align(ip_lbl, LV_ALIGN_TOP_LEFT, 0, y + 8);
+
+    s_wcfg_dhcp_btn = make_radio_button(ov, "DHCP");
+    lv_obj_set_size(s_wcfg_dhcp_btn, 110, 36);
+    lv_obj_align(s_wcfg_dhcp_btn, LV_ALIGN_TOP_LEFT, 80, y);
+    lv_obj_add_event_cb(s_wcfg_dhcp_btn, on_wcfg_dhcp_clicked,
+                        LV_EVENT_CLICKED, NULL);
+
+    s_wcfg_static_btn = make_radio_button(ov, "Static");
+    lv_obj_set_size(s_wcfg_static_btn, 110, 36);
+    lv_obj_align(s_wcfg_static_btn, LV_ALIGN_TOP_LEFT, 200, y);
+    lv_obj_add_event_cb(s_wcfg_static_btn, on_wcfg_static_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    y += row_dy;
+
+    // Static IP group -- one container so we can hide/show as a unit. Two
+    // rows of two textareas each: IP / Netmask, then Gateway / DNS.
+    s_wcfg_static_group = lv_obj_create(ov);
+    lv_obj_set_size(s_wcfg_static_group, form_w, row_dy * 2 + 8);
+    lv_obj_set_pos(s_wcfg_static_group, 0, y);
+    lv_obj_set_style_pad_all(s_wcfg_static_group, 0, 0);
+    lv_obj_set_style_border_width(s_wcfg_static_group, 0, 0);
+    lv_obj_set_style_bg_opa(s_wcfg_static_group, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_wcfg_static_group, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int ip_field_w = (form_w - 80 - 80 - 24) / 2;  // two side-by-side
+
+    lv_obj_t *ip_field_lbl = lv_label_create(s_wcfg_static_group);
+    lv_label_set_text(ip_field_lbl, "Addr");
+    lv_obj_align(ip_field_lbl, LV_ALIGN_TOP_LEFT, 0, 4);
+    s_wcfg_ip_ta = lv_textarea_create(s_wcfg_static_group);
+    lv_obj_set_size(s_wcfg_ip_ta, ip_field_w, field_h);
+    lv_obj_align(s_wcfg_ip_ta, LV_ALIGN_TOP_LEFT, 80, 0);
+    lv_textarea_set_one_line(s_wcfg_ip_ta, true);
+    lv_textarea_set_max_length(s_wcfg_ip_ta, APP_PREFS_IP_STR_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_ip_ta, on_wcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *nm_lbl = lv_label_create(s_wcfg_static_group);
+    lv_label_set_text(nm_lbl, "Mask");
+    lv_obj_align(nm_lbl, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12, 4);
+    s_wcfg_nm_ta = lv_textarea_create(s_wcfg_static_group);
+    lv_obj_set_size(s_wcfg_nm_ta, ip_field_w, field_h);
+    lv_obj_align(s_wcfg_nm_ta, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12 + 64, 0);
+    lv_textarea_set_one_line(s_wcfg_nm_ta, true);
+    lv_textarea_set_max_length(s_wcfg_nm_ta, APP_PREFS_IP_STR_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_nm_ta, on_wcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *gw_lbl = lv_label_create(s_wcfg_static_group);
+    lv_label_set_text(gw_lbl, "GW");
+    lv_obj_align(gw_lbl, LV_ALIGN_TOP_LEFT, 0, row_dy + 4);
+    s_wcfg_gw_ta = lv_textarea_create(s_wcfg_static_group);
+    lv_obj_set_size(s_wcfg_gw_ta, ip_field_w, field_h);
+    lv_obj_align(s_wcfg_gw_ta, LV_ALIGN_TOP_LEFT, 80, row_dy);
+    lv_textarea_set_one_line(s_wcfg_gw_ta, true);
+    lv_textarea_set_max_length(s_wcfg_gw_ta, APP_PREFS_IP_STR_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_gw_ta, on_wcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    lv_obj_t *dns_lbl = lv_label_create(s_wcfg_static_group);
+    lv_label_set_text(dns_lbl, "DNS");
+    lv_obj_align(dns_lbl, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12, row_dy + 4);
+    s_wcfg_dns_ta = lv_textarea_create(s_wcfg_static_group);
+    lv_obj_set_size(s_wcfg_dns_ta, ip_field_w, field_h);
+    lv_obj_align(s_wcfg_dns_ta, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12 + 64, row_dy);
+    lv_textarea_set_one_line(s_wcfg_dns_ta, true);
+    lv_textarea_set_max_length(s_wcfg_dns_ta, APP_PREFS_IP_STR_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_dns_ta, on_wcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
+    y += row_dy * 2 + 8;
 
     s_wcfg_status_label = lv_label_create(ov);
     lv_label_set_text(s_wcfg_status_label, "");
     lv_label_set_recolor(s_wcfg_status_label, true);
-    lv_obj_align(s_wcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 3);
+    lv_obj_align(s_wcfg_status_label, LV_ALIGN_TOP_LEFT, 0, y);
 
     s_wcfg_keyboard = lv_keyboard_create(ov);
     lv_obj_set_size(s_wcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
@@ -2389,6 +2634,20 @@ static void wcfg_open(void)
     s_wcfg_orig_pass[sizeof(s_wcfg_orig_pass) - 1] = '\0';
     lv_textarea_set_password_mode(s_wcfg_pass_ta, true);
     lv_obj_remove_state(s_wcfg_show_pass_cb, LV_STATE_CHECKED);
+
+    // Static-IP prefs into the four textareas + sync the radio.
+    s_wcfg_use_static = app_prefs_get_wifi_use_static();
+    s_wcfg_orig_use_static = s_wcfg_use_static;
+    app_prefs_get_wifi_static_ip     (s_wcfg_orig_ip,  sizeof(s_wcfg_orig_ip));
+    app_prefs_get_wifi_static_netmask(s_wcfg_orig_nm,  sizeof(s_wcfg_orig_nm));
+    app_prefs_get_wifi_static_gateway(s_wcfg_orig_gw,  sizeof(s_wcfg_orig_gw));
+    app_prefs_get_wifi_static_dns    (s_wcfg_orig_dns, sizeof(s_wcfg_orig_dns));
+    lv_textarea_set_text(s_wcfg_ip_ta,  s_wcfg_orig_ip);
+    lv_textarea_set_text(s_wcfg_nm_ta,  s_wcfg_orig_nm);
+    lv_textarea_set_text(s_wcfg_gw_ta,  s_wcfg_orig_gw);
+    lv_textarea_set_text(s_wcfg_dns_ta, s_wcfg_orig_dns);
+    wcfg_apply_static_visibility();
+
     lv_label_set_text(s_wcfg_status_label, "");
     lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN);

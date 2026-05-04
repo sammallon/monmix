@@ -86,6 +86,12 @@ void app_main(void)
     app_ui_init(ms);
     app_ui_set_status("Connecting WiFi...");
 
+    // Apply DHCP / static-IP choice from prefs now that they're loaded. If
+    // the WiFi driver already auto-started DHCP after init_radio, this
+    // override stops DHCP and pushes the static IP -- the next GOT_IP event
+    // reflects the configured address.
+    app_wifi_apply_ip_config();
+
     // Phase 2 of WiFi: block until associated or retries exhausted.
     if (!app_wifi_wait_connected()) {
         ESP_LOGW(TAG, "WiFi unavailable; UI will still render, MS client will retry");

@@ -41,6 +41,16 @@ static const char *TAG = "app_prefs";
 #define NVS_K_BRIGHT_MT     "bright_mt"
 #define NVS_K_SEL_MIX       "sel_mix"
 #define NVS_K_SEL_MIX_MT    "sel_mix_mt"
+#define NVS_K_WIFI_STATIC    "wifi_static"
+#define NVS_K_WIFI_STATIC_MT "wifi_static_mt"
+#define NVS_K_WIFI_IP        "wifi_ip"
+#define NVS_K_WIFI_IP_MT     "wifi_ip_mt"
+#define NVS_K_WIFI_NM        "wifi_nm"
+#define NVS_K_WIFI_NM_MT     "wifi_nm_mt"
+#define NVS_K_WIFI_GW        "wifi_gw"
+#define NVS_K_WIFI_GW_MT     "wifi_gw_mt"
+#define NVS_K_WIFI_DNS       "wifi_dns"
+#define NVS_K_WIFI_DNS_MT    "wifi_dns_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
 
 // Backlight floor — a 0% mis-tap renders the panel unreadable with no
@@ -65,6 +75,11 @@ typedef enum {
     K_CHAN_COLOR,
     K_BRIGHT,
     K_SEL_MIX,
+    K_WIFI_STATIC,
+    K_WIFI_IP,
+    K_WIFI_NM,
+    K_WIFI_GW,
+    K_WIFI_DNS,
     K_COUNT,
 } prefs_key_t;
 
@@ -80,6 +95,11 @@ typedef struct {
     size_t                 color_count;
     uint8_t                brightness_pct;
     uint8_t                selected_mix_index;
+    bool                   wifi_static;
+    char                   wifi_ip [APP_PREFS_IP_STR_MAX];
+    char                   wifi_nm [APP_PREFS_IP_STR_MAX];
+    char                   wifi_gw [APP_PREFS_IP_STR_MAX];
+    char                   wifi_dns[APP_PREFS_IP_STR_MAX];
 } prefs_bag_t;
 
 static SemaphoreHandle_t s_mutex;
@@ -93,6 +113,11 @@ static color_entry_t           s_colors[MAX_COLOR_ENTRIES];
 static size_t                  s_color_count;
 static uint8_t                 s_brightness_pct = BRIGHTNESS_DEFAULT_PCT;
 static uint8_t                 s_selected_mix_index;  // 0-based mix bus
+static bool                    s_wifi_static;
+static char                    s_wifi_ip [APP_PREFS_IP_STR_MAX];
+static char                    s_wifi_nm [APP_PREFS_IP_STR_MAX];
+static char                    s_wifi_gw [APP_PREFS_IP_STR_MAX];
+static char                    s_wifi_dns[APP_PREFS_IP_STR_MAX];
 static uint64_t                s_mtime[K_COUNT];   // mtime of effective value, per key
 static uint64_t                s_mtime_floor;      // monotonic counter base across reboots
 
@@ -172,8 +197,25 @@ static const char *key_name(prefs_key_t k)
         case K_CHAN_COLOR: return "channel_color";
         case K_BRIGHT:     return "display_brightness_pct";
         case K_SEL_MIX:    return "selected_mix_index";
+        case K_WIFI_STATIC:return "wifi_use_static";
+        case K_WIFI_IP:    return "wifi_static_ip";
+        case K_WIFI_NM:    return "wifi_static_netmask";
+        case K_WIFI_GW:    return "wifi_static_gateway";
+        case K_WIFI_DNS:   return "wifi_static_dns";
         default:           return "?";
     }
+}
+
+// Copy-with-cap helper for the new string-valued keys. Out is always
+// NUL-terminated; caller's buffer must be at least APP_PREFS_IP_STR_MAX.
+static void copy_ip_str(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t n = strlen(src);
+    if (n >= dst_len) n = dst_len - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
 static uint8_t clamp_brightness(uint8_t pct)
@@ -289,6 +331,25 @@ static void nvs_load(prefs_bag_t *bag)
         nvs_get_u64_opt(h, NVS_K_SEL_MIX_MT, &bag->mtime[K_SEL_MIX]);
     }
 
+    if (nvs_get_u8(h, NVS_K_WIFI_STATIC, &u8) == ESP_OK) {
+        bag->present[K_WIFI_STATIC] = true;
+        bag->wifi_static = (u8 != 0);
+        nvs_get_u64_opt(h, NVS_K_WIFI_STATIC_MT, &bag->mtime[K_WIFI_STATIC]);
+    }
+    struct { const char *k; const char *mk; prefs_key_t pk; char *dst; } str_keys[] = {
+        { NVS_K_WIFI_IP,  NVS_K_WIFI_IP_MT,  K_WIFI_IP,  bag->wifi_ip  },
+        { NVS_K_WIFI_NM,  NVS_K_WIFI_NM_MT,  K_WIFI_NM,  bag->wifi_nm  },
+        { NVS_K_WIFI_GW,  NVS_K_WIFI_GW_MT,  K_WIFI_GW,  bag->wifi_gw  },
+        { NVS_K_WIFI_DNS, NVS_K_WIFI_DNS_MT, K_WIFI_DNS, bag->wifi_dns },
+    };
+    for (size_t i = 0; i < sizeof(str_keys) / sizeof(str_keys[0]); ++i) {
+        size_t need = APP_PREFS_IP_STR_MAX;
+        if (nvs_get_str(h, str_keys[i].k, str_keys[i].dst, &need) == ESP_OK) {
+            bag->present[str_keys[i].pk] = true;
+            nvs_get_u64_opt(h, str_keys[i].mk, &bag->mtime[str_keys[i].pk]);
+        }
+    }
+
     uint64_t floor = 0;
     if (nvs_get_u64_opt(h, NVS_K_MTIME_FLOOR, &floor) && floor > s_mtime_floor) {
         s_mtime_floor = floor;
@@ -331,6 +392,26 @@ static bool nvs_write_key(prefs_key_t k, const void *value, size_t value_len, ui
         case K_SEL_MIX:
             err = nvs_set_u8(h, NVS_K_SEL_MIX, *(const uint8_t *)value);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_SEL_MIX_MT, mtime);
+            break;
+        case K_WIFI_STATIC:
+            err = nvs_set_u8(h, NVS_K_WIFI_STATIC, *(const uint8_t *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_STATIC_MT, mtime);
+            break;
+        case K_WIFI_IP:
+            err = nvs_set_str(h, NVS_K_WIFI_IP, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_IP_MT, mtime);
+            break;
+        case K_WIFI_NM:
+            err = nvs_set_str(h, NVS_K_WIFI_NM, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_NM_MT, mtime);
+            break;
+        case K_WIFI_GW:
+            err = nvs_set_str(h, NVS_K_WIFI_GW, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_GW_MT, mtime);
+            break;
+        case K_WIFI_DNS:
+            err = nvs_set_str(h, NVS_K_WIFI_DNS, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_DNS_MT, mtime);
             break;
         default:
             err = ESP_FAIL;
@@ -451,6 +532,28 @@ static bool sd_load(prefs_bag_t *bag)
         bag->mtime[K_SEL_MIX]   = json_get_u64(root, "selected_mix_index_mt");
     }
 
+    cJSON *jws = cJSON_GetObjectItem(root, "wifi_use_static");
+    if (cJSON_IsBool(jws) || cJSON_IsNumber(jws)) {
+        bag->present[K_WIFI_STATIC] = true;
+        bag->wifi_static = cJSON_IsBool(jws) ? cJSON_IsTrue(jws)
+                                              : (jws->valuedouble != 0);
+        bag->mtime[K_WIFI_STATIC] = json_get_u64(root, "wifi_use_static_mt");
+    }
+    struct { const char *jk; const char *mk; prefs_key_t pk; char *dst; } str_keys[] = {
+        { "wifi_static_ip",      "wifi_static_ip_mt",      K_WIFI_IP,  bag->wifi_ip  },
+        { "wifi_static_netmask", "wifi_static_netmask_mt", K_WIFI_NM,  bag->wifi_nm  },
+        { "wifi_static_gateway", "wifi_static_gateway_mt", K_WIFI_GW,  bag->wifi_gw  },
+        { "wifi_static_dns",     "wifi_static_dns_mt",     K_WIFI_DNS, bag->wifi_dns },
+    };
+    for (size_t i = 0; i < sizeof(str_keys) / sizeof(str_keys[0]); ++i) {
+        cJSON *j = cJSON_GetObjectItem(root, str_keys[i].jk);
+        if (cJSON_IsString(j)) {
+            bag->present[str_keys[i].pk] = true;
+            copy_ip_str(str_keys[i].dst, APP_PREFS_IP_STR_MAX, j->valuestring);
+            bag->mtime[str_keys[i].pk] = json_get_u64(root, str_keys[i].mk);
+        }
+    }
+
     cJSON_Delete(root);
     return true;
 }
@@ -482,6 +585,16 @@ static bool sd_save_locked(void)
     cJSON_AddNumberToObject(root, "display_brightness_pct_mt", (double) s_mtime[K_BRIGHT]);
     cJSON_AddNumberToObject(root, "selected_mix_index",        (double) s_selected_mix_index);
     cJSON_AddNumberToObject(root, "selected_mix_index_mt",     (double) s_mtime[K_SEL_MIX]);
+    cJSON_AddBoolToObject  (root, "wifi_use_static",       s_wifi_static);
+    cJSON_AddNumberToObject(root, "wifi_use_static_mt",    (double) s_mtime[K_WIFI_STATIC]);
+    cJSON_AddStringToObject(root, "wifi_static_ip",        s_wifi_ip);
+    cJSON_AddNumberToObject(root, "wifi_static_ip_mt",     (double) s_mtime[K_WIFI_IP]);
+    cJSON_AddStringToObject(root, "wifi_static_netmask",   s_wifi_nm);
+    cJSON_AddNumberToObject(root, "wifi_static_netmask_mt",(double) s_mtime[K_WIFI_NM]);
+    cJSON_AddStringToObject(root, "wifi_static_gateway",   s_wifi_gw);
+    cJSON_AddNumberToObject(root, "wifi_static_gateway_mt",(double) s_mtime[K_WIFI_GW]);
+    cJSON_AddStringToObject(root, "wifi_static_dns",       s_wifi_dns);
+    cJSON_AddNumberToObject(root, "wifi_static_dns_mt",    (double) s_mtime[K_WIFI_DNS]);
 
     char *buf = cJSON_Print(root);
     cJSON_Delete(root);
@@ -542,6 +655,18 @@ static bool prefs_write_nvs_locked(prefs_key_t k)
             uint8_t v = s_selected_mix_index;
             return nvs_write_key(k, &v, 1, s_mtime[k], s_mtime_floor);
         }
+        case K_WIFI_STATIC: {
+            uint8_t v = s_wifi_static ? 1 : 0;
+            return nvs_write_key(k, &v, 1, s_mtime[k], s_mtime_floor);
+        }
+        case K_WIFI_IP:
+            return nvs_write_key(k, s_wifi_ip,  strlen(s_wifi_ip)  + 1, s_mtime[k], s_mtime_floor);
+        case K_WIFI_NM:
+            return nvs_write_key(k, s_wifi_nm,  strlen(s_wifi_nm)  + 1, s_mtime[k], s_mtime_floor);
+        case K_WIFI_GW:
+            return nvs_write_key(k, s_wifi_gw,  strlen(s_wifi_gw)  + 1, s_mtime[k], s_mtime_floor);
+        case K_WIFI_DNS:
+            return nvs_write_key(k, s_wifi_dns, strlen(s_wifi_dns) + 1, s_mtime[k], s_mtime_floor);
         default:
             return false;
     }
@@ -623,6 +748,11 @@ static void merge_bags(const prefs_bag_t *nvs, const prefs_bag_t *sd, bool sd_lo
                     break;
                 case K_BRIGHT:     s_brightness_pct = winner->brightness_pct; break;
                 case K_SEL_MIX:    s_selected_mix_index = winner->selected_mix_index; break;
+                case K_WIFI_STATIC: s_wifi_static = winner->wifi_static; break;
+                case K_WIFI_IP:    copy_ip_str(s_wifi_ip,  sizeof(s_wifi_ip),  winner->wifi_ip);  break;
+                case K_WIFI_NM:    copy_ip_str(s_wifi_nm,  sizeof(s_wifi_nm),  winner->wifi_nm);  break;
+                case K_WIFI_GW:    copy_ip_str(s_wifi_gw,  sizeof(s_wifi_gw),  winner->wifi_gw);  break;
+                case K_WIFI_DNS:   copy_ip_str(s_wifi_dns, sizeof(s_wifi_dns), winner->wifi_dns); break;
                 default:           break;
             }
             s_mtime[k] = winner->mtime[k];
@@ -803,6 +933,60 @@ void app_prefs_set_selected_mix_index(uint8_t idx)
     notify_subscribers();
 }
 
+bool app_prefs_get_wifi_use_static(void) { return s_wifi_static; }
+
+void app_prefs_set_wifi_use_static(bool on)
+{
+    if (!s_mutex || s_wifi_static == on) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_wifi_static = on;
+    prefs_commit_locked(K_WIFI_STATIC);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
+// Shared body for the 4 IP/netmask/gw/dns string getters. The live state is
+// stored in the matching s_wifi_* buffer; we copy out under the mutex so a
+// concurrent setter can't truncate mid-read.
+static const char *get_wifi_str_locked(char *out, size_t out_len, const char *src)
+{
+    if (!out || out_len == 0) return out;
+    if (!s_mutex) { out[0] = '\0'; return out; }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    copy_ip_str(out, out_len, src);
+    xSemaphoreGive(s_mutex);
+    return out;
+}
+
+const char *app_prefs_get_wifi_static_ip(char *out, size_t out_len)
+{ return get_wifi_str_locked(out, out_len, s_wifi_ip); }
+
+const char *app_prefs_get_wifi_static_netmask(char *out, size_t out_len)
+{ return get_wifi_str_locked(out, out_len, s_wifi_nm); }
+
+const char *app_prefs_get_wifi_static_gateway(char *out, size_t out_len)
+{ return get_wifi_str_locked(out, out_len, s_wifi_gw); }
+
+const char *app_prefs_get_wifi_static_dns(char *out, size_t out_len)
+{ return get_wifi_str_locked(out, out_len, s_wifi_dns); }
+
+static void set_wifi_str(prefs_key_t k, char *dst, const char *src)
+{
+    if (!s_mutex || !src) return;
+    if (strlen(src) >= APP_PREFS_IP_STR_MAX) return;  // reject overlong
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (strcmp(dst, src) == 0) { xSemaphoreGive(s_mutex); return; }
+    copy_ip_str(dst, APP_PREFS_IP_STR_MAX, src);
+    prefs_commit_locked(k);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
+void app_prefs_set_wifi_static_ip      (const char *s) { set_wifi_str(K_WIFI_IP,  s_wifi_ip,  s); }
+void app_prefs_set_wifi_static_netmask (const char *s) { set_wifi_str(K_WIFI_NM,  s_wifi_nm,  s); }
+void app_prefs_set_wifi_static_gateway (const char *s) { set_wifi_str(K_WIFI_GW,  s_wifi_gw,  s); }
+void app_prefs_set_wifi_static_dns     (const char *s) { set_wifi_str(K_WIFI_DNS, s_wifi_dns, s); }
+
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -868,6 +1052,27 @@ static void dump_bag(const char *label, const prefs_bag_t *bag, bool loaded)
                (unsigned) bag->selected_mix_index,
                (unsigned long long) bag->mtime[K_SEL_MIX]);
     else printf("    selected_mix_idx = <absent>\n");
+
+    if (bag->present[K_WIFI_STATIC])
+        printf("    wifi_use_static  = %s   mt=%llu\n",
+               bag->wifi_static ? "true" : "false",
+               (unsigned long long) bag->mtime[K_WIFI_STATIC]);
+    else printf("    wifi_use_static  = <absent>\n");
+
+    struct { const char *label; prefs_key_t pk; const char *val; } sk[] = {
+        { "wifi_static_ip ", K_WIFI_IP,  bag->wifi_ip  },
+        { "wifi_static_nm ", K_WIFI_NM,  bag->wifi_nm  },
+        { "wifi_static_gw ", K_WIFI_GW,  bag->wifi_gw  },
+        { "wifi_static_dns", K_WIFI_DNS, bag->wifi_dns },
+    };
+    for (size_t i = 0; i < sizeof(sk) / sizeof(sk[0]); ++i) {
+        if (bag->present[sk[i].pk])
+            printf("    %s  = '%s'   mt=%llu\n",
+                   sk[i].label, sk[i].val,
+                   (unsigned long long) bag->mtime[sk[i].pk]);
+        else
+            printf("    %s  = <absent>\n", sk[i].label);
+    }
 }
 
 void app_prefs_debug_dump(void)
@@ -901,6 +1106,17 @@ void app_prefs_debug_dump(void)
     printf("  selected_mix_idx = %u   mt=%llu\n",
            (unsigned) s_selected_mix_index,
            (unsigned long long) s_mtime[K_SEL_MIX]);
+    printf("  wifi_use_static  = %s   mt=%llu\n",
+           s_wifi_static ? "true" : "false",
+           (unsigned long long) s_mtime[K_WIFI_STATIC]);
+    printf("  wifi_static_ip   = '%s'   mt=%llu\n",
+           s_wifi_ip,  (unsigned long long) s_mtime[K_WIFI_IP]);
+    printf("  wifi_static_nm   = '%s'   mt=%llu\n",
+           s_wifi_nm,  (unsigned long long) s_mtime[K_WIFI_NM]);
+    printf("  wifi_static_gw   = '%s'   mt=%llu\n",
+           s_wifi_gw,  (unsigned long long) s_mtime[K_WIFI_GW]);
+    printf("  wifi_static_dns  = '%s'   mt=%llu\n",
+           s_wifi_dns, (unsigned long long) s_mtime[K_WIFI_DNS]);
     printf("  mtime_floor      = %llu\n", (unsigned long long) s_mtime_floor);
 
     dump_bag("nvs",  &nvs_bag, true);
