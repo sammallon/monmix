@@ -37,7 +37,14 @@ static const char *TAG = "app_prefs";
 #define NVS_K_DISP_ROT_MT   "disp_rot_mt"
 #define NVS_K_CHAN_COLOR    "chan_color"
 #define NVS_K_CHAN_COLOR_MT "cclr_mt"
+#define NVS_K_BRIGHT        "bright"
+#define NVS_K_BRIGHT_MT     "bright_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
+
+// Backlight floor — a 0% mis-tap renders the panel unreadable with no
+// non-touch recovery path. 5% is dim but legible in a darkened venue.
+#define BRIGHTNESS_FLOOR_PCT  5
+#define BRIGHTNESS_DEFAULT_PCT 80
 
 typedef struct {
     int id;
@@ -54,6 +61,7 @@ typedef enum {
     K_THEME,
     K_DISP_ROT,
     K_CHAN_COLOR,
+    K_BRIGHT,
     K_COUNT,
 } prefs_key_t;
 
@@ -67,6 +75,7 @@ typedef struct {
     app_display_rotation_t disp_rot;
     color_entry_t          colors[MAX_COLOR_ENTRIES];
     size_t                 color_count;
+    uint8_t                brightness_pct;
 } prefs_bag_t;
 
 static SemaphoreHandle_t s_mutex;
@@ -78,6 +87,7 @@ static app_theme_t             s_theme        = APP_THEME_DARK;
 static app_display_rotation_t  s_disp_rot     = APP_DISPLAY_ROTATION_0;
 static color_entry_t           s_colors[MAX_COLOR_ENTRIES];
 static size_t                  s_color_count;
+static uint8_t                 s_brightness_pct = BRIGHTNESS_DEFAULT_PCT;
 static uint64_t                s_mtime[K_COUNT];   // mtime of effective value, per key
 static uint64_t                s_mtime_floor;      // monotonic counter base across reboots
 
@@ -155,8 +165,16 @@ static const char *key_name(prefs_key_t k)
         case K_THEME:      return "theme";
         case K_DISP_ROT:   return "display_rotation";
         case K_CHAN_COLOR: return "channel_color";
+        case K_BRIGHT:     return "display_brightness_pct";
         default:           return "?";
     }
+}
+
+static uint8_t clamp_brightness(uint8_t pct)
+{
+    if (pct < BRIGHTNESS_FLOOR_PCT) return BRIGHTNESS_FLOOR_PCT;
+    if (pct > 100)                  return 100;
+    return pct;
 }
 
 static void notify_subscribers(void)
@@ -205,10 +223,11 @@ static bool nvs_get_u64_opt(nvs_handle_t h, const char *key, uint64_t *out)
 static void nvs_load(prefs_bag_t *bag)
 {
     memset(bag, 0, sizeof(*bag));
-    bag->level_format = APP_LEVEL_FORMAT_NORM;
-    bag->signal_ind   = APP_SIGNAL_INDICATOR_NONE;
-    bag->theme        = APP_THEME_DARK;
-    bag->disp_rot     = APP_DISPLAY_ROTATION_0;
+    bag->level_format   = APP_LEVEL_FORMAT_NORM;
+    bag->signal_ind     = APP_SIGNAL_INDICATOR_NONE;
+    bag->theme          = APP_THEME_DARK;
+    bag->disp_rot       = APP_DISPLAY_ROTATION_0;
+    bag->brightness_pct = BRIGHTNESS_DEFAULT_PCT;
 
     nvs_handle_t h;
     if (nvs_open_ro(&h) != ESP_OK) return;
@@ -251,6 +270,12 @@ static void nvs_load(prefs_bag_t *bag)
         nvs_get_u64_opt(h, NVS_K_CHAN_COLOR_MT, &bag->mtime[K_CHAN_COLOR]);
     }
 
+    if (nvs_get_u8(h, NVS_K_BRIGHT, &u8) == ESP_OK) {
+        bag->present[K_BRIGHT]   = true;
+        bag->brightness_pct      = clamp_brightness(u8);
+        nvs_get_u64_opt(h, NVS_K_BRIGHT_MT, &bag->mtime[K_BRIGHT]);
+    }
+
     uint64_t floor = 0;
     if (nvs_get_u64_opt(h, NVS_K_MTIME_FLOOR, &floor) && floor > s_mtime_floor) {
         s_mtime_floor = floor;
@@ -286,6 +311,10 @@ static bool nvs_write_key(prefs_key_t k, const void *value, size_t value_len, ui
             err = nvs_set_blob(h, NVS_K_CHAN_COLOR, value, value_len);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_CHAN_COLOR_MT, mtime);
             break;
+        case K_BRIGHT:
+            err = nvs_set_u8(h, NVS_K_BRIGHT, *(const uint8_t *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_BRIGHT_MT, mtime);
+            break;
         default:
             err = ESP_FAIL;
             break;
@@ -320,10 +349,11 @@ static uint64_t json_get_u64(const cJSON *root, const char *key)
 static bool sd_load(prefs_bag_t *bag)
 {
     memset(bag, 0, sizeof(*bag));
-    bag->level_format = APP_LEVEL_FORMAT_NORM;
-    bag->signal_ind   = APP_SIGNAL_INDICATOR_NONE;
-    bag->theme        = APP_THEME_DARK;
-    bag->disp_rot     = APP_DISPLAY_ROTATION_0;
+    bag->level_format   = APP_LEVEL_FORMAT_NORM;
+    bag->signal_ind     = APP_SIGNAL_INDICATOR_NONE;
+    bag->theme          = APP_THEME_DARK;
+    bag->disp_rot       = APP_DISPLAY_ROTATION_0;
+    bag->brightness_pct = BRIGHTNESS_DEFAULT_PCT;
 
     if (!app_storage_is_mounted()) return false;
     FILE *f = fopen(PREFS_PATH, "rb");
@@ -384,6 +414,15 @@ static bool sd_load(prefs_bag_t *bag)
         }
         bag->mtime[K_CHAN_COLOR] = json_get_u64(root, "channel_color_mt");
     }
+    cJSON *jbr = cJSON_GetObjectItem(root, "display_brightness_pct");
+    if (cJSON_IsNumber(jbr)) {
+        bag->present[K_BRIGHT]   = true;
+        int v = (int) jbr->valuedouble;
+        if (v < 0)   v = 0;
+        if (v > 255) v = 255;
+        bag->brightness_pct = clamp_brightness((uint8_t) v);
+        bag->mtime[K_BRIGHT] = json_get_u64(root, "display_brightness_pct_mt");
+    }
 
     cJSON_Delete(root);
     return true;
@@ -412,6 +451,8 @@ static bool sd_save_locked(void)
         cJSON_AddNumberToObject(jcc, key, s_colors[i].color);
     }
     cJSON_AddNumberToObject(root, "channel_color_mt",  (double) s_mtime[K_CHAN_COLOR]);
+    cJSON_AddNumberToObject(root, "display_brightness_pct",    (double) s_brightness_pct);
+    cJSON_AddNumberToObject(root, "display_brightness_pct_mt", (double) s_mtime[K_BRIGHT]);
 
     char *buf = cJSON_Print(root);
     cJSON_Delete(root);
@@ -464,6 +505,10 @@ static bool prefs_write_nvs_locked(prefs_key_t k)
             return nvs_write_key(k, s_colors,
                                  s_color_count * sizeof(color_entry_t),
                                  s_mtime[k], s_mtime_floor);
+        case K_BRIGHT: {
+            uint8_t v = s_brightness_pct;
+            return nvs_write_key(k, &v, 1, s_mtime[k], s_mtime_floor);
+        }
         default:
             return false;
     }
@@ -543,6 +588,8 @@ static void merge_bags(const prefs_bag_t *nvs, const prefs_bag_t *sd, bool sd_lo
                     memcpy(s_colors, winner->colors,
                            winner->color_count * sizeof(color_entry_t));
                     break;
+                case K_BRIGHT:     s_brightness_pct = winner->brightness_pct; break;
+                default:           break;
             }
             s_mtime[k] = winner->mtime[k];
         }
@@ -600,12 +647,13 @@ void app_prefs_init(void)
 
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s rot=%u colors=%u sd=%s)",
+    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s rot=%u colors=%u bright=%u%% sd=%s)",
              level_format_to_str(s_level_format),
              signal_indicator_to_str(s_signal_ind),
              theme_to_str(s_theme),
              (unsigned) s_disp_rot,
              (unsigned) s_color_count,
+             (unsigned) s_brightness_pct,
              sd_loaded ? "loaded" : "absent");
 }
 
@@ -695,6 +743,19 @@ void app_prefs_set_channel_color(int ms_channel_id, int index)
     notify_subscribers();
 }
 
+uint8_t app_prefs_get_brightness_pct(void) { return s_brightness_pct; }
+
+void app_prefs_set_brightness_pct(uint8_t pct)
+{
+    pct = clamp_brightness(pct);
+    if (!s_mutex || s_brightness_pct == pct) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_brightness_pct = pct;
+    prefs_commit_locked(K_BRIGHT);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -748,6 +809,12 @@ static void dump_bag(const char *label, const prefs_bag_t *bag, bool loaded)
     } else {
         printf("    channel_color    = <absent>\n");
     }
+
+    if (bag->present[K_BRIGHT])
+        printf("    brightness_pct   = %u   mt=%llu\n",
+               (unsigned) bag->brightness_pct,
+               (unsigned long long) bag->mtime[K_BRIGHT]);
+    else printf("    brightness_pct   = <absent>\n");
 }
 
 void app_prefs_debug_dump(void)
@@ -775,6 +842,9 @@ void app_prefs_debug_dump(void)
     for (size_t i = 0; i < s_color_count; ++i) {
         printf("     ch=%d color=%d\n", s_colors[i].id, s_colors[i].color);
     }
+    printf("  brightness_pct   = %u   mt=%llu\n",
+           (unsigned) s_brightness_pct,
+           (unsigned long long) s_mtime[K_BRIGHT]);
     printf("  mtime_floor      = %llu\n", (unsigned long long) s_mtime_floor);
 
     dump_bag("nvs",  &nvs_bag, true);

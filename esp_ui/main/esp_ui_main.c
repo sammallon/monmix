@@ -74,6 +74,10 @@ void app_main(void)
         return;
     }
 
+    // Apply persisted brightness. init_backlight seeded with the compile-time
+    // default (80%); now that prefs are loaded, switch to the user's choice.
+    app_display_set_backlight_pct(app_prefs_get_brightness_pct());
+
     // Virtual touch indev for the `touch` console command. Must come
     // after app_display_init brings up LVGL.
     app_touch_inject_init();

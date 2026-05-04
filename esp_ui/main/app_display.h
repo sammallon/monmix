@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "app_prefs.h"
 
@@ -17,3 +18,7 @@ void app_display_apply_theme(app_theme_t theme);
 // the GT911 driver bridge needs no separate transform. Safe to call from
 // any task.
 void app_display_apply_rotation(app_display_rotation_t rot);
+
+// Drive the backlight LEDC PWM duty to the given percentage. Clamped to
+// 5..100 -- a fully-dark mis-tap leaves no non-touch recovery path.
+void app_display_set_backlight_pct(uint8_t pct);

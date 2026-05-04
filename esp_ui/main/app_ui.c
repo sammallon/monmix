@@ -117,6 +117,8 @@ static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
 static lv_obj_t *s_theme_buttons[2]; // dark / light
 static lv_obj_t *s_rot_buttons[2];   // 0 deg / 180 deg
+static lv_obj_t *s_bright_slider;
+static lv_obj_t *s_bright_value_label;
 
 // Auto-revert dialog state. After a rotation change the user has 10 s to
 // confirm (Keep) or revert (Cancel); ignoring the dialog reverts. Without
@@ -1064,6 +1066,32 @@ static void on_rot_clicked(lv_event_t *e)
     rot_confirm_show(old_rot);
 }
 
+// Brightness slider — live LEDC update on every drag step (no network round
+// trip), persist on release. Splitting value-changed and released keeps the
+// slider responsive while only burning one NVS+SD commit per gesture.
+static void on_bright_value_changed(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    if (v < 5)   v = 5;
+    if (v > 100) v = 100;
+    app_display_set_backlight_pct((uint8_t) v);
+    if (s_bright_value_label) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%%", v);
+        lv_label_set_text(s_bright_value_label, buf);
+    }
+}
+
+static void on_bright_released(lv_event_t *e)
+{
+    lv_obj_t *s = lv_event_get_target(e);
+    int v = lv_slider_get_value(s);
+    if (v < 5)   v = 5;
+    if (v > 100) v = 100;
+    app_prefs_set_brightness_pct((uint8_t) v);
+}
+
 // Tap a swatch → open the color-picker popup for that channel. The popup
 // applies the choice via app_prefs (which fires the dirty sweep, recolouring
 // the slider in real time) and refreshes the swatch visual on close.
@@ -1214,13 +1242,34 @@ static void build_settings_overlay(void)
                             (void *)(uintptr_t) i);
     }
 
+    // Section: Brightness — LEDC PWM slider, 5..100. Live LEDC update on
+    // drag (no network round trip), persist on release. The 5% floor at the
+    // slider also lives in app_display + app_prefs as defence-in-depth: a
+    // 0% mis-tap leaves the panel unreadable with no non-touch recovery.
+    lv_obj_t *bright_label = lv_label_create(ov);
+    lv_label_set_text(bright_label, "Brightness");
+    lv_obj_align(bright_label, LV_ALIGN_TOP_LEFT, 0, 176);
+
+    s_bright_slider = lv_slider_create(ov);
+    lv_slider_set_range(s_bright_slider, 5, 100);
+    lv_obj_set_size(s_bright_slider, 600, 24);
+    lv_obj_align(s_bright_slider, LV_ALIGN_TOP_LEFT, 180, 180);
+    lv_obj_add_event_cb(s_bright_slider, on_bright_value_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_bright_slider, on_bright_released,
+                        LV_EVENT_RELEASED, NULL);
+
+    s_bright_value_label = lv_label_create(ov);
+    lv_label_set_text(s_bright_value_label, "");
+    lv_obj_align(s_bright_value_label, LV_ALIGN_TOP_LEFT, 800, 176);
+
     // Section: Channels — 3 columns × N rows in a scrollable container so
     // the same layout works at 12 channels (default) and at the Si Expression
     // 2's full 60-channel count. Row is just [name] + [swatch] for now;
     // selection checkbox will be added with the channel-selection feature.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
-    lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 176);
+    lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 224);
 
     // Edit-channels entry — opens the picker overlay (#33). Button sits to
     // the right of the section label so it doesn't push the existing list
@@ -1231,7 +1280,7 @@ static void build_settings_overlay(void)
     // empty and tapping it would be confusing.
     s_edit_channels_btn = lv_button_create(ov);
     lv_obj_set_size(s_edit_channels_btn, 180, 36);
-    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 168);
+    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 216);
     lv_obj_t *edit_lbl = lv_label_create(s_edit_channels_btn);
     lv_label_set_text(edit_lbl, LV_SYMBOL_LIST " Edit Channels...");
     lv_obj_center(edit_lbl);
@@ -1242,8 +1291,8 @@ static void build_settings_overlay(void)
     }
 
     lv_obj_t *list = lv_obj_create(ov);
-    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 220);
-    lv_obj_set_pos(list, 0, 200);
+    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 268);
+    lv_obj_set_pos(list, 0, 248);
     lv_obj_set_style_pad_all(list, 6, 0);
     lv_obj_set_style_pad_row(list, 4, 0);
 
@@ -1308,6 +1357,16 @@ static void settings_refresh_state(void)
                          (size_t) app_prefs_get_theme());
     update_radio_visuals(s_rot_buttons, 2,
                          app_prefs_get_display_rotation() == APP_DISPLAY_ROTATION_180 ? 1 : 0);
+
+    if (s_bright_slider) {
+        uint8_t pct = app_prefs_get_brightness_pct();
+        lv_slider_set_value(s_bright_slider, (int) pct, LV_ANIM_OFF);
+        if (s_bright_value_label) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%u%%", (unsigned) pct);
+            lv_label_set_text(s_bright_value_label, buf);
+        }
+    }
 
     // Refresh row names from app_state — they may have changed via MS
     // scribble-strip broadcasts (or a local rename) since the overlay was

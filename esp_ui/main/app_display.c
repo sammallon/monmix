@@ -303,6 +303,16 @@ void app_display_apply_rotation(app_display_rotation_t rot)
     ESP_LOGI(TAG, "rotation applied: %u deg", (unsigned) rot);
 }
 
+void app_display_set_backlight_pct(uint8_t pct)
+{
+    if (pct < 5)   pct = 5;       // floor enforced here too: API-level guard
+    if (pct > 100) pct = 100;
+    const uint32_t max_duty = (1u << LCD_BL_DUTY_RES) - 1u;
+    uint32_t duty = max_duty * (uint32_t) pct / 100u;
+    ledc_set_duty   (LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
 void app_display_apply_theme(app_theme_t theme)
 {
     lv_display_t *disp = lv_display_get_default();
