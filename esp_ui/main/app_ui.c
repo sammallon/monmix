@@ -1593,6 +1593,11 @@ static void on_mix_choice(lv_event_t *e)
 {
     int mix_idx = (int)(intptr_t) lv_event_get_user_data(e);
     if (s_ms && s_ms->set_mix) s_ms->set_mix(mix_idx);
+    // Persist so the choice survives reboots. Boot-time validates against
+    // the actual mix count from /console/information.
+    if (mix_idx >= 0 && mix_idx <= 255) {
+        app_prefs_set_selected_mix_index((uint8_t) mix_idx);
+    }
     mix_indicator_refresh();
     mix_picker_close();
 }

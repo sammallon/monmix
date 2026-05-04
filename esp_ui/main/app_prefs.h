@@ -66,6 +66,13 @@ void                   app_prefs_set_display_rotation(app_display_rotation_t r);
 uint8_t app_prefs_get_brightness_pct(void);
 void    app_prefs_set_brightness_pct(uint8_t pct);
 
+// Last mix bus the user picked (0-based; "Mix 1" in MS UI = index 0).
+// The boot path validates this against the actual mix count from
+// /console/information and falls back to 0 if the saved index is out of
+// range (and persists the fallback so the change survives reboots).
+uint8_t app_prefs_get_selected_mix_index(void);
+void    app_prefs_set_selected_mix_index(uint8_t idx);
+
 // Per-channel color tag (palette index 0..7). Returns -1 if no preference
 // is set; callers should fall back to a default palette derived from the
 // channel id. set with `index < 0` to clear.

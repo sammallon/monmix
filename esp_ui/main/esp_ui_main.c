@@ -135,6 +135,19 @@ void app_main(void)
         ms->set_mix_layout(info.mix_offset, info.mix_count);
     }
 
+    // Restore the user's last selected mix bus. If the saved index is out
+    // of range for the connected console (e.g. they previously paired with
+    // a board that had more mixes), fall back to mix 0 and persist the
+    // fallback so the next reboot sees the corrected value.
+    if (info_ok && info.mix_count > 0) {
+        uint8_t saved = app_prefs_get_selected_mix_index();
+        if (saved >= info.mix_count) {
+            app_prefs_set_selected_mix_index(0);
+            saved = 0;
+        }
+        if (ms->set_mix) ms->set_mix(saved);
+    }
+
     // Build the fader UI now, BEFORE ms->start. Must happen here so the
     // tileview is fully constructed by the time the WS subscriptions echo
     // initial values back; rebuilding the UI under live broadcast traffic
