@@ -33,6 +33,8 @@ static const char *TAG = "app_prefs";
 #define NVS_K_SIG_IND_MT    "sig_ind_mt"
 #define NVS_K_THEME         "theme"
 #define NVS_K_THEME_MT      "theme_mt"
+#define NVS_K_DISP_ROT      "disp_rot"
+#define NVS_K_DISP_ROT_MT   "disp_rot_mt"
 #define NVS_K_CHAN_COLOR    "chan_color"
 #define NVS_K_CHAN_COLOR_MT "cclr_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
@@ -50,6 +52,7 @@ typedef enum {
     K_LVL_FMT = 0,
     K_SIG_IND,
     K_THEME,
+    K_DISP_ROT,
     K_CHAN_COLOR,
     K_COUNT,
 } prefs_key_t;
@@ -61,6 +64,7 @@ typedef struct {
     app_level_format_t     level_format;
     app_signal_indicator_t signal_ind;
     app_theme_t            theme;
+    app_display_rotation_t disp_rot;
     color_entry_t          colors[MAX_COLOR_ENTRIES];
     size_t                 color_count;
 } prefs_bag_t;
@@ -71,6 +75,7 @@ static SemaphoreHandle_t s_mutex;
 static app_level_format_t      s_level_format = APP_LEVEL_FORMAT_NORM;
 static app_signal_indicator_t  s_signal_ind   = APP_SIGNAL_INDICATOR_NONE;
 static app_theme_t             s_theme        = APP_THEME_DARK;
+static app_display_rotation_t  s_disp_rot     = APP_DISPLAY_ROTATION_0;
 static color_entry_t           s_colors[MAX_COLOR_ENTRIES];
 static size_t                  s_color_count;
 static uint64_t                s_mtime[K_COUNT];   // mtime of effective value, per key
@@ -136,12 +141,19 @@ static app_theme_t theme_from_str(const char *s)
     return APP_THEME_DARK;
 }
 
+// Anything other than 180 -> 0; the toggle UI only writes one of two values.
+static app_display_rotation_t disp_rot_from_u16(uint16_t v)
+{
+    return (v == 180) ? APP_DISPLAY_ROTATION_180 : APP_DISPLAY_ROTATION_0;
+}
+
 static const char *key_name(prefs_key_t k)
 {
     switch (k) {
         case K_LVL_FMT:    return "level_format";
         case K_SIG_IND:    return "signal_indicator";
         case K_THEME:      return "theme";
+        case K_DISP_ROT:   return "display_rotation";
         case K_CHAN_COLOR: return "channel_color";
         default:           return "?";
     }
@@ -196,6 +208,7 @@ static void nvs_load(prefs_bag_t *bag)
     bag->level_format = APP_LEVEL_FORMAT_NORM;
     bag->signal_ind   = APP_SIGNAL_INDICATOR_NONE;
     bag->theme        = APP_THEME_DARK;
+    bag->disp_rot     = APP_DISPLAY_ROTATION_0;
 
     nvs_handle_t h;
     if (nvs_open_ro(&h) != ESP_OK) return;
@@ -217,6 +230,13 @@ static void nvs_load(prefs_bag_t *bag)
         bag->present[K_THEME] = true;
         bag->theme = (u8 == APP_THEME_LIGHT) ? APP_THEME_LIGHT : APP_THEME_DARK;
         nvs_get_u64_opt(h, NVS_K_THEME_MT, &bag->mtime[K_THEME]);
+    }
+
+    uint16_t u16;
+    if (nvs_get_u16(h, NVS_K_DISP_ROT, &u16) == ESP_OK) {
+        bag->present[K_DISP_ROT] = true;
+        bag->disp_rot = disp_rot_from_u16(u16);
+        nvs_get_u64_opt(h, NVS_K_DISP_ROT_MT, &bag->mtime[K_DISP_ROT]);
     }
 
     // channel_color blob: array of (int id, int color) pairs.
@@ -257,6 +277,10 @@ static bool nvs_write_key(prefs_key_t k, const void *value, size_t value_len, ui
         case K_THEME:
             err = nvs_set_u8(h, NVS_K_THEME, *(const uint8_t *)value);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_THEME_MT, mtime);
+            break;
+        case K_DISP_ROT:
+            err = nvs_set_u16(h, NVS_K_DISP_ROT, *(const uint16_t *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_DISP_ROT_MT, mtime);
             break;
         case K_CHAN_COLOR:
             err = nvs_set_blob(h, NVS_K_CHAN_COLOR, value, value_len);
@@ -299,6 +323,7 @@ static bool sd_load(prefs_bag_t *bag)
     bag->level_format = APP_LEVEL_FORMAT_NORM;
     bag->signal_ind   = APP_SIGNAL_INDICATOR_NONE;
     bag->theme        = APP_THEME_DARK;
+    bag->disp_rot     = APP_DISPLAY_ROTATION_0;
 
     if (!app_storage_is_mounted()) return false;
     FILE *f = fopen(PREFS_PATH, "rb");
@@ -338,6 +363,12 @@ static bool sd_load(prefs_bag_t *bag)
         bag->theme = theme_from_str(jth->valuestring);
         bag->mtime[K_THEME] = json_get_u64(root, "theme_mt");
     }
+    cJSON *jdr = cJSON_GetObjectItem(root, "display_rotation");
+    if (cJSON_IsNumber(jdr)) {
+        bag->present[K_DISP_ROT] = true;
+        bag->disp_rot = disp_rot_from_u16((uint16_t) jdr->valuedouble);
+        bag->mtime[K_DISP_ROT] = json_get_u64(root, "display_rotation_mt");
+    }
     cJSON *jcc = cJSON_GetObjectItem(root, "channel_color");
     if (cJSON_IsObject(jcc)) {
         bag->present[K_CHAN_COLOR] = true;
@@ -372,6 +403,8 @@ static bool sd_save_locked(void)
     cJSON_AddNumberToObject(root, "signal_indicator_mt", (double) s_mtime[K_SIG_IND]);
     cJSON_AddStringToObject(root, "theme",             theme_to_str(s_theme));
     cJSON_AddNumberToObject(root, "theme_mt",          (double) s_mtime[K_THEME]);
+    cJSON_AddNumberToObject(root, "display_rotation",     (double) s_disp_rot);
+    cJSON_AddNumberToObject(root, "display_rotation_mt",  (double) s_mtime[K_DISP_ROT]);
     cJSON *jcc = cJSON_AddObjectToObject(root, "channel_color");
     for (size_t i = 0; i < s_color_count; ++i) {
         char key[16];
@@ -422,6 +455,10 @@ static bool prefs_write_nvs_locked(prefs_key_t k)
         case K_THEME: {
             uint8_t v = (uint8_t) s_theme;
             return nvs_write_key(k, &v, 1, s_mtime[k], s_mtime_floor);
+        }
+        case K_DISP_ROT: {
+            uint16_t v = (uint16_t) s_disp_rot;
+            return nvs_write_key(k, &v, sizeof(v), s_mtime[k], s_mtime_floor);
         }
         case K_CHAN_COLOR:
             return nvs_write_key(k, s_colors,
@@ -500,6 +537,7 @@ static void merge_bags(const prefs_bag_t *nvs, const prefs_bag_t *sd, bool sd_lo
                 case K_LVL_FMT:    s_level_format = winner->level_format; break;
                 case K_SIG_IND:    s_signal_ind   = winner->signal_ind;   break;
                 case K_THEME:      s_theme        = winner->theme;        break;
+                case K_DISP_ROT:   s_disp_rot     = winner->disp_rot;     break;
                 case K_CHAN_COLOR:
                     s_color_count = winner->color_count;
                     memcpy(s_colors, winner->colors,
@@ -562,10 +600,11 @@ void app_prefs_init(void)
 
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s colors=%u sd=%s)",
+    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s rot=%u colors=%u sd=%s)",
              level_format_to_str(s_level_format),
              signal_indicator_to_str(s_signal_ind),
              theme_to_str(s_theme),
+             (unsigned) s_disp_rot,
              (unsigned) s_color_count,
              sd_loaded ? "loaded" : "absent");
 }
@@ -602,6 +641,24 @@ void app_prefs_set_theme(app_theme_t t)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_theme = t;
     prefs_commit_locked(K_THEME);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
+app_display_rotation_t app_prefs_get_display_rotation(void) { return s_disp_rot; }
+
+void app_prefs_set_display_rotation(app_display_rotation_t r)
+{
+    // Coerce anything non-180 to 0 -- the toggle UI only writes valid values
+    // but persistence migrations or hand-edited SD JSON could land arbitrary
+    // numbers in here.
+    app_display_rotation_t coerced = (r == APP_DISPLAY_ROTATION_180)
+                                         ? APP_DISPLAY_ROTATION_180
+                                         : APP_DISPLAY_ROTATION_0;
+    if (!s_mutex || s_disp_rot == coerced) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_disp_rot = coerced;
+    prefs_commit_locked(K_DISP_ROT);
     xSemaphoreGive(s_mutex);
     notify_subscribers();
 }
@@ -675,6 +732,12 @@ static void dump_bag(const char *label, const prefs_bag_t *bag, bool loaded)
                (unsigned long long) bag->mtime[K_THEME]);
     else printf("    theme            = <absent>\n");
 
+    if (bag->present[K_DISP_ROT])
+        printf("    display_rotation = %u   mt=%llu\n",
+               (unsigned) bag->disp_rot,
+               (unsigned long long) bag->mtime[K_DISP_ROT]);
+    else printf("    display_rotation = <absent>\n");
+
     if (bag->present[K_CHAN_COLOR]) {
         printf("    channel_color    = (%u entries) mt=%llu\n",
                (unsigned) bag->color_count,
@@ -703,6 +766,9 @@ void app_prefs_debug_dump(void)
     printf("  theme            = %s   mt=%llu\n",
            theme_to_str(s_theme),
            (unsigned long long) s_mtime[K_THEME]);
+    printf("  display_rotation = %u   mt=%llu\n",
+           (unsigned) s_disp_rot,
+           (unsigned long long) s_mtime[K_DISP_ROT]);
     printf("  channel_color    = (%u entries) mt=%llu\n",
            (unsigned) s_color_count,
            (unsigned long long) s_mtime[K_CHAN_COLOR]);

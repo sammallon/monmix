@@ -116,6 +116,18 @@ static lv_obj_t *s_lvl_norm_btn;
 static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
 static lv_obj_t *s_theme_buttons[2]; // dark / light
+static lv_obj_t *s_rot_buttons[2];   // 0 deg / 180 deg
+
+// Auto-revert dialog state. After a rotation change the user has 10 s to
+// confirm (Keep) or revert (Cancel); ignoring the dialog reverts. Without
+// this, an accidental tap that flips the screen could leave a user unable
+// to find the toggle to undo it.
+#define ROT_REVERT_SECONDS  10
+static lv_obj_t           *s_rot_confirm;
+static lv_obj_t           *s_rot_confirm_msg;     // "Keep this orientation? Reverts in N s"
+static lv_timer_t         *s_rot_confirm_timer;   // 1 Hz countdown -> auto-revert at 0
+static int                 s_rot_confirm_remaining;
+static app_display_rotation_t s_rot_pending_revert;  // value to revert TO if dialog times out
 
 // Color-picker popup. One instance, reused for whichever channel last tapped
 // a swatch in the settings overlay. s_picker_target_idx remembers which
@@ -923,6 +935,135 @@ static void on_theme_clicked(lv_event_t *e)
     update_radio_visuals(s_theme_buttons, 2, (size_t) which);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Rotation toggle + auto-revert dialog. The toggle applies + persists
+// optimistically; a 10 s confirm popup reverts the change if the user
+// doesn't tap "Keep" -- prevents an accidental rotation from leaving the
+// user unable to find the toggle to undo it.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void rot_confirm_close(void)
+{
+    if (s_rot_confirm_timer) {
+        lv_timer_delete(s_rot_confirm_timer);
+        s_rot_confirm_timer = NULL;
+    }
+    if (s_rot_confirm) {
+        lv_obj_add_flag(s_rot_confirm, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void rot_confirm_revert(void)
+{
+    // Apply + persist the original orientation, then refresh the radios so
+    // they reflect the actual state.
+    app_prefs_set_display_rotation(s_rot_pending_revert);
+    app_display_apply_rotation(s_rot_pending_revert);
+    update_radio_visuals(s_rot_buttons, 2,
+                         s_rot_pending_revert == APP_DISPLAY_ROTATION_180 ? 1 : 0);
+    rot_confirm_close();
+}
+
+static void rot_confirm_tick(lv_timer_t *t)
+{
+    (void) t;
+    s_rot_confirm_remaining--;
+    if (s_rot_confirm_remaining <= 0) {
+        rot_confirm_revert();
+        return;
+    }
+    if (s_rot_confirm_msg) {
+        char buf[80];
+        snprintf(buf, sizeof(buf),
+                 "Keep this orientation?\nReverts in %d s",
+                 s_rot_confirm_remaining);
+        lv_label_set_text(s_rot_confirm_msg, buf);
+    }
+}
+
+static void on_rot_keep(lv_event_t *e)
+{
+    (void) e;
+    rot_confirm_close();
+}
+
+static void on_rot_cancel(lv_event_t *e)
+{
+    (void) e;
+    rot_confirm_revert();
+}
+
+static void rot_confirm_show(app_display_rotation_t revert_to)
+{
+    s_rot_pending_revert    = revert_to;
+    s_rot_confirm_remaining = ROT_REVERT_SECONDS;
+
+    if (!s_rot_confirm) {
+        // Build modal centered on the screen so it sits on top of the
+        // settings overlay even after rotation flipped the framebuffer.
+        lv_obj_t *scr = lv_screen_active();
+        lv_obj_t *p = lv_obj_create(scr);
+        lv_obj_set_size(p, 460, 220);
+        lv_obj_center(p);
+        lv_obj_set_style_pad_all(p, 20, 0);
+        lv_obj_set_style_radius(p, 12, 0);
+        lv_obj_set_style_border_width(p, 2, 0);
+        lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+        s_rot_confirm = p;
+
+        s_rot_confirm_msg = lv_label_create(p);
+        lv_label_set_text(s_rot_confirm_msg, "");
+        lv_obj_align(s_rot_confirm_msg, LV_ALIGN_TOP_MID, 0, 10);
+        lv_obj_set_style_text_align(s_rot_confirm_msg, LV_TEXT_ALIGN_CENTER, 0);
+
+        lv_obj_t *cancel = lv_button_create(p);
+        lv_obj_set_size(cancel, 160, 50);
+        lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_obj_t *cancel_lbl = lv_label_create(cancel);
+        lv_label_set_text(cancel_lbl, "Cancel");
+        lv_obj_center(cancel_lbl);
+        lv_obj_add_event_cb(cancel, on_rot_cancel, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *keep = lv_button_create(p);
+        lv_obj_set_size(keep, 160, 50);
+        lv_obj_align(keep, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+        lv_obj_set_style_bg_color(keep, lv_color_hex(0x40C060), 0);
+        lv_obj_t *keep_lbl = lv_label_create(keep);
+        lv_label_set_text(keep_lbl, "Keep");
+        lv_obj_center(keep_lbl);
+        lv_obj_add_event_cb(keep, on_rot_keep, LV_EVENT_CLICKED, NULL);
+    }
+
+    // Initial label + show.
+    char buf[80];
+    snprintf(buf, sizeof(buf),
+             "Keep this orientation?\nReverts in %d s",
+             s_rot_confirm_remaining);
+    lv_label_set_text(s_rot_confirm_msg, buf);
+    lv_obj_remove_flag(s_rot_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_rot_confirm);
+
+    if (s_rot_confirm_timer) lv_timer_delete(s_rot_confirm_timer);
+    s_rot_confirm_timer = lv_timer_create(rot_confirm_tick, 1000, NULL);
+}
+
+static void on_rot_clicked(lv_event_t *e)
+{
+    int which = (int)(uintptr_t) lv_event_get_user_data(e);
+    app_display_rotation_t new_rot = (which == 1)
+                                         ? APP_DISPLAY_ROTATION_180
+                                         : APP_DISPLAY_ROTATION_0;
+    app_display_rotation_t old_rot = app_prefs_get_display_rotation();
+    if (new_rot == old_rot) return;
+
+    // Apply optimistically; revert path puts both prefs and framebuffer back
+    // if the user doesn't confirm within ROT_REVERT_SECONDS.
+    app_prefs_set_display_rotation(new_rot);
+    app_display_apply_rotation(new_rot);
+    update_radio_visuals(s_rot_buttons, 2, (size_t) which);
+    rot_confirm_show(old_rot);
+}
+
 // Tap a swatch → open the color-picker popup for that channel. The popup
 // applies the choice via app_prefs (which fires the dirty sweep, recolouring
 // the slider in real time) and refreshes the swatch visual on close.
@@ -1027,6 +1168,22 @@ static void build_settings_overlay(void)
     lv_obj_set_size(s_lvl_db_btn, 120, 44);
     lv_obj_align(s_lvl_db_btn, LV_ALIGN_TOP_LEFT, 312, 50);
     lv_obj_add_event_cb(s_lvl_db_btn, on_lvl_db_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Section: Rotation -- right side of row 1, beside Level Format. Only
+    // 0 / 180 supported (the panel is landscape and 90/270 would reflow the
+    // entire fader UI).
+    lv_obj_t *rot_label = lv_label_create(ov);
+    lv_label_set_text(rot_label, "Rotation");
+    lv_obj_align(rot_label, LV_ALIGN_TOP_LEFT, 480, 56);
+
+    static const char *rot_text[2] = { "0 deg", "180 deg" };
+    for (int i = 0; i < 2; ++i) {
+        s_rot_buttons[i] = make_radio_button(ov, rot_text[i]);
+        lv_obj_set_size(s_rot_buttons[i], 120, 44);
+        lv_obj_align(s_rot_buttons[i], LV_ALIGN_TOP_LEFT, 620 + i * 132, 50);
+        lv_obj_add_event_cb(s_rot_buttons[i], on_rot_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+    }
 
     // Section: Signal Indicator
     lv_obj_t *sig_label = lv_label_create(ov);
@@ -1149,6 +1306,8 @@ static void settings_refresh_state(void)
                          (size_t) app_prefs_get_signal_indicator());
     update_radio_visuals(s_theme_buttons, 2,
                          (size_t) app_prefs_get_theme());
+    update_radio_visuals(s_rot_buttons, 2,
+                         app_prefs_get_display_rotation() == APP_DISPLAY_ROTATION_180 ? 1 : 0);
 
     // Refresh row names from app_state — they may have changed via MS
     // scribble-strip broadcasts (or a local rename) since the overlay was
