@@ -57,6 +57,7 @@ static const char *TAG = "app_ui";
 #define DOT_GAP             10
 
 typedef struct {
+    lv_obj_t *box;            // outer strip box; reorder-mode highlight goes here
     lv_obj_t *slider;
     lv_obj_t *label_name;
     lv_obj_t *label_val;
@@ -244,6 +245,21 @@ static lv_timer_t *s_toast_timer;
 static void toast_show(const char *text);
 static void apply_controls_enabled(void);
 static void on_mute_en_clicked(lv_event_t *e);
+
+// Drag-to-reorder. Long-press on a strip's name label enters reorder mode;
+// on each pressing event we compare finger X against neighbour-box centres
+// and swap entries when a centre is crossed. Persist + rebuild on release.
+// State below is touched only from LVGL event callbacks, all under the
+// LVGL task -- no extra locking needed.
+static bool   s_reorder_active;
+static size_t s_reorder_idx;             // logical slot currently being dragged
+static size_t s_reorder_page;            // confine swap to one page (visual)
+static int    s_reorder_ids[APP_CONFIG_MAX_CHANNELS];
+static size_t s_reorder_count;
+static void on_strip_long_pressed(lv_event_t *e);
+static void on_strip_pressing(lv_event_t *e);
+static void on_strip_released(lv_event_t *e);
+static void reorder_exit(bool persist_and_rebuild);
 
 // Status-bar icons for WiFi / MS connection state. Tap opens the read-only
 // info panel; the icon color reflects the live state.
@@ -563,6 +579,165 @@ static void on_tile_changed(lv_event_t *e)
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Drag-to-reorder. Long-press on a strip's name label promotes the strip
+// into "reorder mode": outline-highlighted, sliders + mute disabled, tile
+// swipe suppressed. Pressing events compare finger X against the centres
+// of neighbour boxes ON THE SAME PAGE; crossing a centre swaps both the
+// working ids array and the live app_state slot. Release persists +
+// rebuilds.
+// ─────────────────────────────────────────────────────────────────────────
+
+static void reorder_set_highlight(size_t idx, bool on)
+{
+    if (idx >= APP_CONFIG_MAX_CHANNELS) return;
+    lv_obj_t *box = s_widgets[idx].box;
+    if (!box) return;
+    if (on) {
+        // Bright outline -- reads on both dark and light themes. Width of 4
+        // is enough to be unambiguous without crowding the slider.
+        lv_obj_set_style_outline_width(box, 4, 0);
+        lv_obj_set_style_outline_color(box, lv_color_hex(0xE0C040), 0);
+        lv_obj_set_style_outline_pad(box, 2, 0);
+        lv_obj_set_style_outline_opa(box, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_set_style_outline_width(box, 0, 0);
+        lv_obj_set_style_outline_opa(box, LV_OPA_TRANSP, 0);
+    }
+}
+
+static void on_strip_long_pressed(lv_event_t *e)
+{
+    if (s_reorder_active) return;
+    size_t idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    size_t total = app_state_count();
+    if (idx >= total) return;
+
+    // Snapshot current ids into a working buffer; mutated in-place on each
+    // swap. Persisted on release.
+    s_reorder_count = total;
+    for (size_t i = 0; i < total; ++i) {
+        s_reorder_ids[i] = app_state_id_for_idx(i);
+    }
+    s_reorder_idx    = idx;
+    s_reorder_page   = idx / FADERS_PER_PAGE;
+    s_reorder_active = true;
+
+    reorder_set_highlight(idx, true);
+
+    // Suppress slider drag and tile swipe so neither competes with the
+    // reorder gesture. Restored on release.
+    for (size_t i = 0; i < total; ++i) {
+        if (s_widgets[i].slider) {
+            lv_obj_remove_flag(s_widgets[i].slider, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+    if (s_tileview) {
+        lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
+static void on_strip_pressing(lv_event_t *e)
+{
+    if (!s_reorder_active) return;
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (!indev) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+
+    // The pointer's x is in screen coordinates. The strip boxes are
+    // children of tile children of the tileview, so their lv_obj_get_x is
+    // tile-relative. Compute screen-x of each candidate neighbour box on
+    // the same page and compare.
+    size_t cur = s_reorder_idx;
+    size_t page_first = s_reorder_page * FADERS_PER_PAGE;
+    size_t page_last  = page_first + FADERS_PER_PAGE - 1;
+    if (page_last >= s_reorder_count) page_last = s_reorder_count - 1;
+
+    // Try left neighbour: swap if finger crossed its centre going left.
+    if (cur > page_first) {
+        lv_obj_t *nb = s_widgets[cur - 1].box;
+        if (nb) {
+            int32_t nb_x = lv_obj_get_x(nb);
+            int32_t nb_w = lv_obj_get_width(nb);
+            int32_t nb_cx = nb_x + nb_w / 2;
+            if (p.x < nb_cx) {
+                size_t a = cur, b = cur - 1;
+                int tmp = s_reorder_ids[a];
+                s_reorder_ids[a] = s_reorder_ids[b];
+                s_reorder_ids[b] = tmp;
+                app_state_swap_slots(a, b);
+                reorder_set_highlight(a, false);
+                reorder_set_highlight(b, true);
+                s_reorder_idx = b;
+                on_state_change(a, NULL);
+                on_state_change(b, NULL);
+                return;
+            }
+        }
+    }
+    // Right neighbour.
+    if (cur < page_last) {
+        lv_obj_t *nb = s_widgets[cur + 1].box;
+        if (nb) {
+            int32_t nb_x = lv_obj_get_x(nb);
+            int32_t nb_w = lv_obj_get_width(nb);
+            int32_t nb_cx = nb_x + nb_w / 2;
+            if (p.x > nb_cx) {
+                size_t a = cur, b = cur + 1;
+                int tmp = s_reorder_ids[a];
+                s_reorder_ids[a] = s_reorder_ids[b];
+                s_reorder_ids[b] = tmp;
+                app_state_swap_slots(a, b);
+                reorder_set_highlight(a, false);
+                reorder_set_highlight(b, true);
+                s_reorder_idx = b;
+                on_state_change(a, NULL);
+                on_state_change(b, NULL);
+                return;
+            }
+        }
+    }
+}
+
+// Deferred rebuild: present_channels destroys the very label object we
+// were dispatching the event into. Punt it to the next LVGL idle.
+static void reorder_persist_and_rebuild(void *unused)
+{
+    (void) unused;
+    app_config_set_channel_ids(s_reorder_ids, s_reorder_count);
+    app_ui_present_channels();
+}
+
+static void reorder_exit(bool persist_and_rebuild)
+{
+    if (!s_reorder_active) return;
+    s_reorder_active = false;
+
+    // Drop the highlight on whichever slot we ended on.
+    reorder_set_highlight(s_reorder_idx, false);
+
+    // Restore tile swipe; slider clickability is restored by the rebuild via
+    // apply_controls_enabled, or here directly when we don't rebuild.
+    if (s_tileview) {
+        lv_obj_add_flag(s_tileview, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    if (persist_and_rebuild) {
+        // Defer destroy-and-rebuild until after this event finishes
+        // dispatching -- the name label is the event target.
+        lv_async_call(reorder_persist_and_rebuild, NULL);
+    } else {
+        apply_controls_enabled();
+    }
+}
+
+static void on_strip_released(lv_event_t *e)
+{
+    (void) e;
+    reorder_exit(true);
+}
+
 static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
 {
     app_channel_t ch;
@@ -578,6 +753,7 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_set_pos(box, box_x, box_y);
     lv_obj_set_style_pad_all(box, FADER_BOX_PAD, 0);
     lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    s_widgets[idx].box = box;
 
     lv_obj_t *name = lv_label_create(box);
     lv_label_set_text(name, ch.name);
@@ -586,6 +762,21 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
     s_widgets[idx].label_name = name;
+
+    // Drag-to-reorder is bound to the name label only -- the slider has its
+    // own drag (level), the mute button its own click. PRESS_LOCK keeps the
+    // press on this label even when the finger slides off, so PRESSING/
+    // RELEASED keep firing through the swap.
+    lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(name, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_add_event_cb(name, on_strip_long_pressed, LV_EVENT_LONG_PRESSED,
+                        (void *)(uintptr_t) idx);
+    lv_obj_add_event_cb(name, on_strip_pressing, LV_EVENT_PRESSING,
+                        (void *)(uintptr_t) idx);
+    lv_obj_add_event_cb(name, on_strip_released, LV_EVENT_RELEASED,
+                        (void *)(uintptr_t) idx);
+    lv_obj_add_event_cb(name, on_strip_released, LV_EVENT_PRESS_LOST,
+                        (void *)(uintptr_t) idx);
 
     // Signal-present indicator — small round dot centered below the name
     // label and above the slider. Visible only when mode != none AND the

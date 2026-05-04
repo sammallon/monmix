@@ -111,6 +111,16 @@ int app_state_id_for_idx(size_t idx)
     return s_channels[idx].id;
 }
 
+void app_state_swap_slots(size_t a, size_t b)
+{
+    if (a == b || a >= s_count || b >= s_count) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    app_channel_t tmp = s_channels[a];
+    s_channels[a] = s_channels[b];
+    s_channels[b] = tmp;
+    xSemaphoreGive(s_mutex);
+}
+
 void app_state_register_on_change(app_state_on_change_t cb, void *ctx)
 {
     s_on_change     = cb;
