@@ -35,3 +35,19 @@ int app_state_id_for_idx(size_t idx);
 void app_state_swap_slots(size_t a, size_t b);
 
 void app_state_register_on_change(app_state_on_change_t cb, void *ctx);
+
+// Master strip — the mix-bus output fader for the currently-selected mix.
+// On Si Expression 2 these are channels 60..73 (Mix 01..14) etc; the
+// channel id and the bus path differ from input strips (no `level` alias,
+// uses `mix.lvl` instead of `levelData.<m>.lvl`), so it gets its own
+// state slot rather than living in the per-fader array.
+typedef void (*app_state_master_on_change_t)(void *ctx);
+
+bool app_state_master_get(app_channel_t *out);
+void app_state_master_set_id(int ms_channel_id);
+void app_state_master_set_level(float level, bool notify);
+void app_state_master_set_level_db(float db, bool notify);
+void app_state_master_set_name(const char *name, bool notify);
+void app_state_master_set_mute(bool mute, bool notify);
+
+void app_state_master_register_on_change(app_state_master_on_change_t cb, void *ctx);

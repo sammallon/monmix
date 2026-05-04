@@ -52,6 +52,12 @@ static lv_obj_t *s_splash_logo_img;
 #define INDICATOR_H         28
 #define TILEVIEW_Y          STATUS_H
 #define TILEVIEW_H          (SCREEN_H - STATUS_H - INDICATOR_H)
+// Master strip — pinned to the right edge outside the tileview so the mix-
+// bus output is always reachable regardless of which input page is showing.
+// Width matches the input slots; tileview shrinks by exactly this amount
+// so the 12-input layout still fits on a single page (12 * 78 = 936).
+#define MASTER_STRIP_W      88
+#define TILEVIEW_W          (SCREEN_W - MASTER_STRIP_W)
 #define FADER_BOX_W         72
 #define FADER_BOX_H         500
 #define FADER_BOX_PAD       8
@@ -115,6 +121,10 @@ static const uint32_t COLOR_PALETTE[8] = {
 // (the FreeRTOS timer-task-stack alloc tipped over the edge once before
 // when the s_mix_names array landed in DRAM, see app_ms_client_ws.c).
 EXT_RAM_BSS_ATTR static fader_widgets_t s_widgets[APP_CONFIG_MAX_CHANNELS];
+// Master strip — same widget shape as the input strips but a singleton
+// (one mix-bus output at a time, retargeted on mix change). Sits outside
+// the tileview, anchored to the right edge.
+static fader_widgets_t          s_master_widgets;
 static lv_obj_t                *s_status_label;
 static lv_obj_t                *s_tileview;
 static lv_obj_t                *s_page_tiles[MAX_PAGES];
@@ -490,6 +500,11 @@ static void on_mute_clicked(lv_event_t *e)
 EXT_RAM_BSS_ATTR static volatile bool s_dirty[APP_CONFIG_MAX_CHANNELS];
 static volatile bool s_sweep_queued;
 
+// Master strip rides the same dirty-flag pattern but with a single bit; the
+// sweep is folded into apply_pending so a master change still uses one
+// queued async (not two).
+static volatile bool s_master_dirty;
+
 static void apply_pending(void *unused)
 {
     (void)unused;
@@ -554,6 +569,26 @@ static void apply_pending(void *unused)
             }
         }
     }
+
+    // Master strip — same redraw shape as the input strips. Master has no
+    // `level` (dB) alias on MS, so the dB-format readout falls back to the
+    // slider percent.
+    if (s_master_dirty && s_master_widgets.slider) {
+        s_master_dirty = false;
+        app_channel_t m;
+        if (app_state_master_get(&m)) {
+            int v = (int)(m.level * 100.0f);
+            lv_slider_set_value(s_master_widgets.slider, v, LV_ANIM_OFF);
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%d", v);
+            lv_label_set_text(s_master_widgets.label_val, buf);
+            lv_label_set_text(s_master_widgets.label_name, m.name);
+            if (s_master_widgets.btn_mute) {
+                if (m.mute) lv_obj_add_state   (s_master_widgets.btn_mute, LV_STATE_CHECKED);
+                else        lv_obj_remove_state(s_master_widgets.btn_mute, LV_STATE_CHECKED);
+            }
+        }
+    }
 }
 
 static void on_state_change(size_t idx, void *ctx)
@@ -576,6 +611,25 @@ static void on_state_change(size_t idx, void *ctx)
     lvgl_port_unlock();
 }
 
+// Master strip rides apply_pending too — same coalescing, same lock
+// discipline. Setting s_master_dirty before queuing means a sweep already
+// in flight picks it up via the master branch at the end of apply_pending.
+static void on_master_state_change(void *ctx)
+{
+    (void) ctx;
+    s_master_dirty = true;
+    if (s_sweep_queued) return;
+
+    if (!lvgl_port_lock(100)) return;
+    if (!s_sweep_queued) {
+        s_sweep_queued = true;
+        if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
+            s_sweep_queued = false;
+        }
+    }
+    lvgl_port_unlock();
+}
+
 // Pref changes (level format, channel colors, signal indicator, theme) affect
 // the rendering of every fader, so we mark all channels dirty and queue a
 // single sweep — same plumbing as the per-channel state changes. Theme is
@@ -587,6 +641,7 @@ static void on_prefs_change(void *ctx)
     app_display_apply_theme(app_prefs_get_theme());
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
+    s_master_dirty = true;
     if (s_sweep_queued) return;
 
     if (!lvgl_port_lock(100)) return;
@@ -778,8 +833,10 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     app_channel_t ch;
     if (!app_state_get(idx, &ch)) return;
 
-    // Center the box within its slot. slot_w = SCREEN_W / FADERS_PER_PAGE.
-    const int slot_w = SCREEN_W / FADERS_PER_PAGE;
+    // Center the box within its slot. slot_w = TILEVIEW_W / FADERS_PER_PAGE
+    // — tileview shrinks for the master strip on the right so use the
+    // tileview width here, not the full screen width.
+    const int slot_w = TILEVIEW_W / FADERS_PER_PAGE;
     const int box_x  = slot_x_in_tile + (slot_w - FADER_BOX_W) / 2;
     const int box_y  = (TILEVIEW_H - FADER_BOX_H) / 2;
 
@@ -881,6 +938,149 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     // the floor case). Other labels stay on LV_FONT_DEFAULT.
     lv_obj_set_style_text_font(val, &font_monmix_level, 0);
     s_widgets[idx].label_val = val;
+}
+
+// Master strip — same widget pattern as build_fader minus the per-channel
+// quirks (no color tag, no reorder gesture, no signal dot — the master is
+// visually distinct already). Bound to the singleton master state, retargeted
+// to the active mix bus's channel id by the WS subscribe path.
+static void on_master_slider_changed(lv_event_t *e)
+{
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int   v     = lv_slider_get_value(slider);
+    float level = (float) v / 100.0f;
+
+    app_state_master_set_level(level, false);
+
+    // Same 20 Hz rate-limit shape as the per-channel sliders. Master gets
+    // its own send timestamp so a fast input drag doesn't gate master
+    // updates.
+    static uint32_t s_master_last_send_ms;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now - s_master_last_send_ms >= SET_MIN_INTERVAL_MS) {
+        if (s_ms && s_ms->set_master_level) s_ms->set_master_level(level);
+        s_master_last_send_ms = now;
+    }
+
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%d", v);
+    lv_label_set_text(s_master_widgets.label_val, buf);
+}
+
+static void on_master_slider_released(lv_event_t *e)
+{
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int v = lv_slider_get_value(slider);
+    if (s_ms && s_ms->set_master_level) {
+        s_ms->set_master_level((float) v / 100.0f);
+    }
+}
+
+static void on_master_mute_clicked(lv_event_t *e)
+{
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+
+    bool ms_ok = (s_ms && s_ms->get_state &&
+                  s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    if (!ms_ok) return;
+    if (!s_mute_enabled) {
+        toast_show("Mute disabled - tap MUTE EN to enable");
+        return;
+    }
+
+    app_channel_t m;
+    if (!app_state_master_get(&m)) return;
+    bool new_mute = !m.mute;
+
+    if (s_ms && s_ms->set_master_mute) s_ms->set_master_mute(new_mute);
+    app_state_master_set_mute(new_mute, false);
+
+    if (new_mute) lv_obj_add_state   (btn, LV_STATE_CHECKED);
+    else          lv_obj_remove_state(btn, LV_STATE_CHECKED);
+}
+
+static void build_master_strip(lv_obj_t *parent)
+{
+    app_channel_t m;
+    app_state_master_get(&m);
+
+    // Anchored to the right of the screen, same vertical band as the
+    // tileview. Width matches MASTER_STRIP_W; box centered within that
+    // slot using the same FADER_BOX_W as the input strips.
+    const int box_x = SCREEN_W - MASTER_STRIP_W + (MASTER_STRIP_W - FADER_BOX_W) / 2;
+    const int box_y = TILEVIEW_Y + (TILEVIEW_H - FADER_BOX_H) / 2;
+
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, FADER_BOX_W, FADER_BOX_H);
+    lv_obj_set_pos(box, box_x, box_y);
+    lv_obj_set_style_pad_all(box, FADER_BOX_PAD, 0);
+    // Subtle outline so the master reads as a separate group from the
+    // input strips. Same accent the reorder mode uses but at lower opacity
+    // so it's a visual hint, not a "this is selected" cue.
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(0xE0C040), 0);
+    lv_obj_set_style_border_opa(box, LV_OPA_50, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    // Hidden by default — ms_apply_async / present_channels reveals it on
+    // the next CONNECTED transition. Mirrors s_tileview's behavior so the
+    // master doesn't show stale values during boot / outage.
+    lv_obj_add_flag(box, LV_OBJ_FLAG_HIDDEN);
+    s_master_widgets.box = box;
+
+    lv_obj_t *name = lv_label_create(box);
+    lv_label_set_text(name, m.name[0] ? m.name : "Master");
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(name, FADER_BOX_W - 2 * FADER_BOX_PAD);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
+    s_master_widgets.label_name = name;
+
+    lv_obj_t *slider = lv_slider_create(box);
+    lv_slider_set_range(slider, 0, 100);
+    lv_slider_set_value(slider, (int)(m.level * 100.0f), LV_ANIM_OFF);
+    lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
+    // Master always reads as the unity-gain accent color — no per-channel
+    // color tag for the master since there's only one of it visible at a
+    // time. Yellow matches the box outline so the master strip reads as a
+    // single visual group.
+    lv_color_t bar  = lv_color_hex(0xE0C040);
+    lv_color_t knob = lv_color_darken(bar, 60);
+    lv_obj_set_style_bg_color(slider, bar,  LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, knob, LV_PART_KNOB);
+    lv_obj_add_event_cb(slider, on_master_slider_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider, on_master_slider_released,
+                        LV_EVENT_RELEASED, NULL);
+    s_master_widgets.slider = slider;
+
+    // 0 dB unity tick to mirror the input strips.
+    lv_obj_t *tick = lv_obj_create(box);
+    lv_obj_set_size(tick, 12, 2);
+    lv_obj_set_style_bg_color(tick, lv_color_hex(0xC0C0C0), 0);
+    lv_obj_set_style_border_width(tick, 0, 0);
+    lv_obj_set_style_pad_all(tick, 0, 0);
+    lv_obj_clear_flag(tick, LV_OBJ_FLAG_SCROLLABLE);
+    int tick_y_off = (int)((0.5f - NORM_AT_0DB) * (float) SLIDER_H);
+    lv_obj_align(tick, LV_ALIGN_CENTER, SLIDER_W / 2 + 10, tick_y_off);
+
+    lv_obj_t *btn_mute = lv_button_create(box);
+    lv_obj_set_size(btn_mute, MUTE_BTN_W, MUTE_BTN_H);
+    lv_obj_align(btn_mute, LV_ALIGN_BOTTOM_MID, 0, -28);
+    lv_obj_set_style_bg_color(btn_mute, lv_color_hex(0xC00000), LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(btn_mute, lv_color_hex(0x303030), LV_STATE_DEFAULT);
+    lv_obj_t *btn_label = lv_label_create(btn_mute);
+    lv_label_set_text(btn_label, "MUTE");
+    lv_obj_center(btn_label);
+    lv_obj_add_event_cb(btn_mute, on_master_mute_clicked, LV_EVENT_CLICKED, NULL);
+    s_master_widgets.btn_mute = btn_mute;
+    if (m.mute) lv_obj_add_state(btn_mute, LV_STATE_CHECKED);
+
+    lv_obj_t *val = lv_label_create(box);
+    lv_label_set_text(val, "0");
+    lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_text_font(val, &font_monmix_level, 0);
+    s_master_widgets.label_val = val;
 }
 
 static lv_obj_t *create_page_indicator(lv_obj_t *parent, size_t pages)
@@ -1027,6 +1227,7 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_align_to(s_spinner_label, s_spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 
     app_state_register_on_change(on_state_change, NULL);
+    app_state_master_register_on_change(on_master_state_change, NULL);
     app_prefs_register_on_change(on_prefs_change, NULL);
     app_wifi_register_on_change(on_wifi_state_change, NULL);
     if (s_ms && s_ms->register_on_change) {
@@ -1068,7 +1269,7 @@ void app_ui_present_channels(void)
         memset(s_page_tiles,  0, sizeof(s_page_tiles));
     } else {
         s_tileview = lv_tileview_create(lv_screen_active());
-        lv_obj_set_size(s_tileview, SCREEN_W, TILEVIEW_H);
+        lv_obj_set_size(s_tileview, TILEVIEW_W, TILEVIEW_H);
         lv_obj_set_pos(s_tileview, 0, TILEVIEW_Y);
         lv_obj_set_style_border_width(s_tileview, 0, 0);
         // Hidden by default — ms_apply_async unhides on the next transition
@@ -1103,7 +1304,7 @@ void app_ui_present_channels(void)
         lv_obj_set_style_border_width(tile, 0, 0);
         s_page_tiles[p] = tile;
 
-        const int slot_w = SCREEN_W / FADERS_PER_PAGE;
+        const int slot_w = TILEVIEW_W / FADERS_PER_PAGE;
         for (size_t slot = 0; slot < FADERS_PER_PAGE; ++slot) {
             size_t idx = p * FADERS_PER_PAGE + slot;
             if (idx >= total) break;
@@ -1115,6 +1316,19 @@ void app_ui_present_channels(void)
         s_page_indicator = create_page_indicator(lv_screen_active(), s_page_count);
     }
 
+    // Master strip lives outside the tileview (on the screen directly) so
+    // it survives lv_obj_clean(s_tileview) and doesn't need to rebuild on
+    // channel-list changes. Build once on first present; later calls are
+    // no-ops.
+    if (!s_master_widgets.box) {
+        build_master_strip(lv_screen_active());
+        // Initial paint follows the same dirty-flag path as live updates.
+        s_master_dirty = true;
+        if (lv_async_call(apply_pending, NULL) == LV_RESULT_OK) {
+            s_sweep_queued = true;
+        }
+    }
+
     apply_controls_enabled();
 
     // Sync the spinner ↔ tileview visibility with the current MS state.
@@ -1123,9 +1337,10 @@ void app_ui_present_channels(void)
     bool ms_connected = (s_ms && s_ms->get_state &&
                          s_ms->get_state() == APP_MS_STATE_CONNECTED);
     if (ms_connected) {
-        if (s_tileview)      lv_obj_remove_flag(s_tileview,      LV_OBJ_FLAG_HIDDEN);
-        if (s_spinner)       lv_obj_add_flag   (s_spinner,       LV_OBJ_FLAG_HIDDEN);
-        if (s_spinner_label) lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+        if (s_tileview)            lv_obj_remove_flag(s_tileview,      LV_OBJ_FLAG_HIDDEN);
+        if (s_master_widgets.box)  lv_obj_remove_flag(s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
+        if (s_spinner)             lv_obj_add_flag   (s_spinner,       LV_OBJ_FLAG_HIDDEN);
+        if (s_spinner_label)       lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
     }
 
     // The fader UI is now mounted; dismiss the boot splash. We leave the
@@ -3404,6 +3619,18 @@ static void apply_controls_enabled(void)
         }
     }
 
+    // Master strip — same gating as the per-channel strips.
+    if (s_master_widgets.slider) {
+        lv_obj_set_style_opa(s_master_widgets.slider,
+                             ms_ok ? LV_OPA_COVER : LV_OPA_50, 0);
+        if (ms_ok) lv_obj_add_flag   (s_master_widgets.slider, LV_OBJ_FLAG_CLICKABLE);
+        else       lv_obj_remove_flag(s_master_widgets.slider, LV_OBJ_FLAG_CLICKABLE);
+    }
+    if (s_master_widgets.btn_mute) {
+        lv_obj_set_style_opa(s_master_widgets.btn_mute,
+                             mute_ok ? LV_OPA_COVER : LV_OPA_50, 0);
+    }
+
     if (s_mute_en_btn) {
         if (s_mute_enabled) lv_obj_add_state   (s_mute_en_btn, LV_STATE_CHECKED);
         else                lv_obj_remove_state(s_mute_en_btn, LV_STATE_CHECKED);
@@ -3738,6 +3965,10 @@ static void ms_apply_async(void *unused)
     if (s_tileview) {
         if (ms_connected) lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);
         else              lv_obj_add_flag   (s_tileview, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_master_widgets.box) {
+        if (ms_connected) lv_obj_remove_flag(s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag   (s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_spinner) {
         if (ms_connected) lv_obj_add_flag   (s_spinner, LV_OBJ_FLAG_HIDDEN);

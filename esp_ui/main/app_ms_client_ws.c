@@ -128,6 +128,8 @@ static bool ws_start(void);
 static void ws_set_level(int ms_channel_id, float level);
 static void ws_set_mute (int ms_channel_id, bool mute);
 static void ws_set_name (int ms_channel_id, const char *name);
+static void ws_set_master_level(float level);
+static void ws_set_master_mute (bool mute);
 static void ws_stop(void);
 static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data);
 static void send_envelope(const char *method, const char *path, const char *body_json);
@@ -225,6 +227,8 @@ static const ms_client_iface_t s_iface = {
     .get_mix_name       = ws_get_mix_name,
     .resubscribe        = ws_resubscribe,
     .reconnect          = ws_reconnect,
+    .set_master_level   = ws_set_master_level,
+    .set_master_mute    = ws_set_master_mute,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -528,6 +532,48 @@ static void ws_set_level(int ms_channel_id, float level)
     }
 }
 
+// Master = the mix-bus's own channel id (s_mix_offset + s_mix_bus_idx).
+// Returns -1 when the mix layout hasn't been set yet (boot before
+// /console/information arrives).
+static int master_channel_id(void)
+{
+    if (s_mix_count <= 0)              return -1;
+    if (s_mix_bus_idx >= s_mix_count)  return -1;
+    return s_mix_offset + s_mix_bus_idx;
+}
+
+static void ws_set_master_level(float level)
+{
+    if (level < 0.0f) level = 0.0f;
+    if (level > 1.0f) level = 1.0f;
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
+    int id = master_channel_id();
+    if (id < 0) return;
+
+    char path[64];
+    snprintf(path, sizeof(path),
+             "/console/data/set/ch.%d.mix.lvl/norm", id);
+    char body[48];
+    snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)level);
+    send_envelope("POST", path, body);
+}
+
+static void ws_set_master_mute(bool mute)
+{
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
+    int id = master_channel_id();
+    if (id < 0) return;
+
+    char path[64];
+    snprintf(path, sizeof(path),
+             "/console/data/set/ch.%d.mix.on/val", id);
+    // MS `.on` true = audible; we expose `mute` as the user-facing bool
+    // (true = silenced) so flip on the wire — same convention as input
+    // strips, see ws_set_mute.
+    const char *body = mute ? "{\"value\":false}" : "{\"value\":true}";
+    send_envelope("POST", path, body);
+}
+
 static void ws_set_mute(int ms_channel_id, bool mute)
 {
     if (!s_ws || !esp_websocket_client_is_connected(s_ws)) {
@@ -644,8 +690,28 @@ static void on_connected_subscribe_all(void)
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
         subscribe_path(dotted, "val");
     }
-    ESP_LOGI(TAG, "subscribed %d channels + %d mix names",
-             (int) app_state_count(), s_mix_count);
+
+    // Master strip — the mix bus's own output. Path shape differs from
+    // input strips: `ch.<N>.mix.lvl` (norm only — there's no `level`
+    // alias on the master, see repro_ms_master_fader.py findings) and
+    // `ch.<N>.mix.on`. Master `cfg.name` subscription is already covered
+    // by the mix-name loop above. Re-aimed at the new id on every
+    // set_mix via ws_resubscribe → here.
+    int master_id = master_channel_id();
+    if (master_id >= 0) {
+        char dotted[32];
+        snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", master_id);
+        subscribe_path(dotted, "norm");
+        snprintf(dotted, sizeof(dotted), "ch.%d.mix.on", master_id);
+        subscribe_path(dotted, "val");
+        // Hand the id to app_state so the master-state's mute/level
+        // notifications carry the right channel context. Clears stale
+        // values on a mix change.
+        app_state_master_set_id(master_id);
+    }
+
+    ESP_LOGI(TAG, "subscribed %d channels + %d mix names + master(ch.%d)",
+             (int) app_state_count(), s_mix_count, master_id);
 }
 
 static void handle_broadcast(const char *json, size_t len)
@@ -725,6 +791,28 @@ static void handle_broadcast(const char *json, size_t len)
                     sizeof(s_mix_names[mix_idx]) - 1);
             s_mix_names[mix_idx][sizeof(s_mix_names[mix_idx]) - 1] = '\0';
             notify_subscribers();
+        }
+        // Master strip name follows the active mix's cfg.name. The cache
+        // above keeps the picker labels current; this branch keeps the
+        // visible master strip's name in sync.
+        if (ch == master_channel_id()) {
+            app_state_master_set_name(jvalue->valuestring, true);
+        }
+    }
+
+    // Master strip values: ch.<N>.mix.<lvl|on>. Filter by current master id
+    // — old subs from a prior mix can still fire (true unsubscribe is a
+    // follow-up, same caveat as the per-channel re-subscribe note in
+    // ws_set_mix). lvl arrives as norm only; master has no `level` alias
+    // (verified in repro_ms_master_fader.py) so dB-format readout falls
+    // back to the slider percent in app_ui.
+    if (sscanf(dotted, "ch.%d.mix.%15s", &ch, suffix) == 2 &&
+        ch == master_channel_id()) {
+        if (strcmp(suffix, "lvl") == 0 && cJSON_IsNumber(jvalue)) {
+            app_state_master_set_level((float)jvalue->valuedouble, true);
+        } else if (strcmp(suffix, "on") == 0 && cJSON_IsBool(jvalue)) {
+            bool ms_on = cJSON_IsTrue(jvalue);
+            app_state_master_set_mute(!ms_on, true);
         }
     }
 
