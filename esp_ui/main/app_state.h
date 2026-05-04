@@ -29,4 +29,9 @@ void app_state_set_mute(size_t idx, bool mute, bool notify);
 int app_state_idx_for_id(int ms_channel_id);
 int app_state_id_for_idx(size_t idx);
 
+// Swap two slots in the channel array. Used by the drag-to-reorder UI to
+// keep app_state aligned with the working ids while the user is mid-drag,
+// so live MS broadcasts indexed by id still land in the right slot.
+void app_state_swap_slots(size_t a, size_t b);
+
 void app_state_register_on_change(app_state_on_change_t cb, void *ctx);
