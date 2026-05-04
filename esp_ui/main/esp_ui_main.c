@@ -141,15 +141,33 @@ void app_main(void)
         ms->set_mix_layout(info.mix_offset, info.mix_count);
     }
 
+    // P11: REST-fetch ch.<N>.info.isActive for every mix bus before the
+    // saved-index validation below. The WS subscribe path keeps the mask
+    // live afterwards; this synchronous prime is just so the boot path
+    // can see un-routed mixes the user must be steered away from.
+    if (info_ok && info.mix_count > 0 && ms->fetch_mix_routing) {
+        ms->fetch_mix_routing();
+    }
+
     // Restore the user's last selected mix bus. If the saved index is out
     // of range for the connected console (e.g. they previously paired with
-    // a board that had more mixes), fall back to mix 0 and persist the
-    // fallback so the next reboot sees the corrected value.
+    // a board that had more mixes), or it points at a now-unrouted mix in
+    // MS (P11), fall back to the first routed mix and persist the fallback
+    // so the next reboot sees the corrected value.
     if (info_ok && info.mix_count > 0) {
         uint8_t saved = app_prefs_get_selected_mix_index();
-        if (saved >= info.mix_count) {
-            app_prefs_set_selected_mix_index(0);
-            saved = 0;
+        bool out_of_range = saved >= info.mix_count;
+        bool unrouted = !out_of_range && ms->is_mix_routed &&
+                        !ms->is_mix_routed(saved);
+        if (out_of_range || unrouted) {
+            uint8_t fallback = 0;
+            if (ms->is_mix_routed) {
+                for (int i = 0; i < info.mix_count; ++i) {
+                    if (ms->is_mix_routed(i)) { fallback = (uint8_t) i; break; }
+                }
+            }
+            app_prefs_set_selected_mix_index(fallback);
+            saved = fallback;
         }
         if (ms->set_mix) ms->set_mix(saved);
     }
