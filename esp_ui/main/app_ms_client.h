@@ -44,6 +44,21 @@ typedef struct {
     // "Mix <idx+1>" when NULL.
     const char *(*get_mix_name)(int mix_idx);
 
+    // P11: routed-mix filter. MS exposes ch.<mix_offset+i>.info.isActive
+    // (bool) per mix bus; only the routed ones should appear in the
+    // selector. Returns true if the layout hasn't been populated yet so
+    // callers don't accidentally hide everything before discovery
+    // completes -- esp_ui_main forces a synchronous REST fetch before
+    // boot-time validation runs.
+    bool (*is_mix_routed)(int mix_idx);
+
+    // Synchronously REST-fetch the routed (info.isActive) mask for every
+    // mix bus in the current layout. Called once from app_main between
+    // set_mix_layout and the saved-index validation so the boot path
+    // doesn't see an empty mask. The WS subscribe path keeps it live
+    // afterwards.
+    void (*fetch_mix_routing)(void);
+
     // Re-subscribe every tracked channel under the current mix bus. Used
     // by the discovery flow after reseeding app_state. No-op when the WS
     // isn't connected.

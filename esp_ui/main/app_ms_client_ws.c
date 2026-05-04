@@ -51,6 +51,11 @@ static int  s_mix_offset;
 static int  s_mix_count;
 EXT_RAM_BSS_ATTR static char s_mix_names[MAX_MIX_BUSES][32];
 
+// P11: per-mix routing flag from ch.<mix_offset+i>.info.isActive. Default
+// true so a stale state never accidentally hides every mix before the
+// REST fetch (or initial WS broadcast) populates it.
+static bool s_mix_routed[MAX_MIX_BUSES] = { [0 ... MAX_MIX_BUSES - 1] = true };
+
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
 
@@ -96,6 +101,24 @@ static int64_t s_pending_set_at_us[APP_CONFIG_MAX_CHANNELS];
 static float   s_pending_set_value[APP_CONFIG_MAX_CHANNELS];
 static int     s_pending_set_mix  [APP_CONFIG_MAX_CHANNELS];
 static uint8_t s_pending_resends  [APP_CONFIG_MAX_CHANNELS];
+
+// Shared sink for the small REST GETs (poll watchdog + P11 routing fetch).
+typedef struct {
+    char   buf[POLL_HTTP_BUF_LEN];
+    size_t len;
+} poll_sink_t;
+
+static esp_err_t poll_http_event(esp_http_client_event_t *evt)
+{
+    poll_sink_t *sink = (poll_sink_t *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && evt->data && evt->data_len > 0) {
+        if (sink->len + (size_t) evt->data_len < sizeof(sink->buf)) {
+            memcpy(sink->buf + sink->len, evt->data, evt->data_len);
+            sink->len += evt->data_len;
+        }
+    }
+    return ESP_OK;
+}
 
 static void notify_subscribers(void)
 {
@@ -172,6 +195,66 @@ static const char *ws_get_mix_name(int mix_idx)
     return s_mix_names[mix_idx];
 }
 
+static bool ws_is_mix_routed(int mix_idx)
+{
+    if (mix_idx < 0 || mix_idx >= MAX_MIX_BUSES) return false;
+    return s_mix_routed[mix_idx];
+}
+
+// P11: blocking REST GET of ch.<N>.info.isActive for one mix bus. Returns
+// true on 200 + parseable {"value":<bool>} body.
+static bool fetch_one_routing(int ch_idx, bool *out_active)
+{
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://%s:%u/console/data/get/ch.%d.info.isActive/val",
+             app_config_ms_host(), (unsigned) app_config_ms_port(), ch_idx);
+
+    poll_sink_t sink = {0};
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = poll_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = POLL_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200 || sink.len == 0) return false;
+    sink.buf[sink.len < sizeof(sink.buf) ? sink.len : sizeof(sink.buf) - 1] = '\0';
+
+    cJSON *root = cJSON_Parse(sink.buf);
+    if (!root) return false;
+    cJSON *jv = cJSON_GetObjectItem(root, "value");
+    bool ok = cJSON_IsBool(jv);
+    if (ok) *out_active = cJSON_IsTrue(jv);
+    cJSON_Delete(root);
+    return ok;
+}
+
+// P11: one-shot REST sweep over the mix layout. Called from app_main right
+// after set_mix_layout so the saved-index validation can see the routed
+// mask before WS subscribes wire it up live.
+static void ws_fetch_mix_routing(void)
+{
+    if (s_mix_count <= 0) return;
+    for (int i = 0; i < s_mix_count && i < MAX_MIX_BUSES; ++i) {
+        bool active = true;
+        if (fetch_one_routing(s_mix_offset + i, &active)) {
+            s_mix_routed[i] = active;
+        }
+    }
+    int routed = 0;
+    for (int i = 0; i < s_mix_count && i < MAX_MIX_BUSES; ++i) {
+        if (s_mix_routed[i]) routed++;
+    }
+    ESP_LOGI(TAG, "mix routing: %d/%d active", routed, s_mix_count);
+    notify_subscribers();
+}
+
 static bool ws_create_and_start(void);  // fwd
 
 static void ws_reconnect(void)
@@ -223,6 +306,8 @@ static const ms_client_iface_t s_iface = {
     .set_mix            = ws_set_mix,
     .set_mix_layout     = ws_set_mix_layout,
     .get_mix_name       = ws_get_mix_name,
+    .is_mix_routed      = ws_is_mix_routed,
+    .fetch_mix_routing  = ws_fetch_mix_routing,
     .resubscribe        = ws_resubscribe,
     .reconnect          = ws_reconnect,
 };
@@ -357,23 +442,6 @@ static void ws_watchdog_task(void *arg)
 
 // P8: REST GET the current `lvl` for one channel/mix and parse the value.
 // Returns true + writes *out_level on 200 OK with a numeric body.value.
-typedef struct {
-    char   buf[POLL_HTTP_BUF_LEN];
-    size_t len;
-} poll_sink_t;
-
-static esp_err_t poll_http_event(esp_http_client_event_t *evt)
-{
-    poll_sink_t *sink = (poll_sink_t *) evt->user_data;
-    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && evt->data && evt->data_len > 0) {
-        if (sink->len + (size_t) evt->data_len < sizeof(sink->buf)) {
-            memcpy(sink->buf + sink->len, evt->data, evt->data_len);
-            sink->len += evt->data_len;
-        }
-    }
-    return ESP_OK;
-}
-
 static bool poll_fetch_level(int ms_channel_id, int mix_idx, float *out_level)
 {
     char url[128];
@@ -644,6 +712,14 @@ static void on_connected_subscribe_all(void)
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
         subscribe_path(dotted, "val");
     }
+    // P11: routed-mix flag per bus. The picker hides un-routed mixes;
+    // boot-time validation falls back to the first routed mix if the
+    // saved index is no longer routed.
+    for (int i = 0; i < s_mix_count; ++i) {
+        char dotted[40];
+        snprintf(dotted, sizeof(dotted), "ch.%d.info.isActive", s_mix_offset + i);
+        subscribe_path(dotted, "val");
+    }
     ESP_LOGI(TAG, "subscribed %d channels + %d mix names",
              (int) app_state_count(), s_mix_count);
 }
@@ -725,6 +801,20 @@ static void handle_broadcast(const char *json, size_t len)
                     sizeof(s_mix_names[mix_idx]) - 1);
             s_mix_names[mix_idx][sizeof(s_mix_names[mix_idx]) - 1] = '\0';
             notify_subscribers();
+        }
+    }
+
+    // P11: ch.<N>.info.isActive flips the routed-mix mask. Notify so the
+    // picker rebuilds with the new routed set.
+    if (sscanf(dotted, "ch.%d.info.isActive", &ch) == 1 && cJSON_IsBool(jvalue)) {
+        if (s_mix_count > 0 && ch >= s_mix_offset &&
+            ch < s_mix_offset + s_mix_count && ch - s_mix_offset < MAX_MIX_BUSES) {
+            int mix_idx = ch - s_mix_offset;
+            bool active = cJSON_IsTrue(jvalue);
+            if (s_mix_routed[mix_idx] != active) {
+                s_mix_routed[mix_idx] = active;
+                notify_subscribers();
+            }
         }
     }
 

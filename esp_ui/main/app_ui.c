@@ -167,6 +167,10 @@ static lv_obj_t *s_mix_picker_popup;
 // per-channel arrays similarly.
 EXT_RAM_BSS_ATTR static lv_obj_t *s_mix_picker_btn_labels[24];
 static int       s_mix_count;            // 0 = popup not yet usable
+// P11: snapshot of the routed-mix mask the popup was last built against.
+// When the live MS routing changes, ms_apply_async tears down the popup so
+// the next open rebuilds it with the new layout.
+static uint32_t  s_picker_routed_mask;
 
 // Rename popup — full-screen modal with a textarea + on-screen keyboard
 // for editing a channel's scribble-strip name. The same popup is reused
@@ -1910,14 +1914,25 @@ static void build_mix_picker_popup(void)
 {
     lv_obj_t *scr = lv_screen_active();
 
-    // 4-column grid; cols × rows sized to fit the current mix count.
+    // P11: count routed mixes only; un-routed ones get skipped entirely
+    // so the user can't pick a mix that MS won't honor. The underlying
+    // mix index (i) is still passed to on_mix_choice -- the user sees
+    // "Mix 5" not "Mix 3" when 1/2 are unrouted, the picker just hides
+    // those rows.
+    bool has_routed_query = (s_ms && s_ms->is_mix_routed);
+    int routed_n = 0;
+    for (int i = 0; i < s_mix_count; ++i) {
+        if (!has_routed_query || s_ms->is_mix_routed(i)) routed_n++;
+    }
+
+    // 4-column grid; cols × rows sized to fit the routed mix count.
     const int btn_w  = 110;
     const int btn_h  = 50;
     const int gap    = 10;
     const int pad    = 20;
     const int header = 40;
     const int cols   = 4;
-    int rows         = (s_mix_count + cols - 1) / cols;
+    int rows         = (routed_n + cols - 1) / cols;
     if (rows < 1) rows = 1;
 
     int inner_w = cols * btn_w + (cols - 1) * gap;
@@ -1947,11 +1962,22 @@ static void build_mix_picker_popup(void)
     lv_obj_add_event_cb(close_btn, on_mix_picker_close_clicked,
                         LV_EVENT_CLICKED, NULL);
 
+    // Snapshot the routed mask the grid was built against so ms_apply_async
+    // can detect a change and force a rebuild on next open.
+    uint32_t mask = 0;
+    for (int i = 0; i < s_mix_count && i < 32; ++i) {
+        if (!has_routed_query || s_ms->is_mix_routed(i)) mask |= (1u << i);
+    }
+    s_picker_routed_mask = mask;
+
+    int slot = 0;  // grid position; advances only for routed mixes
     for (int i = 0; i < s_mix_count; ++i) {
-        int row = i / cols;
-        int col = i % cols;
+        if (has_routed_query && !s_ms->is_mix_routed(i)) continue;
+        int row = slot / cols;
+        int col = slot % cols;
         int x   = col * (btn_w + gap);
         int y   = header + row * (btn_h + gap);
+        slot++;
 
         lv_obj_t *btn = lv_button_create(p);
         lv_obj_set_size(btn, btn_w, btn_h);
@@ -1966,6 +1992,9 @@ static void build_mix_picker_popup(void)
         lv_obj_center(lbl);
         lv_obj_add_event_cb(btn, on_mix_choice, LV_EVENT_CLICKED,
                             (void *)(intptr_t) i);
+        // s_mix_picker_btn_labels is indexed by the underlying mix index
+        // so mix_picker_refresh_labels can match name broadcasts back to
+        // the right button without tracking a parallel slot table.
         if (i < (int)(sizeof(s_mix_picker_btn_labels) /
                        sizeof(s_mix_picker_btn_labels[0]))) {
             s_mix_picker_btn_labels[i] = lbl;
@@ -3755,6 +3784,21 @@ static void ms_apply_async(void *unused)
     (void)unused;
     ms_icon_refresh();
     mix_indicator_refresh();
+    // P11: routed-set changes invalidate the picker grid (mix-row count
+    // and ordering depends on the mask). Tear down so the next open
+    // rebuilds — rare event, the heap-churn comment below applies to
+    // per-broadcast updates not routing flips.
+    if (s_mix_picker_popup && s_ms && s_ms->is_mix_routed) {
+        uint32_t live_mask = 0;
+        for (int i = 0; i < s_mix_count && i < 32; ++i) {
+            if (s_ms->is_mix_routed(i)) live_mask |= (1u << i);
+        }
+        if (live_mask != s_picker_routed_mask) {
+            lv_obj_delete(s_mix_picker_popup);
+            s_mix_picker_popup = NULL;
+            memset(s_mix_picker_btn_labels, 0, sizeof(s_mix_picker_btn_labels));
+        }
+    }
     // Update labels in place rather than tearing down the popup. The
     // earlier "delete on every notify" pattern accumulated heap churn
     // (~31 LVGL widgets per rebuild × every mix change) and after a
