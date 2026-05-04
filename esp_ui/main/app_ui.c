@@ -965,9 +965,12 @@ void app_ui_init(const ms_client_iface_t *ms)
 
     // Mix-bus indicator — left of the MS icon. Shows the active mix label
     // ("Mix N"); tap opens the selector popup. Hidden until app_main tells
-    // us how many mixes the connected console exposes.
+    // us how many mixes the connected console exposes. Width is content-
+    // sized with a 90 px floor so long names ("STAGE LEFT MONITOR MIX")
+    // don't overflow; right edge is anchored, growth pushes left.
     s_mix_indicator = lv_button_create(scr);
-    lv_obj_set_size(s_mix_indicator, 90, 28);
+    lv_obj_set_size(s_mix_indicator, LV_SIZE_CONTENT, 28);
+    lv_obj_set_style_min_width(s_mix_indicator, 90, 0);
     lv_obj_align(s_mix_indicator, LV_ALIGN_TOP_RIGHT, -118, 2);
     s_mix_indicator_label = lv_label_create(s_mix_indicator);
     lv_label_set_text(s_mix_indicator_label, "Mix 1");
