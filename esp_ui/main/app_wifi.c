@@ -1,6 +1,7 @@
 #include "app_wifi.h"
 #include "app_config.h"
 #include "app_logd.h"
+#include "app_prefs.h"
 #include "app_ui.h"
 
 #include <stdio.h>
@@ -13,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "app_wifi";
 
@@ -118,6 +120,9 @@ void app_wifi_init_radio(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+    // NB: app_wifi_apply_ip_config() runs from app_main AFTER app_prefs_init.
+    // We can't call it here -- this function runs before prefs are loaded
+    // (the SDMMC singleton forces this order, see CLAUDE.md).
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
@@ -126,6 +131,98 @@ bool app_wifi_wait_connected(void)
     EventBits_t bits = xEventGroupWaitBits(s_evt, BIT_CONNECTED | BIT_FAILED,
                                            pdFALSE, pdFALSE, portMAX_DELAY);
     return (bits & BIT_CONNECTED) != 0;
+}
+
+// Locate the default STA netif by description. Created in app_wifi_init_radio
+// via esp_netif_create_default_wifi_sta(). Single instance for our app.
+static esp_netif_t *sta_netif(void)
+{
+    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+}
+
+void app_wifi_apply_ip_config(void)
+{
+    esp_netif_t *netif = sta_netif();
+    if (!netif) {
+        ESP_LOGW(TAG, "apply_ip_config: STA netif missing");
+        return;
+    }
+
+    if (!app_prefs_get_wifi_use_static()) {
+        // Default path -- DHCP. Calling start on an already-running client is
+        // a no-op + ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED, which is fine.
+        esp_netif_dhcpc_start(netif);
+        return;
+    }
+
+    char ip[APP_PREFS_IP_STR_MAX];
+    char nm[APP_PREFS_IP_STR_MAX];
+    char gw[APP_PREFS_IP_STR_MAX];
+    char dns[APP_PREFS_IP_STR_MAX];
+    app_prefs_get_wifi_static_ip     (ip,  sizeof(ip));
+    app_prefs_get_wifi_static_netmask(nm,  sizeof(nm));
+    app_prefs_get_wifi_static_gateway(gw,  sizeof(gw));
+    app_prefs_get_wifi_static_dns    (dns, sizeof(dns));
+
+    esp_netif_ip_info_t info = {0};
+    info.ip.addr      = ipaddr_addr(ip);
+    info.netmask.addr = ipaddr_addr(nm);
+    info.gw.addr      = ipaddr_addr(gw);
+    if (info.ip.addr == IPADDR_NONE || info.netmask.addr == IPADDR_NONE) {
+        ESP_LOGW(TAG, "static-ip prefs incomplete (ip='%s' nm='%s'); falling back to DHCP",
+                 ip, nm);
+        esp_netif_dhcpc_start(netif);
+        return;
+    }
+    // Stop DHCP before set_ip_info -- esp_netif refuses to overwrite the
+    // ip while DHCP is running.
+    esp_netif_dhcpc_stop(netif);
+    esp_err_t err = esp_netif_set_ip_info(netif, &info);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_ip_info failed: %s; falling back to DHCP",
+                 esp_err_to_name(err));
+        esp_netif_dhcpc_start(netif);
+        return;
+    }
+    if (dns[0] != '\0') {
+        esp_netif_dns_info_t d = {0};
+        d.ip.type = ESP_IPADDR_TYPE_V4;
+        d.ip.u_addr.ip4.addr = ipaddr_addr(dns);
+        if (d.ip.u_addr.ip4.addr != IPADDR_NONE) {
+            esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &d);
+        }
+    }
+    ESP_LOGI(TAG, "static ip applied: %s/%s gw=%s dns=%s", ip, nm, gw, dns);
+}
+
+bool app_wifi_reconfigure(void)
+{
+    // Re-pick the latest creds + IP config. Disconnect first so the driver
+    // isn't sitting on a half-applied state when we push the new config.
+    s_retry = 0;
+    set_state(APP_WIFI_STATE_CONNECTING);
+
+    wifi_config_t cfg = {0};
+    const char *ssid = app_config_wifi_ssid();
+    const char *pass = app_config_wifi_pass();
+    memcpy(cfg.sta.ssid,     ssid, strlen(ssid));
+    memcpy(cfg.sta.password, pass, strlen(pass));
+
+    // Returning errors here is unusual -- esp_wifi_disconnect on a not-yet-
+    // connected client returns ESP_ERR_WIFI_NOT_CONNECT, harmless.
+    esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "set_config failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    app_wifi_apply_ip_config();
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "connect failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 app_wifi_state_t app_wifi_get_state(void)

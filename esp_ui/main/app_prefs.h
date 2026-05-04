@@ -72,6 +72,28 @@ void    app_prefs_set_brightness_pct(uint8_t pct);
 int  app_prefs_get_channel_color(int ms_channel_id);
 void app_prefs_set_channel_color(int ms_channel_id, int index);
 
+// WiFi static IP toggle + dotted-quad strings. When the toggle is false the
+// IP / netmask / gateway / DNS values are ignored and DHCP runs as usual.
+// Strings are stored as IPv4 dotted form ("192.168.1.50"); empty string
+// means "fall back to a sensible default" (zeros). Max in-buffer length is
+// 16 (15 chars + NUL).
+#define APP_PREFS_IP_STR_MAX 16
+
+bool app_prefs_get_wifi_use_static(void);
+void app_prefs_set_wifi_use_static(bool on);
+
+// Each getter writes into the caller's buffer (must be APP_PREFS_IP_STR_MAX
+// or larger) and returns the same pointer; the value is "" when the pref
+// isn't set. Setters reject values longer than 15 chars.
+const char *app_prefs_get_wifi_static_ip      (char *out, size_t out_len);
+const char *app_prefs_get_wifi_static_netmask (char *out, size_t out_len);
+const char *app_prefs_get_wifi_static_gateway (char *out, size_t out_len);
+const char *app_prefs_get_wifi_static_dns     (char *out, size_t out_len);
+void        app_prefs_set_wifi_static_ip      (const char *s);
+void        app_prefs_set_wifi_static_netmask (const char *s);
+void        app_prefs_set_wifi_static_gateway (const char *s);
+void        app_prefs_set_wifi_static_dns     (const char *s);
+
 // Subscribe to pref changes -- typically the UI registers once at init
 // time and re-reads whatever it cares about on each notification.
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx);

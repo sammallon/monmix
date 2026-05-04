@@ -23,6 +23,20 @@ void app_wifi_init_radio(void);
 // Returns true on connect, false on permanent failure.
 bool app_wifi_wait_connected(void);
 
+// Apply the persisted DHCP/static-IP choice from app_prefs to the default
+// STA netif. Safe to call before or after esp_wifi_start. When static is on
+// and any of ip/netmask/gateway are empty or invalid the call falls back to
+// DHCP (so a half-filled form can't strand the device). DNS is best-effort.
+void app_wifi_apply_ip_config(void);
+
+// Live reconfigure: pick up the latest SSID/password/static-IP prefs and
+// trigger a clean disconnect+reconnect WITHOUT a reboot. Per memory
+// reference_c6_wedge_workaround the disconnect+connect path is the
+// known-working sequence to land a new wifi_config on a running C6.
+// Returns true if the dispatch succeeded; the caller still needs to watch
+// app_wifi_get_state() to see whether association lands.
+bool app_wifi_reconfigure(void);
+
 // Live status — safe to call from any task. The IP buffer must hold at
 // least 16 bytes ("xxx.xxx.xxx.xxx\0"); written even when state is not
 // CONNECTED (in which case it's set to "0.0.0.0").
