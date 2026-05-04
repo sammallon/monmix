@@ -126,3 +126,94 @@ void app_state_register_on_change(app_state_on_change_t cb, void *ctx)
     s_on_change     = cb;
     s_on_change_ctx = ctx;
 }
+
+// Master strip — singleton, separate from the per-fader array because the
+// MS path shape (`ch.<N>.mix.*`) and the channel id (a mix bus, not an
+// input) don't fit the existing array idiom. Its own dirty/notify path so
+// the master strip widget can be redrawn independently of the fader
+// tileview.
+static app_channel_t                 s_master = { .id = -1, .level_db = -200.0f };
+static SemaphoreHandle_t             s_master_mutex;
+static app_state_master_on_change_t  s_master_on_change;
+static void                         *s_master_on_change_ctx;
+
+static void master_lock(void)
+{
+    if (!s_master_mutex) s_master_mutex = xSemaphoreCreateMutex();
+    xSemaphoreTake(s_master_mutex, portMAX_DELAY);
+}
+
+static void master_unlock(void)
+{
+    xSemaphoreGive(s_master_mutex);
+}
+
+bool app_state_master_get(app_channel_t *out)
+{
+    if (!out) return false;
+    master_lock();
+    *out = s_master;
+    master_unlock();
+    return true;
+}
+
+void app_state_master_set_id(int ms_channel_id)
+{
+    master_lock();
+    if (s_master.id != ms_channel_id) {
+        // New mix — clear the cached values so a stale level/name doesn't
+        // flash on the strip while subscriptions for the new id are in flight.
+        s_master.id       = ms_channel_id;
+        s_master.level    = 0.0f;
+        s_master.level_db = -200.0f;
+        s_master.mute     = false;
+        snprintf(s_master.name, sizeof(s_master.name), "Master");
+    }
+    master_unlock();
+    if (s_master_on_change) s_master_on_change(s_master_on_change_ctx);
+}
+
+void app_state_master_set_level(float level, bool notify)
+{
+    if (level < 0.0f) level = 0.0f;
+    if (level > 1.0f) level = 1.0f;
+    master_lock();
+    s_master.level = level;
+    master_unlock();
+    if (notify && s_master_on_change) s_master_on_change(s_master_on_change_ctx);
+}
+
+void app_state_master_set_level_db(float db, bool notify)
+{
+    master_lock();
+    s_master.level_db = db;
+    master_unlock();
+    if (notify && s_master_on_change) s_master_on_change(s_master_on_change_ctx);
+}
+
+void app_state_master_set_name(const char *name, bool notify)
+{
+    if (!name) return;
+    master_lock();
+    strncpy(s_master.name, name, sizeof(s_master.name) - 1);
+    s_master.name[sizeof(s_master.name) - 1] = '\0';
+    master_unlock();
+    if (notify && s_master_on_change) s_master_on_change(s_master_on_change_ctx);
+}
+
+void app_state_master_set_mute(bool mute, bool notify)
+{
+    master_lock();
+    bool changed = (s_master.mute != mute);
+    s_master.mute = mute;
+    master_unlock();
+    if (notify && changed && s_master_on_change) {
+        s_master_on_change(s_master_on_change_ctx);
+    }
+}
+
+void app_state_master_register_on_change(app_state_master_on_change_t cb, void *ctx)
+{
+    s_master_on_change     = cb;
+    s_master_on_change_ctx = ctx;
+}

@@ -70,6 +70,13 @@ typedef struct {
     // values. Does NOT touch wifi -- the watchdog's wifi-reassoc path is
     // for stuck connections, not for normal config changes.
     void (*reconnect)(void);
+
+    // Master fader (mix-bus output) SET path. Master uses `ch.<N>.mix.lvl`
+    // and `ch.<N>.mix.on`, NOT the per-channel `levelData.<m>.*` paths.
+    // Channel id derives from current mix bus + mix offset; client owns
+    // the mapping so callers don't have to track the layout.
+    void (*set_master_level)(float level);
+    void (*set_master_mute) (bool mute);
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);
