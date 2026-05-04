@@ -267,6 +267,19 @@ bool app_display_init(void)
         return false;
     }
 
+    // Kill the LVGL pale-blue default screen bg before the first flush. There
+    // is a long visible gap between display power-on and the first widget
+    // being mounted (WiFi associate, MS info fetch, channel enumeration);
+    // without this the user stares at a bright pale-blue rectangle through
+    // the whole boot. 0x101010 matches the splash logo's baked bg so the
+    // logo blends seamlessly. Both light and dark default themes leave this
+    // alone -- they style children, not the active screen's bg directly.
+    if (lvgl_port_lock(0)) {
+        lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x101010), 0);
+        lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);
+        lvgl_port_unlock();
+    }
+
     // Rotation is user-configurable (0 or 180). LVGL applies the inverse
     // transform to touch coordinates automatically when an indev shares the
     // display, so registering the GT911 below picks the rotation up for free

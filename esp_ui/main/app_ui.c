@@ -23,6 +23,14 @@
 
 static const char *TAG = "app_ui";
 
+// Splash screen logo. Shown over the dark screen bg during boot until the
+// fader UI mounts (i.e. until app_ui_present_channels finishes). Without
+// this the user sees a long blank period between display init and the first
+// real widget; the splash gives them something branded to look at.
+LV_IMAGE_DECLARE(splash_logo);
+static lv_obj_t *s_splash_screen;
+static lv_obj_t *s_splash_logo_img;
+
 // Layout:
 //   1024x600 panel (LVGL software-rotated 180°). Each "page" is one tile in
 //   an lv_tileview. 12 faders fit across 1024 px (~85 px slot, 72 px box):
@@ -904,6 +912,23 @@ void app_ui_init(const ms_client_iface_t *ms)
 
     lv_obj_t *scr = lv_screen_active();
 
+    // Splash: full-screen near-black overlay with the logo centered. Built
+    // first so all subsequent widgets land underneath; we explicitly bring
+    // it back to the foreground in case any later object claims top z-order.
+    // Hidden in app_ui_present_channels once the real fader UI is mounted.
+    s_splash_screen = lv_obj_create(scr);
+    lv_obj_set_size(s_splash_screen, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_splash_screen, 0, 0);
+    lv_obj_set_style_bg_color(s_splash_screen, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(s_splash_screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_splash_screen, 0, 0);
+    lv_obj_set_style_radius(s_splash_screen, 0, 0);
+    lv_obj_set_style_pad_all(s_splash_screen, 0, 0);
+    lv_obj_clear_flag(s_splash_screen, LV_OBJ_FLAG_SCROLLABLE);
+    s_splash_logo_img = lv_image_create(s_splash_screen);
+    lv_image_set_src(s_splash_logo_img, &splash_logo);
+    lv_obj_center(s_splash_logo_img);
+
     // Status line at the top. app_wifi / ms_ws push updates here so the user
     // sees boot progress instead of a static screen.
     s_status_label = lv_label_create(scr);
@@ -1001,6 +1026,11 @@ void app_ui_init(const ms_client_iface_t *ms)
     ms_icon_refresh();
     apply_controls_enabled();
 
+    // Keep the splash on top of every shell widget built above. Faders are
+    // mounted later in app_ui_present_channels which dismisses the splash
+    // explicitly.
+    if (s_splash_screen) lv_obj_move_foreground(s_splash_screen);
+
     lvgl_port_unlock();
 
     ESP_LOGI(TAG, "UI shell mounted; awaiting channel enumeration");
@@ -1086,6 +1116,11 @@ void app_ui_present_channels(void)
         if (s_spinner)       lv_obj_add_flag   (s_spinner,       LV_OBJ_FLAG_HIDDEN);
         if (s_spinner_label) lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
     }
+
+    // The fader UI is now mounted; dismiss the boot splash. We leave the
+    // object alive so the LVGL theme doesn't have a half-decoded pointer in
+    // its parent list -- just hide it.
+    if (s_splash_screen) lv_obj_add_flag(s_splash_screen, LV_OBJ_FLAG_HIDDEN);
 
     lvgl_port_unlock();
 

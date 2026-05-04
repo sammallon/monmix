@@ -14,6 +14,7 @@ idf_component_register(
         "app_logd.c"
         "app_touch_inject.c"
         "app_prefs.c"
+        "images/splash_logo.c"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES
