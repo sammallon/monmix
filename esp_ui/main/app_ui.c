@@ -21,6 +21,12 @@
 #include "esp_timer.h"
 #include "lvgl.h"
 
+// Custom font for level labels — Montserrat 14 plus U+221E (infinity glyph)
+// so the floor reads "-INF" with the math symbol instead of the ASCII word.
+// Default LVGL Montserrat doesn't ship the glyph; only the level label uses
+// this font to keep the flash hit minimal.
+extern const lv_font_t font_monmix_level;
+
 static const char *TAG = "app_ui";
 
 // Layout:
@@ -495,12 +501,14 @@ static void apply_pending(void *unused)
         lv_slider_set_value(s_widgets[i].slider, v, LV_ANIM_OFF);
         char buf[12];
         if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
-            // MS reports min ≈ -138 dB on the Si Expression 2; display "-INF"
-            // there since the channel is effectively off. Above the floor we
-            // round to the nearest dB — a half-dB step is finer than the
-            // mixer's quantization, no need for decimals on a glance-readout.
+            // MS reports min ~= -138 dB on the Si Expression 2; display
+            // "-inf dB" there since the channel is effectively off. Above the
+            // floor we round to the nearest dB -- a half-dB step is finer
+            // than the mixer's quantization, no need for decimals on a
+            // glance-readout. Infinity glyph (U+221E) requires
+            // font_monmix_level set on the label by build_fader.
             if (ch.level_db <= -138.0f) {
-                snprintf(buf, sizeof(buf), "-INF");
+                snprintf(buf, sizeof(buf), "-\xe2\x88\x9e dB");
             } else {
                 snprintf(buf, sizeof(buf), "%.0f dB", ch.level_db);
             }
@@ -861,6 +869,9 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_t *val = lv_label_create(box);
     lv_label_set_text(val, "0");
     lv_obj_align(val, LV_ALIGN_BOTTOM_MID, 0, 0);
+    // Only the level label needs the extended Montserrat (infinity glyph for
+    // the floor case). Other labels stay on LV_FONT_DEFAULT.
+    lv_obj_set_style_text_font(val, &font_monmix_level, 0);
     s_widgets[idx].label_val = val;
 }
 
