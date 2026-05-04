@@ -201,57 +201,104 @@ static bool ws_is_mix_routed(int mix_idx)
     return s_mix_routed[mix_idx];
 }
 
-// P11: blocking REST GET of ch.<N>.info.isActive for one mix bus. Returns
-// true on 200 + parseable {"value":<bool>} body.
-static bool fetch_one_routing(int ch_idx, bool *out_active)
-{
-    char url[128];
-    snprintf(url, sizeof(url),
-             "http://%s:%u/console/data/get/ch.%d.info.isActive/val",
-             app_config_ms_host(), (unsigned) app_config_ms_port(), ch_idx);
+// P11: blocking REST GET of /console/mixTargets — the profile-aware list
+// of mix buses the current MS user view exposes. Returns true on 200 +
+// parseable body. Replaces the earlier per-mix info.isActive sweep,
+// which on this Si console always returns true regardless of profile.
+//
+// Response is up to a few KB on a full-profile fetch (14 mix targets +
+// 6 matrix + LR + Mono), so the per-poll 256-byte sink is too small;
+// use a heap-allocated 4 KB buffer scoped to this call.
+#define MIX_TARGETS_BUF_LEN 16384  // full-profile response on Si is ~6.5 KB; headroom
+typedef struct {
+    char   *buf;
+    size_t  cap;
+    size_t  len;
+} mt_sink_t;
 
-    poll_sink_t sink = {0};
+static esp_err_t mt_http_event(esp_http_client_event_t *evt)
+{
+    mt_sink_t *sink = (mt_sink_t *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && sink->buf) {
+        size_t room = sink->cap - 1 - sink->len;
+        if (room > 0) {
+            size_t n = (size_t) evt->data_len < room ? (size_t) evt->data_len : room;
+            memcpy(sink->buf + sink->len, evt->data, n);
+            sink->len += n;
+        }
+    }
+    return ESP_OK;
+}
+
+static bool fetch_mix_targets(bool routed_out[MAX_MIX_BUSES])
+{
+    char url[96];
+    snprintf(url, sizeof(url), "http://%s:%u/console/mixTargets",
+             app_config_ms_host(), (unsigned) app_config_ms_port());
+
+    mt_sink_t sink = { .buf = malloc(MIX_TARGETS_BUF_LEN),
+                       .cap = MIX_TARGETS_BUF_LEN, .len = 0 };
+    if (!sink.buf) return false;
+
     esp_http_client_config_t cfg = {
         .url           = url,
-        .event_handler = poll_http_event,
+        .event_handler = mt_http_event,
         .user_data     = &sink,
         .timeout_ms    = POLL_HTTP_TIMEOUT_MS,
     };
     esp_http_client_handle_t cli = esp_http_client_init(&cfg);
-    if (!cli) return false;
+    if (!cli) { free(sink.buf); return false; }
 
     esp_err_t err = esp_http_client_perform(cli);
     int status = esp_http_client_get_status_code(cli);
     esp_http_client_cleanup(cli);
-    if (err != ESP_OK || status != 200 || sink.len == 0) return false;
-    sink.buf[sink.len < sizeof(sink.buf) ? sink.len : sizeof(sink.buf) - 1] = '\0';
+    if (err != ESP_OK || status != 200 || sink.len == 0) {
+        free(sink.buf);
+        return false;
+    }
+    sink.buf[sink.len] = '\0';
 
     cJSON *root = cJSON_Parse(sink.buf);
+    free(sink.buf);
     if (!root) return false;
-    cJSON *jv = cJSON_GetObjectItem(root, "value");
-    bool ok = cJSON_IsBool(jv);
-    if (ok) *out_active = cJSON_IsTrue(jv);
+    cJSON *targets = cJSON_GetObjectItem(root, "targets");
+    bool ok = cJSON_IsArray(targets);
+    if (ok) {
+        memset(routed_out, 0, sizeof(bool) * MAX_MIX_BUSES);
+        cJSON *t;
+        cJSON_ArrayForEach(t, targets) {
+            cJSON *jid = cJSON_GetObjectItem(t, "id");
+            if (cJSON_IsNumber(jid)) {
+                int mix_idx = (int) jid->valuedouble;
+                if (mix_idx >= 0 && mix_idx < MAX_MIX_BUSES) {
+                    routed_out[mix_idx] = true;
+                }
+            }
+        }
+    }
     cJSON_Delete(root);
     return ok;
 }
 
-// P11: one-shot REST sweep over the mix layout. Called from app_main right
-// after set_mix_layout so the saved-index validation can see the routed
-// mask before WS subscribes wire it up live.
+// P11: one-shot fetch of the profile-filtered mix list. Called from
+// app_main right after set_mix_layout so saved-index validation sees
+// the routed mask before WS subscribes wire up. mixTargets reflects
+// the active MS profile -- e.g., switching to a "mix master" profile
+// reduces the list to just the assigned mix.
 static void ws_fetch_mix_routing(void)
 {
     if (s_mix_count <= 0) return;
-    for (int i = 0; i < s_mix_count && i < MAX_MIX_BUSES; ++i) {
-        bool active = true;
-        if (fetch_one_routing(s_mix_offset + i, &active)) {
-            s_mix_routed[i] = active;
-        }
+    bool fresh[MAX_MIX_BUSES] = {0};
+    if (!fetch_mix_targets(fresh)) {
+        ESP_LOGW(TAG, "mixTargets fetch failed; assuming all routed");
+        return;  // keep prior mask (defaults to all-true on first boot)
     }
     int routed = 0;
     for (int i = 0; i < s_mix_count && i < MAX_MIX_BUSES; ++i) {
-        if (s_mix_routed[i]) routed++;
+        s_mix_routed[i] = fresh[i];
+        if (fresh[i]) routed++;
     }
-    ESP_LOGI(TAG, "mix routing: %d/%d active", routed, s_mix_count);
+    ESP_LOGI(TAG, "mix routing: %d/%d in profile", routed, s_mix_count);
     notify_subscribers();
 }
 
@@ -712,13 +759,20 @@ static void on_connected_subscribe_all(void)
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", s_mix_offset + i);
         subscribe_path(dotted, "val");
     }
-    // P11: routed-mix flag per bus. The picker hides un-routed mixes;
-    // boot-time validation falls back to the first routed mix if the
-    // saved index is no longer routed.
-    for (int i = 0; i < s_mix_count; ++i) {
-        char dotted[40];
-        snprintf(dotted, sizeof(dotted), "ch.%d.info.isActive", s_mix_offset + i);
-        subscribe_path(dotted, "val");
+    // P11: profile-filtered routed mask comes from /console/mixTargets,
+    // not from per-channel info.isActive (which on the Si Expression
+    // returns true for all 20 buses regardless of MS profile). Re-fetch
+    // it on every connect so a profile switch in MS picks up after a
+    // reconnect without a device reboot.
+    bool fresh[MAX_MIX_BUSES] = {0};
+    if (fetch_mix_targets(fresh)) {
+        int routed = 0;
+        for (int i = 0; i < s_mix_count && i < MAX_MIX_BUSES; ++i) {
+            s_mix_routed[i] = fresh[i];
+            if (fresh[i]) routed++;
+        }
+        ESP_LOGI(TAG, "subscribe-time routing: %d/%d in profile", routed, s_mix_count);
+        notify_subscribers();
     }
     ESP_LOGI(TAG, "subscribed %d channels + %d mix names",
              (int) app_state_count(), s_mix_count);
@@ -801,20 +855,6 @@ static void handle_broadcast(const char *json, size_t len)
                     sizeof(s_mix_names[mix_idx]) - 1);
             s_mix_names[mix_idx][sizeof(s_mix_names[mix_idx]) - 1] = '\0';
             notify_subscribers();
-        }
-    }
-
-    // P11: ch.<N>.info.isActive flips the routed-mix mask. Notify so the
-    // picker rebuilds with the new routed set.
-    if (sscanf(dotted, "ch.%d.info.isActive", &ch) == 1 && cJSON_IsBool(jvalue)) {
-        if (s_mix_count > 0 && ch >= s_mix_offset &&
-            ch < s_mix_offset + s_mix_count && ch - s_mix_offset < MAX_MIX_BUSES) {
-            int mix_idx = ch - s_mix_offset;
-            bool active = cJSON_IsTrue(jvalue);
-            if (s_mix_routed[mix_idx] != active) {
-                s_mix_routed[mix_idx] = active;
-                notify_subscribers();
-            }
         }
     }
 
