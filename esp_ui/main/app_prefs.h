@@ -51,6 +51,11 @@ void                   app_prefs_set_signal_indicator(app_signal_indicator_t s);
 app_theme_t app_prefs_get_theme(void);
 void        app_prefs_set_theme(app_theme_t t);
 
+// Backlight brightness, percent 5..100. Floor of 5% prevents a fully-dark
+// mis-tap; the slider itself enforces the floor at the UI layer too.
+uint8_t app_prefs_get_brightness_pct(void);
+void    app_prefs_set_brightness_pct(uint8_t pct);
+
 // Per-channel color tag (palette index 0..7). Returns -1 if no preference
 // is set; callers should fall back to a default palette derived from the
 // channel id. set with `index < 0` to clear.
