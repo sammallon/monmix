@@ -369,13 +369,23 @@ void app_display_apply_theme(app_theme_t theme)
     // backgrounds, dark-grey boxes, blue primary so the slider track reads
     // at a glance. Light mode is the LVGL default — white surfaces with
     // the same blue accent.
+    bool dark = (theme == APP_THEME_DARK);
     lv_theme_t *t = lv_theme_default_init(
         disp,
         lv_palette_main(LV_PALETTE_BLUE),
         lv_palette_main(LV_PALETTE_GREY),
-        /* dark */ theme == APP_THEME_DARK,
+        dark,
         LV_FONT_DEFAULT);
     lv_display_set_theme(disp, t);
+    // The active screen's bg shows around the tileview/master-strip and at
+    // the top/bottom margins. lv_theme_default_init styles children only --
+    // the screen object's own bg stays whatever we last set it to. Drive it
+    // from the theme so light mode doesn't keep dark margins around the
+    // light fader strips. 0x101010 for dark (matches the splash + the strip
+    // box bg), 0xF0F0F0 for light (LVGL default light surface).
+    lv_obj_set_style_bg_color(lv_screen_active(),
+                              lv_color_hex(dark ? 0x101010 : 0xF0F0F0), 0);
+    lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);
     lvgl_port_unlock();
     ESP_LOGI(TAG, "theme applied: %s", theme == APP_THEME_DARK ? "dark" : "light");
 }
