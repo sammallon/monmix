@@ -84,6 +84,7 @@ static void silence_windows_crash_popups(void) {
 #include "app_ui.h"
 
 #include "app_display.h"
+#include "esp_lvgl_port.h"
 #include "ms_client_real.h"
 #include "throttle.h"
 
@@ -124,13 +125,23 @@ static void inject_button(int x, int y, bool down) {
 
 // Pump the LVGL loop for at least `ms` milliseconds, ticking and handling
 // timers so animations + lv_async_calls run during scripted waits.
+//
+// lv_timer_handler must run with lvgl_port_lock held: non-LVGL threads
+// (the ms_client worker) take the same lock before invalidating widgets
+// or queuing async calls, and unlike the real esp_lvgl_port (which
+// interrupts the LVGL task) our SDL-backed mock can't suspend an
+// already-running handler. Without this, the worker thread can
+// invalidate during a render -> "lv_inv_area asserted at expression:
+// !disp->rendering_in_progress" crash.
 static void pump_for(uint32_t ms, uint32_t *prev_ticks) {
     uint32_t deadline = SDL_GetTicks() + ms;
     while ((int32_t)(deadline - SDL_GetTicks()) > 0) {
         uint32_t now = SDL_GetTicks();
         lv_tick_inc(now - *prev_ticks);
         *prev_ticks = now;
+        lvgl_port_lock(0);
         uint32_t next_ms = lv_timer_handler();
+        lvgl_port_unlock();
         if (next_ms > 8) next_ms = 8;
         SDL_Delay(next_ms);
     }
@@ -336,13 +347,18 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    // Interactive mode: pump until the SDL window is closed.
+    // Interactive mode: pump until the SDL window is closed. Same
+    // lvgl_port_lock discipline as pump_for -- non-LVGL threads (mongoose
+    // worker) take the lock to touch widgets, so the handler must hold
+    // it during render too.
     uint32_t prev = SDL_GetTicks();
     for (;;) {
         uint32_t now = SDL_GetTicks();
         lv_tick_inc(now - prev);
         prev = now;
+        lvgl_port_lock(0);
         uint32_t next_ms = lv_timer_handler();
+        lvgl_port_unlock();
         uint32_t cap = throttle_active() ? throttle_frame_ms() : 16u;
         if (next_ms > cap) next_ms = cap;
         SDL_Delay(next_ms);

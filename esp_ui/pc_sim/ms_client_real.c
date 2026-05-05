@@ -237,7 +237,19 @@ static void route_inbound(const char *path, double num_value, const char *str_va
             // Same dotted path carries either NORM (0..1) or VAL (dB)
             // depending on the format we subscribed in. Route to the
             // matching app_state slot so apply_pending finds it where it
-            // expects.
+            // expects. First broadcast per channel logs which format
+            // arrived -- useful in tests to prove the boot-time seed
+            // and runtime resubscribe paths landed in the right shape.
+            static bool first_seen[256];
+            if (id >= 0 && id < 256 && !first_seen[id]) {
+                first_seen[id] = true;
+                if (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) {
+                    printf("ms_real: lvl ch=%d db=%.2f\n", id, num_value);
+                } else {
+                    printf("ms_real: lvl ch=%d norm=%.3f\n", id, num_value);
+                }
+                fflush(stdout);
+            }
             if (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) {
                 app_state_set_level_db(idx, (float)num_value, true);
             } else {
@@ -574,6 +586,11 @@ const ms_client_iface_t *ms_client_real_create(const char *host, int port) {
     g_ms.outq_mtx = SDL_CreateMutex();
     g_ms.running  = true;
     g_ms.state    = APP_MS_STATE_BOOT;
+    // Seed format from prefs -- a sim relaunch with level=db saved in NVS
+    // would otherwise subscribe in "norm" and the UI's sweep reads zeroes
+    // from ch.level_db. Same bug shape we just fixed for the runtime
+    // switch, but triggered at boot.
+    g_ms.level_fmt = app_prefs_get_level_format();
     g_ms.thread   = SDL_CreateThread(worker_thread, "ms_real_ws", NULL);
     return &s_iface;
 }

@@ -50,50 +50,67 @@ def load_test(path: Path) -> dict:
     return module.TEST
 
 
+def _check_expect(stdout: str, stderr: str, returncode: int, expect: dict, fails: list):
+    if "exit_code" in expect and returncode != expect["exit_code"]:
+        fails.append(f"exit {returncode} != {expect['exit_code']}")
+    for s in expect.get("stdout_contains", []):
+        if s not in stdout:
+            fails.append(f"stdout missing: {s!r}")
+    for s in expect.get("stdout_not_contains", []):
+        if s in stdout:
+            fails.append(f"stdout has forbidden: {s!r}")
+    for s in expect.get("stderr_not_contains", []):
+        if s in stderr:
+            fails.append(f"stderr has forbidden: {s!r}")
+
+
 def run_one(test: dict) -> tuple[bool, str]:
     name      = test["name"]
     args      = list(test.get("args", []))
-    script    = test["script"]
-    expect    = test.get("expect", {})
     headless  = test.get("headless", True)
     timeout_s = test.get("timeout_s", 90)
+
+    # A test is either a single script (script + expect) or a sequence
+    # of phases sharing one cwd so persisted state (NVS, SD mirror)
+    # carries between phase runs. Phases are useful for boot-with-
+    # persisted-prefs regressions.
+    if "phases" in test:
+        phases = test["phases"]
+    else:
+        phases = [{"name": "main", "script": test["script"],
+                   "expect": test.get("expect", {})}]
 
     out_dir = ARTIFACTS / name
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
 
-    script_path = out_dir / "script.txt"
-    script_path.write_text(script)
-
-    cmd = [str(SIM_EXE), "--script", str(script_path)] + args
-    if headless:
-        cmd.append("--headless")
-
-    start = time.time()
-    proc  = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout_s, cwd=out_dir)
-    elapsed = time.time() - start
-
-    (out_dir / "stdout.txt").write_text(proc.stdout)
-    (out_dir / "stderr.txt").write_text(proc.stderr)
-
     fails: list[str] = []
+    total_elapsed = 0.0
+    for i, ph in enumerate(phases):
+        ph_name     = ph.get("name", f"phase{i}")
+        script_path = out_dir / f"{i:02d}_{ph_name}.script"
+        script_path.write_text(ph["script"])
 
-    if "exit_code" in expect and proc.returncode != expect["exit_code"]:
-        fails.append(f"exit {proc.returncode} != {expect['exit_code']}")
+        cmd = [str(SIM_EXE), "--script", str(script_path)] + args
+        if headless:
+            cmd.append("--headless")
 
-    for s in expect.get("stdout_contains", []):
-        if s not in proc.stdout:
-            fails.append(f"stdout missing: {s!r}")
-    for s in expect.get("stdout_not_contains", []):
-        if s in proc.stdout:
-            fails.append(f"stdout has forbidden: {s!r}")
-    for s in expect.get("stderr_not_contains", []):
-        if s in proc.stderr:
-            fails.append(f"stderr has forbidden: {s!r}")
+        start = time.time()
+        proc  = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout_s, cwd=out_dir)
+        total_elapsed += (time.time() - start)
 
-    msg = f"{elapsed:5.1f}s"
+        (out_dir / f"{i:02d}_{ph_name}.stdout").write_text(proc.stdout)
+        (out_dir / f"{i:02d}_{ph_name}.stderr").write_text(proc.stderr)
+
+        ph_fails: list[str] = []
+        _check_expect(proc.stdout, proc.stderr, proc.returncode,
+                      ph.get("expect", {}), ph_fails)
+        if ph_fails:
+            fails.extend([f"[{ph_name}] {f}" for f in ph_fails])
+
+    msg = f"{total_elapsed:5.1f}s"
     if fails:
         msg += "  " + "; ".join(fails)
     return (not fails, msg)

@@ -45,6 +45,7 @@
 #include "app_config.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
+#include "app_prefs.h"
 #include "app_state.h"
 
 #include <stdio.h>
@@ -522,6 +523,11 @@ static bool ws_start(void) {
     g.running  = true;
     g.state    = APP_MS_STATE_BOOT;
     g.subscriber_count = g.subscriber_count;  // keep prior registrations
+    // Seed level_format from prefs so the first subscribe goes out in the
+    // right shape. Without this, a tablet booting with level=db saved in
+    // NVS subscribes in "norm", the broadcasts land in ch.level, and the
+    // UI's apply_pending reads ch.level_db (never populated) -> -inf dB.
+    g.level_format = app_prefs_get_level_format();
     if (xTaskCreatePinnedToCore(ws_task, "ms_ws", WORKER_STACK, NULL, WORKER_PRIO, &g.task, tskNO_AFFINITY) != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed");
         return false;
