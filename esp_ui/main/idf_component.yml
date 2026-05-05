@@ -17,13 +17,12 @@ dependencies:
   # MIPI-DSI panel driver. CrowPanel Advanced 10.1" (Elecrow SKU DHE04310D)
   # uses the EK79007 — confirmed against Elecrow's own Arduino lessons
   # (esp_panel_board_custom_conf.h sets ESP_PANEL_BOARD_LCD_CONTROLLER EK79007).
-  # Held at ~1.0.4 pending UI-lag investigation: bumping to 2.0.2 (which is
-  # the IDF v6 API alignment line) coincided with new sluggishness during
-  # touch interaction. The 1.x macros reference fields not present on IDF v6
-  # but we already hand-build the dpi_cfg, so the workaround is sustainable.
-  # Revisit if/when 2.x line gets a fix or we identify a different cause.
+  # 2.x is the IDF v6 API alignment line; 1.x macros reference fields not
+  # present on IDF v6 but we hand-build the dpi_cfg either way. Verified
+  # 2026-05-05 not to contribute to the touch-lag (which is the meter
+  # subscription on CPU 0).
   espressif/esp_lcd_ek79007:
-    version: "~1.0.4"
+    version: "^2.0.0"
 
   # Capacitive touch controller (GT911) over I2C.
   espressif/esp_lcd_touch_gt911:
