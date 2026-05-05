@@ -3,14 +3,20 @@ dependencies:
     version: ">=6.0.1"
 
   # LVGL + Espressif port (handles display flush, touch input, PPA acceleration).
+  # LVGL pinned directly so we get the latest 9.x line; esp_lvgl_port's
+  # constraint is "8 <= x < 10" so any 9.x works under it.
+  lvgl/lvgl:
+    version: "~9.5.0"
   espressif/esp_lvgl_port:
     version: "^2.0.0"
 
   # MIPI-DSI panel driver. CrowPanel Advanced 10.1" (Elecrow SKU DHE04310D)
   # uses the EK79007 — confirmed against Elecrow's own Arduino lessons
   # (esp_panel_board_custom_conf.h sets ESP_PANEL_BOARD_LCD_CONTROLLER EK79007).
+  # 2.x is the IDF v6.0 API alignment line; 1.x macros referenced fields
+  # missing on IDF v6 and forced a hand-built dpi_cfg in app_display.c.
   espressif/esp_lcd_ek79007:
-    version: "*"
+    version: "^2.0.0"
 
   # Capacitive touch controller (GT911) over I2C.
   espressif/esp_lcd_touch_gt911:
