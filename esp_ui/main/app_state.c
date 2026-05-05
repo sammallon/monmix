@@ -11,6 +11,8 @@ static size_t               s_count;
 static SemaphoreHandle_t    s_mutex;
 static app_state_on_change_t s_on_change;
 static void                 *s_on_change_ctx;
+static app_state_on_meter_t  s_on_meter;
+static void                 *s_on_meter_ctx;
 
 void app_state_init(const int *ids, size_t count)
 {
@@ -26,6 +28,7 @@ void app_state_init(const int *ids, size_t count)
         s_channels[i].level    = 0.0f;
         s_channels[i].level_db = -200.0f;   // sentinel: "below floor" until MS reports
         s_channels[i].mute     = false;
+        s_channels[i].meter_db = -200.0f;   // #30: no meter sample yet
     }
     xSemaphoreGive(s_mutex);
 }
@@ -125,6 +128,24 @@ void app_state_register_on_change(app_state_on_change_t cb, void *ctx)
 {
     s_on_change     = cb;
     s_on_change_ctx = ctx;
+}
+
+void app_state_set_meter_db(size_t idx, float db, bool notify)
+{
+    if (idx >= s_count) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_channels[idx].meter_db = db;
+    xSemaphoreGive(s_mutex);
+
+    if (notify && s_on_meter) {
+        s_on_meter(idx, s_on_meter_ctx);
+    }
+}
+
+void app_state_register_on_meter(app_state_on_meter_t cb, void *ctx)
+{
+    s_on_meter     = cb;
+    s_on_meter_ctx = ctx;
 }
 
 // Master strip — singleton, separate from the per-fader array because the

@@ -82,10 +82,22 @@ typedef struct {
     lv_obj_t *label_name;
     lv_obj_t *label_val;
     lv_obj_t *btn_mute;
-    lv_obj_t *signal_dot;
+    lv_obj_t *signal_dot;     // signal-present mode: small green dot
+    lv_obj_t *meter_bar;      // #30 meter mode: vertical fill bar (lv_bar)
 } fader_widgets_t;
 
 #define SIGNAL_DOT_SIZE     10
+// #30: meter bar dimensions. Sits flush along the slider's left edge so
+// it tracks the slider visually without crowding the unity tick on the
+// right. Height matches the slider's travel; width kept thin so the
+// fader thumb still reads as the dominant control.
+#define METER_BAR_W         6
+#define METER_BAR_H         SLIDER_H
+// dB range mapped onto the bar fill. -60 dB = empty, 0 dB = full. Values
+// above 0 dB clamp to full; values below -60 clamp to empty. Si reports
+// silence as -90 dB.
+#define METER_DB_FLOOR      -60.0f
+#define METER_DB_CEIL         0.0f
 #define DEFAULT_SLIDER_HEX  0x4080E0   // medium blue when no per-channel color set
 // Mid-grey for the "no color set" swatch and the picker's clear cell. 0x808080
 // reads as a neutral indicator on both dark and light themes (the previous
@@ -521,6 +533,13 @@ static volatile bool s_sweep_queued;
 // queued async (not two).
 static volatile bool s_master_dirty;
 
+// #30: meter-only dirty bits. Separate from s_dirty so a 10 Hz meter
+// stream doesn't trigger the slider/colour/label rebuild branch on
+// every frame. The meter sweep is a single async fold (apply_meter_pending)
+// queued only when there's actual meter work to do.
+EXT_RAM_BSS_ATTR static volatile bool s_meter_dirty[APP_CONFIG_MAX_CHANNELS];
+static volatile bool s_meter_sweep_queued;
+
 static void apply_pending(void *unused)
 {
     (void)unused;
@@ -587,16 +606,27 @@ static void apply_pending(void *unused)
             lv_obj_set_style_bg_color(s_widgets[i].slider, bar_color,  LV_PART_INDICATOR);
             lv_obj_set_style_bg_color(s_widgets[i].slider, knob_color, LV_PART_KNOB);
         }
+        // Indicator widgets — exactly one of {dot, meter bar} is visible
+        // depending on signal_indicator pref. Meter mode driven from
+        // ch.meter_db which is fed by the metering broadcast handler;
+        // signal-present mode is the legacy "level > 0 && !mute" derive.
+        app_signal_indicator_t mode = app_prefs_get_signal_indicator();
         if (s_widgets[i].signal_dot) {
-            app_signal_indicator_t mode = app_prefs_get_signal_indicator();
-            bool show = (mode != APP_SIGNAL_INDICATOR_NONE) &&
-                        !ch.mute && ch.level > 0.01f;
-            if (show) {
+            bool show_dot = (mode == APP_SIGNAL_INDICATOR_PRESENT) &&
+                            !ch.mute && ch.level > 0.01f;
+            if (show_dot) {
                 lv_obj_set_style_bg_color(s_widgets[i].signal_dot,
                                           lv_color_hex(0x40C040), 0);
                 lv_obj_remove_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
             } else {
                 lv_obj_add_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (s_widgets[i].meter_bar) {
+            if (mode == APP_SIGNAL_INDICATOR_METER) {
+                lv_obj_remove_flag(s_widgets[i].meter_bar, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(s_widgets[i].meter_bar, LV_OBJ_FLAG_HIDDEN);
             }
         }
     }
@@ -620,6 +650,60 @@ static void apply_pending(void *unused)
             }
         }
     }
+}
+
+// #30: meter-only redraw. Walks s_meter_dirty[], computes the bar fill from
+// each channel's meter_db, and writes lv_bar_set_value. Decoupled from
+// apply_pending so a 10 Hz meter stream doesn't trigger the heavier
+// slider/label/colour repaint branch on every frame.
+static void apply_meter_pending(void *unused)
+{
+    (void) unused;
+    s_meter_sweep_queued = false;
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        if (!s_meter_dirty[i]) continue;
+        s_meter_dirty[i] = false;
+        if (!s_widgets[i].meter_bar) continue;
+        app_channel_t ch;
+        if (!app_state_get(i, &ch)) continue;
+        float db = ch.meter_db;
+        // Mute squelches the bar — the audio path is silent, so a non-zero
+        // meter reading from a stale broadcast would mislead. Sentinel
+        // -200 (no sample yet) and the explicit silence flush from
+        // ws_set_meter_enabled both fall through to the floor clamp.
+        if (ch.mute) db = METER_DB_FLOOR;
+        if (db < METER_DB_FLOOR) db = METER_DB_FLOOR;
+        if (db > METER_DB_CEIL)  db = METER_DB_CEIL;
+        int fill = (int) (((db - METER_DB_FLOOR) /
+                           (METER_DB_CEIL - METER_DB_FLOOR)) * 1000.0f);
+        lv_bar_set_value(s_widgets[i].meter_bar, fill, LV_ANIM_OFF);
+        // Color shifts as level rises: green (-60..-12), yellow (-12..-3),
+        // red (-3..0). Stage-monitor convention; thresholds picked to match
+        // typical Si Expression bus headroom.
+        uint32_t hex = 0x40C040;  // green
+        if (db > -3.0f)       hex = 0xE04040;  // red
+        else if (db > -12.0f) hex = 0xE0D040;  // yellow
+        lv_obj_set_style_bg_color(s_widgets[i].meter_bar,
+                                  lv_color_hex(hex), LV_PART_INDICATOR);
+    }
+}
+
+static void on_meter_change(size_t idx, void *ctx)
+{
+    (void) ctx;
+    if (idx >= APP_CONFIG_MAX_CHANNELS) return;
+    s_meter_dirty[idx] = true;
+    if (s_meter_sweep_queued) return;
+
+    if (!lvgl_port_lock(100)) return;
+    if (!s_meter_sweep_queued) {
+        s_meter_sweep_queued = true;
+        if (lv_async_call(apply_meter_pending, NULL) != LV_RESULT_OK) {
+            s_meter_sweep_queued = false;
+        }
+    }
+    lvgl_port_unlock();
 }
 
 static void on_state_change(size_t idx, void *ctx)
@@ -673,6 +757,30 @@ static void on_prefs_change(void *ctx)
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
     s_master_dirty = true;
+
+    // #30: chase the signal indicator pref. Subscribe meter feed only when
+    // the user opts in; unsubscribe when they switch back. Idempotent on
+    // both sides so a no-op pref change (e.g. brightness) leaves the
+    // subscription alone. Called from any task — the WS client's
+    // set_meter_enabled lands the message on the WS task so locking isn't
+    // our problem here.
+    if (s_ms && s_ms->set_meter_enabled) {
+        bool want_meter = (app_prefs_get_signal_indicator() ==
+                           APP_SIGNAL_INDICATOR_METER);
+        s_ms->set_meter_enabled(want_meter);
+        // Force a meter-bar repaint so a mode flip clears any stale fill
+        // left over from a previous meter session. apply_pending owns the
+        // visibility flag from this same sweep; pairing the two keeps the
+        // bar's first frame in sync with its first visible frame.
+        for (size_t i = 0; i < total; ++i) s_meter_dirty[i] = true;
+        if (!s_meter_sweep_queued) {
+            s_meter_sweep_queued = true;
+            if (lv_async_call(apply_meter_pending, NULL) != LV_RESULT_OK) {
+                s_meter_sweep_queued = false;
+            }
+        }
+    }
+
     if (s_sweep_queued) return;
 
     if (!lvgl_port_lock(100)) return;
@@ -904,9 +1012,9 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     // Signal-present indicator — small round dot centered below the name
     // label and above the slider. Visible only when mode != none AND the
     // channel is actively passing audio (!mute && level > 0). Without live
-    // meter data from MS (offline test instance) this is a "configured
-    // to pass audio" indicator, not strict audio presence — useful for
-    // the "do I have a cable problem?" question.
+    // meter data from MS this is a "configured to pass audio" indicator,
+    // not strict audio presence — useful for the "do I have a cable
+    // problem?" question.
     lv_obj_t *dot = lv_obj_create(box);
     lv_obj_set_size(dot, SIGNAL_DOT_SIZE, SIGNAL_DOT_SIZE);
     lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 26);
@@ -916,6 +1024,29 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
     s_widgets[idx].signal_dot = dot;
+
+    // #30: real meter bar. Vertical lv_bar to the immediate left of the
+    // slider track. Hidden unless signal_indicator pref is METER and we
+    // have a live meter sample. Built here (always) so apply_pending can
+    // toggle its visibility cheaply on indicator pref change rather than
+    // tearing down/rebuilding the strip.
+    lv_obj_t *meter = lv_bar_create(box);
+    lv_obj_set_size(meter, METER_BAR_W, METER_BAR_H);
+    lv_bar_set_range(meter, 0, 1000);  // 1000 steps over 60 dB; fine enough
+    lv_bar_set_value(meter, 0, LV_ANIM_OFF);
+    // Pin to the left of the slider — slider is centered with width 28,
+    // so its left edge sits at -SLIDER_W/2 from the box centre. Park the
+    // meter bar at -SLIDER_W/2 - METER_BAR_W - small gap.
+    lv_obj_align(meter, LV_ALIGN_CENTER, -SLIDER_W / 2 - METER_BAR_W - 2, 0);
+    lv_obj_set_style_pad_all(meter, 0, 0);
+    lv_obj_set_style_radius(meter, 1, 0);
+    lv_obj_set_style_radius(meter, 1, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(meter, 0, 0);
+    lv_obj_set_style_bg_color(meter, lv_color_hex(0x202020), 0);
+    lv_obj_set_style_bg_color(meter, lv_color_hex(0x40C040), LV_PART_INDICATOR);
+    lv_obj_clear_flag(meter, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(meter, LV_OBJ_FLAG_HIDDEN);
+    s_widgets[idx].meter_bar = meter;
 
     lv_obj_t *slider = lv_slider_create(box);
     lv_slider_set_range(slider, 0, 100);
@@ -1258,6 +1389,7 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_align_to(s_spinner_label, s_spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 
     app_state_register_on_change(on_state_change, NULL);
+    app_state_register_on_meter(on_meter_change, NULL);
     app_state_master_register_on_change(on_master_state_change, NULL);
     app_prefs_register_on_change(on_prefs_change, NULL);
     app_wifi_register_on_change(on_wifi_state_change, NULL);

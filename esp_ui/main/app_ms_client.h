@@ -97,6 +97,14 @@ typedef struct {
     // the app_state slot index). Returns NULL when MS hasn't broadcast
     // a name for this id yet -- caller should fall back to "CH NN".
     const char *(*get_strip_name)(int ms_channel_id);
+
+    // #30: real metering subscription. on=true subscribes the current
+    // tracked channel set to /console/metering2 at ~10 Hz; on=false
+    // unsubscribes. Idempotent. Called by the UI when the user changes
+    // signal_indicator pref to/from APP_SIGNAL_INDICATOR_METER, and on
+    // every reconnect/resubscribe so the subscription survives WS
+    // bounce. Routes incoming dB values through app_state_set_meter_db.
+    void (*set_meter_enabled)(bool on);
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);
