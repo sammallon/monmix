@@ -252,6 +252,7 @@ static lv_obj_t *s_wcfg_gw_ta;
 static lv_obj_t *s_wcfg_dns_ta;
 static lv_obj_t *s_wcfg_ntp_ta;
 static lv_obj_t *s_wcfg_ntp_dhcp_cb;     // checkbox: honor DHCP-supplied NTP
+static lv_obj_t *s_wcfg_current_ip_value; // read-only "what IP did we land?"
 static bool     s_wcfg_use_static;       // working state of the radio
 static bool     s_wcfg_orig_use_static;
 static char     s_wcfg_orig_ip [APP_PREFS_IP_STR_MAX];
@@ -389,6 +390,7 @@ static void wifi_panel_open(void);
 static void wifi_panel_close(void);
 static void wifi_panel_refresh(void);
 static void wifi_icon_refresh(void);
+static void apply_sntp_config(void);
 static void on_wifi_clicked(lv_event_t *e);
 static void on_wifi_state_change(void *ctx);
 static void ms_panel_open(void);
@@ -2914,27 +2916,18 @@ static void on_wcfg_save_yes(lv_event_t *e)
         esp_restart();
         return;   // unreached
     }
-    // Live path dispatched. Close the overlay so the user can see the
-    // wifi-icon and clock recover; the WS reconnect watchdog handles the
-    // MS client when the IP comes back. NTP server / DHCP-NTP changes need
-    // a re-init of SNTP though -- the existing path runs once-per-boot, so
-    // those particular changes still want a reboot until we wire SNTP-on-
-    // pref-change. For now, always reboot when ntp_server / ntp_use_dhcp
-    // changed.
+    // NTP server / DHCP-NTP changes apply live too -- apply_sntp_config
+    // does an esp_netif_sntp_deinit + reinit with the new server, no
+    // reboot needed. SNTP picks the new server up on the next poll cycle
+    // (within ~5 s on a healthy network).
     bool ntp_changed = strcmp(s_wcfg_orig_ntp,
                               lv_textarea_get_text(s_wcfg_ntp_ta)) != 0;
     if (s_wcfg_ntp_dhcp_cb) {
         bool now_use_dhcp = lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
         if (now_use_dhcp != s_wcfg_orig_ntp_use_dhcp) ntp_changed = true;
     }
-    if (ntp_changed) {
-        lv_label_set_text(s_wcfg_status_label,
-                          "#40C060 Saved. Rebooting (NTP changed)...#");
-        lv_refr_now(NULL);
-        vTaskDelay(pdMS_TO_TICKS(800));
-        esp_restart();
-        return;
-    }
+    if (ntp_changed) apply_sntp_config();
+
     vTaskDelay(pdMS_TO_TICKS(600));
     if (s_wcfg_overlay) lv_obj_add_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2953,9 +2946,9 @@ static void build_wcfg_save_confirm(void)
 
     lv_obj_t *msg = lv_label_create(p);
     lv_label_set_text(msg,
-                      "Save WiFi settings and restart the device?\n"
-                      "The fader UI will reconnect to the mixer\n"
-                      "once the new network associates.");
+                      "Save WiFi settings?\n"
+                      "SSID, password, IP and NTP changes apply live --\n"
+                      "the fader UI briefly reconnects, no reboot.");
     lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
 
     lv_obj_t *cancel = lv_button_create(p);
@@ -2967,11 +2960,11 @@ static void build_wcfg_save_confirm(void)
     lv_obj_add_event_cb(cancel, on_wcfg_save_no, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *yes = lv_button_create(p);
-    lv_obj_set_size(yes, 220, 50);
+    lv_obj_set_size(yes, 160, 50);
     lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
     lv_obj_t *yl = lv_label_create(yes);
-    lv_label_set_text(yl, LV_SYMBOL_OK " Save & Restart");
+    lv_label_set_text(yl, LV_SYMBOL_OK " Save");
     lv_obj_center(yl);
     lv_obj_add_event_cb(yes, on_wcfg_save_yes, LV_EVENT_CLICKED, NULL);
 
@@ -3136,6 +3129,16 @@ static void on_wcfg_scan_clicked(lv_event_t *e)
 // Show / hide the static-IP field group based on the radio's working state.
 // Called from the radio click handlers and from wcfg_open() so the initial
 // visibility matches the persisted pref.
+static void wcfg_refresh_current_ip(void)
+{
+    if (!s_wcfg_current_ip_value) return;
+    char ip[16];
+    app_wifi_format_ip(ip, sizeof(ip));
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Current: %s", ip);
+    lv_label_set_text(s_wcfg_current_ip_value, buf);
+}
+
 static void wcfg_apply_static_visibility(void)
 {
     if (!s_wcfg_static_group) return;
@@ -3275,6 +3278,14 @@ static void build_wcfg_overlay(void)
     lv_obj_align(s_wcfg_static_btn, LV_ALIGN_TOP_LEFT, 200, y);
     lv_obj_add_event_cb(s_wcfg_static_btn, on_wcfg_static_clicked,
                         LV_EVENT_CLICKED, NULL);
+
+    // Read-only "Current: <ip>" -- shows whatever the netif actually has,
+    // i.e. the DHCP-assigned address when DHCP is on, or the configured
+    // static IP otherwise. Updates on every wifi-state change while the
+    // overlay is open. Right-aligned to keep the form column tidy.
+    s_wcfg_current_ip_value = lv_label_create(ov);
+    lv_label_set_text(s_wcfg_current_ip_value, "Current: 0.0.0.0");
+    lv_obj_align(s_wcfg_current_ip_value, LV_ALIGN_TOP_LEFT, 320, y + 8);
     y += row_dy;
 
     // Static IP group -- one container so we can hide/show as a unit. Two
@@ -3408,6 +3419,7 @@ static void wcfg_open(void)
         if (s_wcfg_orig_ntp_use_dhcp) lv_obj_add_state   (s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
         else                          lv_obj_remove_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
     }
+    wcfg_refresh_current_ip();
     wcfg_apply_static_visibility();
 
     lv_label_set_text(s_wcfg_status_label, "");
@@ -4279,6 +4291,48 @@ static void on_sntp_synced(struct timeval *tv)
 }
 
 
+// File-static buffer holding the live SNTP server hostname. lwIP
+// (sntp_setservername under the wrapper) stores the pointer we pass,
+// not a copy, so it must remain valid for the lifetime of the SNTP
+// service. Stack-buffered hostnames cause "first sync works, then
+// stops" races. Idempotent: re-reading from prefs into the same buffer
+// updates the contents in place; the pointer LWIP holds is unchanged.
+static char s_ntp_server_static[APP_PREFS_STR_MAX];
+
+// (Re)initialise SNTP from the current ntp_server / ntp_use_dhcp prefs.
+// Safe to call before WiFi is up (the wrapper just defers the first
+// poll). Safe to call repeatedly -- esp_netif_sntp_deinit + re-init
+// applies the new config live, so the user's wifi-config save can
+// trigger a server change without a reboot.
+static void apply_sntp_config(void)
+{
+    app_prefs_get_ntp_server(s_ntp_server_static, sizeof(s_ntp_server_static));
+    if (s_ntp_server_static[0] == '\0') return;   // no server configured
+    bool use_dhcp = app_prefs_get_ntp_use_dhcp();
+    esp_netif_sntp_deinit();   // safe if never initialised
+    if (use_dhcp) {
+        // 2 slots, both pre-filled with the manual server. With
+        // server_from_dhcp=true and index_of_first_server=1, lwIP
+        // overwrites slot 0 when DHCP option-42 arrives. If the network
+        // never provides one, slot 0 keeps its initial value and the
+        // SNTP poll still has live targets, so the clock syncs from
+        // the manual server.
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+            2, ESP_SNTP_SERVER_LIST(s_ntp_server_static,
+                                    s_ntp_server_static));
+        cfg.server_from_dhcp           = true;
+        cfg.renew_servers_after_new_IP = true;
+        cfg.index_of_first_server      = 1;
+        cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
+        esp_netif_sntp_init(&cfg);
+    } else {
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(s_ntp_server_static);
+        esp_netif_sntp_init(&cfg);
+    }
+    ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d",
+             s_ntp_server_static, use_dhcp);
+}
+
 static void start_clock_once(void)
 {
     if (s_sntp_started) return;
@@ -4289,47 +4343,7 @@ static void start_clock_once(void)
     // re-syncs). The log line correlates against the user-visible clock.
     sntp_set_time_sync_notification_cb(on_sntp_synced);
 
-    // TZ + SNTP server come from prefs (set in main via app_time_apply_tz +
-    // app_time_init). When ntp_use_dhcp is true (default), DHCP option 42
-    // takes slot 0 and the user's pref is the static fallback in slot 1.
-    // When false, only the user's manual server is used -- DHCP-supplied
-    // NTP is ignored even if the network offers it.
-    // sntp_setservername (the underlying lwIP call) stores the pointer
-    // we pass, not a copy. Keep the live hostname in a file-static buffer
-    // so the pointer stays valid for the lifetime of the SNTP service --
-    // dangling stack pointers were the cause of the "first sync works,
-    // then stops" race we hit earlier with both the wrapper and bare API.
-    static char s_ntp_server_static[APP_PREFS_STR_MAX];
-    app_prefs_get_ntp_server(s_ntp_server_static, sizeof(s_ntp_server_static));
-    if (s_ntp_server_static[0] == '\0') {
-        // App_time_init handles plain init; nothing to do.
-    } else {
-        bool use_dhcp = app_prefs_get_ntp_use_dhcp();
-        esp_netif_sntp_deinit();   // safe if never initialised
-        if (use_dhcp) {
-            // 2 slots, both pre-filled with the manual server. With
-            // server_from_dhcp=true and index_of_first_server=1, lwIP
-            // overwrites slot 0 when DHCP option-42 arrives. If the
-            // network never provides one, slot 0 keeps its initial
-            // value and the SNTP poll still has live targets, so the
-            // clock syncs from the manual server.
-            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
-                2, ESP_SNTP_SERVER_LIST(s_ntp_server_static,
-                                        s_ntp_server_static));
-            cfg.server_from_dhcp           = true;
-            cfg.renew_servers_after_new_IP = true;
-            cfg.index_of_first_server      = 1;
-            cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
-            esp_netif_sntp_init(&cfg);
-        } else {
-            // Manual-only -- single-server config, no DHCP integration.
-            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(
-                s_ntp_server_static);
-            esp_netif_sntp_init(&cfg);
-        }
-        ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d",
-                 s_ntp_server_static, use_dhcp);
-    }
+    apply_sntp_config();
 
     if (!s_clock_timer) {
         s_clock_timer = lv_timer_create(clock_tick, 1000, NULL);
@@ -4343,6 +4357,9 @@ static void wifi_apply_async(void *unused)
     wifi_icon_refresh();
     if (s_wifi_panel && !lv_obj_has_flag(s_wifi_panel, LV_OBJ_FLAG_HIDDEN)) {
         wifi_panel_refresh();
+    }
+    if (s_wcfg_overlay && !lv_obj_has_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN)) {
+        wcfg_refresh_current_ip();
     }
     // SNTP requires a working route; kick it once the first time wifi
     // reaches CONNECTED. The clock label takes over from the boot status
