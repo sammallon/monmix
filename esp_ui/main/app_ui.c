@@ -4239,26 +4239,6 @@ static void on_sntp_synced(struct timeval *tv)
     ESP_LOGI(TAG, "sntp synced: epoch=%lld", (long long) tv->tv_sec);
 }
 
-// Diagnostic: every 5 s, log SNTP sync status + current time. Lets us see
-// from the boot log whether the service is reaching the server, retrying,
-// or wedged. Cheap; logs go to UART only.
-static lv_timer_t *s_sntp_diag_timer;
-static void sntp_diag_tick(lv_timer_t *t)
-{
-    (void) t;
-    sntp_sync_status_t st = sntp_get_sync_status();
-    const char *st_str = (st == SNTP_SYNC_STATUS_RESET)        ? "reset" :
-                         (st == SNTP_SYNC_STATUS_COMPLETED)    ? "completed" :
-                         (st == SNTP_SYNC_STATUS_IN_PROGRESS)  ? "in_progress" : "?";
-    time_t now = time(NULL);
-    ESP_LOGI(TAG, "sntp diag: status=%s now=%lld", st_str, (long long) now);
-    if (st == SNTP_SYNC_STATUS_COMPLETED) {
-        // Stop polling once sync is done -- the notification cb will fire on
-        // any future re-sync.
-        lv_timer_delete(s_sntp_diag_timer);
-        s_sntp_diag_timer = NULL;
-    }
-}
 
 static void start_clock_once(void)
 {
@@ -4275,9 +4255,14 @@ static void start_clock_once(void)
     // takes slot 0 and the user's pref is the static fallback in slot 1.
     // When false, only the user's manual server is used -- DHCP-supplied
     // NTP is ignored even if the network offers it.
-    char user_ntp[APP_PREFS_STR_MAX];
-    app_prefs_get_ntp_server(user_ntp, sizeof(user_ntp));
-    if (user_ntp[0] == '\0') {
+    // sntp_setservername STORES THE POINTER, not a copy. Stack-buffered
+    // hostnames dangle after return. Keep the live copy in a file-static
+    // buffer so the pointer stays valid for the lifetime of the SNTP
+    // service. (Earlier intermittent "first sync works, then stops"
+    // behaviour was the GC race against this.)
+    static char s_ntp_server_static[APP_PREFS_STR_MAX];
+    app_prefs_get_ntp_server(s_ntp_server_static, sizeof(s_ntp_server_static));
+    if (s_ntp_server_static[0] == '\0') {
         // App_time_init handles plain init; nothing to do.
     } else {
         bool use_dhcp = app_prefs_get_ntp_use_dhcp();
@@ -4288,26 +4273,24 @@ static void start_clock_once(void)
         // esp_sntp_init() and the clock syncs in ~1 s.
         esp_sntp_stop();   // safe if not started
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        esp_sntp_setservername(0, user_ntp);
+        esp_sntp_setservername(0, s_ntp_server_static);
         if (use_dhcp) {
-            // Slot 1 = user_ntp as manual fallback. If the DHCP server
-            // provides option-42, lwIP overwrites slot 0; otherwise slot 1
-            // remains as user_ntp and the clock still syncs.
-            esp_sntp_setservername(1, user_ntp);
+            // Slot 1 = manual fallback. If the DHCP server provides
+            // option-42, lwIP overwrites slot 0; otherwise slot 1 remains
+            // as the user's manual server and the clock still syncs.
+            esp_sntp_setservername(1, s_ntp_server_static);
             esp_sntp_servermode_dhcp(true);
         } else {
             esp_sntp_servermode_dhcp(false);
         }
         esp_sntp_init();
-        ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d", user_ntp, use_dhcp);
+        ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d",
+                 s_ntp_server_static, use_dhcp);
     }
 
     if (!s_clock_timer) {
         s_clock_timer = lv_timer_create(clock_tick, 1000, NULL);
         lv_timer_ready(s_clock_timer);  // run once now so the placeholder appears
-    }
-    if (!s_sntp_diag_timer) {
-        s_sntp_diag_timer = lv_timer_create(sntp_diag_tick, 5000, NULL);
     }
 }
 
