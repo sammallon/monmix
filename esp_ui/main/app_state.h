@@ -11,6 +11,11 @@ typedef struct {
     float level;       // 0..1 normalised — what the slider tracks
     float level_db;    // dB value from MS — used by the dB readout
     bool  mute;
+    // #30: realtime meter level in dB from MS metering2. Sentinel -200
+    // means "no meter sample yet". Range observed on Si Expression:
+    // ~-90 (silence) to ~0 (clip). Updated independently from .level
+    // so the metering broadcast stream doesn't fight with fader echoes.
+    float meter_db;
 } app_channel_t;
 
 typedef void (*app_state_on_change_t)(size_t idx, void *ctx);
@@ -25,6 +30,13 @@ void app_state_set_level(size_t idx, float level, bool notify);
 void app_state_set_level_db(size_t idx, float db, bool notify);
 void app_state_set_name(size_t idx, const char *name, bool notify);
 void app_state_set_mute(size_t idx, bool mute, bool notify);
+
+// #30: meter only. Separate notification path so the UI's redraw can
+// repaint the meter bar without re-running the full fader sweep on
+// every 10 Hz frame (slider/colour/labels are unchanged by metering).
+typedef void (*app_state_on_meter_t)(size_t idx, void *ctx);
+void app_state_set_meter_db(size_t idx, float db, bool notify);
+void app_state_register_on_meter(app_state_on_meter_t cb, void *ctx);
 
 int app_state_idx_for_id(int ms_channel_id);
 int app_state_id_for_idx(size_t idx);

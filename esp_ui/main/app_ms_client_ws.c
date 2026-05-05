@@ -19,6 +19,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mbedtls/base64.h"
 
 static const char *TAG = "ms_ws";
 
@@ -121,6 +122,25 @@ static float   s_pending_set_value[APP_CONFIG_MAX_CHANNELS];
 static int     s_pending_set_mix  [APP_CONFIG_MAX_CHANNELS];
 static uint8_t s_pending_resends  [APP_CONFIG_MAX_CHANNELS];
 
+// #30: realtime metering. Single /console/metering2 subscription that
+// covers every tracked channel. Server paces at the requested interval
+// (verified 10 Hz with INTERVAL_MS=100 against the offline MS instance,
+// see tools/repro_ms_metering.py). Type=0 = mono peak, one int16 per
+// channel in the same order as params[]. Decoded values land in
+// app_state via app_state_set_meter_db; the UI redraws via the
+// existing dirty-flag sweep.
+//
+// One subscription id covers all tracked channels — keeps the wire
+// traffic to ~10 frames/sec total instead of N times that.
+#define METERING_SUB_ID       1
+#define METERING_INTERVAL_MS  100
+// MAX_PARAMS bounded by APP_CONFIG_MAX_CHANNELS so the params[] array
+// never overruns.  Slot order matches app_state slot order at subscribe
+// time; decode unpacks into the same slots.
+static bool s_meter_subscribed;
+static int  s_meter_param_ids[APP_CONFIG_MAX_CHANNELS];   // ms_channel_id per slot
+static int  s_meter_param_count;
+
 // Shared sink for the small REST GETs (poll watchdog + P11 routing fetch).
 typedef struct {
     char   buf[POLL_HTTP_BUF_LEN];
@@ -172,6 +192,7 @@ static void ws_set_mute (int ms_channel_id, bool mute);
 static void ws_set_name (int ms_channel_id, const char *name);
 static void ws_set_master_level(float level);
 static void ws_set_master_mute (bool mute);
+static void ws_set_meter_enabled(bool on);
 static void ws_stop(void);
 static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data);
 static void send_envelope(const char *method, const char *path, const char *body_json);
@@ -466,6 +487,7 @@ static const ms_client_iface_t s_iface = {
     .set_master_mute       = ws_set_master_mute,
     .fetch_all_strip_names = ws_fetch_all_strip_names,
     .get_strip_name        = ws_get_strip_name,
+    .set_meter_enabled     = ws_set_meter_enabled,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -870,6 +892,136 @@ static void subscribe_path(const char *dotted, const char *format)
     send_envelope("POST", "/console/data/subscribe", body);
 }
 
+// #30: send metering2 subscribe/unsubscribe. Body is bigger than the
+// stack-allocated frame in send_envelope (256 B) for >8 channels, so
+// we build it via cJSON and send_text directly. params order matches
+// app_state slot order so decode can index by position.
+static void meter_send_subscribe(void)
+{
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
+
+    s_meter_param_count = 0;
+    cJSON *root   = cJSON_CreateObject();
+    cJSON *body   = cJSON_CreateObject();
+    cJSON *params = cJSON_CreateArray();
+    if (!root || !body || !params) {
+        if (root)   cJSON_Delete(root);
+        if (body)   cJSON_Delete(body);
+        if (params) cJSON_Delete(params);
+        return;
+    }
+    for (size_t i = 0; i < app_state_count() && i < APP_CONFIG_MAX_CHANNELS; ++i) {
+        int ch_id = app_state_id_for_idx(i);
+        if (ch_id < 0) continue;
+        s_meter_param_ids[s_meter_param_count++] = ch_id;
+        cJSON *p = cJSON_CreateObject();
+        cJSON_AddNumberToObject(p, "index", ch_id);
+        cJSON_AddNumberToObject(p, "type",  0);  // mono peak; verified
+        cJSON_AddItemToArray(params, p);
+    }
+    cJSON_AddBoolToObject  (body, "binary",   true);
+    cJSON_AddNumberToObject(body, "interval", METERING_INTERVAL_MS);
+    cJSON_AddNumberToObject(body, "id",       METERING_SUB_ID);
+    cJSON_AddItemToObject  (body, "params",   params);  // takes ownership
+
+    cJSON_AddStringToObject(root, "method", "POST");
+    cJSON_AddStringToObject(root, "path",   "/console/metering2/subscribe");
+    cJSON_AddItemToObject  (root, "body",   body);      // takes ownership
+
+    char *frame = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!frame) return;
+    APP_LOGD_I("ms_ws", "meter subscribe: %d channels @ %d ms",
+               s_meter_param_count, METERING_INTERVAL_MS);
+    esp_websocket_client_send_text(s_ws, frame, strlen(frame), portMAX_DELAY);
+    free(frame);
+}
+
+static void meter_send_unsubscribe(void)
+{
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
+    char body[24];
+    snprintf(body, sizeof(body), "{\"id\":%d}", METERING_SUB_ID);
+    send_envelope("POST", "/console/metering/unsubscribe", body);
+    s_meter_param_count = 0;
+}
+
+static void ws_set_meter_enabled(bool on)
+{
+    bool was = s_meter_subscribed;
+    s_meter_subscribed = on;
+    if (!on && was) {
+        meter_send_unsubscribe();
+    }
+    if (on) {
+        meter_send_subscribe();
+    }
+    // Always reset cached meter values to the "no sample" sentinel on a
+    // mode flip — clears stale fill that would briefly flash on the bar
+    // before the first new broadcast arrives, both directions.
+    if (on != was) {
+        for (size_t i = 0; i < app_state_count(); ++i) {
+            app_state_set_meter_db(i, -200.0f, true);
+        }
+    }
+}
+
+// Pads a non-padded base64 string in place so mbedtls accepts it. MS
+// emits the trailing '=' padding stripped (RFC 4648 5.) — we re-add up
+// to 2 '='s. Output buffer must have room for in_len + 3.
+static size_t pad_b64(char *buf, size_t in_len, size_t buf_cap)
+{
+    size_t pad = (4 - (in_len % 4)) % 4;
+    if (in_len + pad + 1 > buf_cap) return 0;
+    for (size_t i = 0; i < pad; ++i) buf[in_len + i] = '=';
+    buf[in_len + pad] = '\0';
+    return in_len + pad;
+}
+
+// Decode one /console/metering2/<id> broadcast body. Filters by id so a
+// stale subscription (after a mix-change resub or test scaffolding) is
+// ignored. Maps payload position -> app_state slot via s_meter_param_ids.
+static void handle_metering(int sub_id, cJSON *jbody)
+{
+    if (sub_id != METERING_SUB_ID) return;
+    if (s_meter_param_count <= 0) return;
+
+    cJSON *jb = cJSON_GetObjectItem(jbody, "b");
+    if (!cJSON_IsString(jb) || !jb->valuestring) return;
+    const char *b64 = jb->valuestring;
+    size_t in_len = strlen(b64);
+    if (in_len == 0) return;
+
+    // Pad in a stack copy. Bound max size: APP_CONFIG_MAX_CHANNELS *
+    // 2 bytes (mono peak per channel) -> 48B raw -> ~64B base64.
+    char padded[96];
+    if (in_len + 4 > sizeof(padded)) return;
+    memcpy(padded, b64, in_len);
+    size_t padded_len = pad_b64(padded, in_len, sizeof(padded));
+    if (padded_len == 0) return;
+
+    unsigned char raw[APP_CONFIG_MAX_CHANNELS * 2 + 4];
+    size_t        raw_len = 0;
+    int rc = mbedtls_base64_decode(raw, sizeof(raw), &raw_len,
+                                   (const unsigned char *) padded, padded_len);
+    if (rc != 0) {
+        APP_LOGD_W("ms_ws", "meter b64 decode rc=%d", rc);
+        return;
+    }
+    int values = (int) (raw_len / 2);
+    if (values > s_meter_param_count) values = s_meter_param_count;
+
+    for (int i = 0; i < values; ++i) {
+        int ch_id = s_meter_param_ids[i];
+        int idx   = app_state_idx_for_id(ch_id);
+        if (idx < 0) continue;
+        // big-endian int16, scale=100. -90.0 = silence floor on Si.
+        int16_t v = (int16_t) ((raw[2 * i] << 8) | raw[2 * i + 1]);
+        float db  = (float) v / 100.0f;
+        app_state_set_meter_db((size_t) idx, db, true);
+    }
+}
+
 static void on_connected_subscribe_all(void)
 {
     // For each tracked channel, subscribe to its fader (norm 0..1), scribble
@@ -947,6 +1099,15 @@ static void on_connected_subscribe_all(void)
 
     ESP_LOGI(TAG, "subscribed %d channels + %d mix names + master(ch.%d)",
              (int) app_state_count(), s_mix_count, master_id);
+
+    // #30: re-arm metering subscription if the user had it on across the
+    // reconnect (or set_mix re-subscribes the channel set under a new
+    // mix). Always rebuild rather than try to dedupe — MS dedupes by id
+    // and accepts a fresh /console/metering2/subscribe as an in-place
+    // replacement of the params list.
+    if (s_meter_subscribed) {
+        meter_send_subscribe();
+    }
 }
 
 static void handle_broadcast(const char *json, size_t len)
@@ -969,9 +1130,22 @@ static void handle_broadcast(const char *json, size_t len)
         return;
     }
 
+    const char *p = jpath->valuestring;
+
+    // #30: metering2 broadcasts arrive on /console/metering2/<id>, NOT
+    // /console/data/get/, so route them off here before the data-prefix
+    // check below.
+    {
+        int sub_id;
+        if (sscanf(p, "/console/metering2/%d", &sub_id) == 1) {
+            handle_metering(sub_id, jbody);
+            cJSON_Delete(root);
+            return;
+        }
+    }
+
     // Strip the "/console/data/get/" prefix. Anything that doesn't carry it
     // isn't a value broadcast we care about.
-    const char *p = jpath->valuestring;
     if (strncmp(p, WS_GET_PREFIX, WS_GET_PREFIX_LEN) != 0) {
         cJSON_Delete(root);
         return;

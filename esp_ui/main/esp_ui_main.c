@@ -189,4 +189,16 @@ void app_main(void)
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up.
     ms->start();
+
+    // #30: if the user had the meter indicator on at last shutdown, prime
+    // the WS client's "subscribed" flag so the connect handler subscribes
+    // metering on first connect. set_meter_enabled is idempotent and the
+    // actual /console/metering2/subscribe send is gated on the WS being
+    // open, so calling it here before connect just sets the bookkeeping
+    // bit and the on-connect handler does the real work.
+    if (ms->set_meter_enabled) {
+        bool want_meter = (app_prefs_get_signal_indicator() ==
+                           APP_SIGNAL_INDICATOR_METER);
+        ms->set_meter_enabled(want_meter);
+    }
 }
