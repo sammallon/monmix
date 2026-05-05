@@ -4255,29 +4255,27 @@ static void start_clock_once(void)
     // takes slot 0 and the user's pref is the static fallback in slot 1.
     // When false, only the user's manual server is used -- DHCP-supplied
     // NTP is ignored even if the network offers it.
-    // sntp_setservername STORES THE POINTER, not a copy. Stack-buffered
-    // hostnames dangle after return. Keep the live copy in a file-static
-    // buffer so the pointer stays valid for the lifetime of the SNTP
-    // service. (Earlier intermittent "first sync works, then stops"
-    // behaviour was the GC race against this.)
+    // sntp_setservername (the underlying lwIP call) stores the pointer
+    // we pass, not a copy. Keep the live hostname in a file-static buffer
+    // so the pointer stays valid for the lifetime of the SNTP service --
+    // dangling stack pointers were the cause of the "first sync works,
+    // then stops" race we hit earlier with both the wrapper and bare API.
     static char s_ntp_server_static[APP_PREFS_STR_MAX];
     app_prefs_get_ntp_server(s_ntp_server_static, sizeof(s_ntp_server_static));
     if (s_ntp_server_static[0] == '\0') {
         // App_time_init handles plain init; nothing to do.
     } else {
         bool use_dhcp = app_prefs_get_ntp_use_dhcp();
-        // Bare lwIP SNTP API. The earlier esp_netif_sntp wrapper returned
-        // ESP_OK on init but never actually started the poll timer on this
-        // BSP -- sntp_get_sync_status stayed in RESET indefinitely. The
-        // bare API path schedules the first request immediately via
-        // esp_sntp_init() and the clock syncs in ~1 s.
-        esp_sntp_stop();   // safe if not started
+        // Tried moving back to esp_netif_sntp_init with the same static
+        // buffer -- still didn't sync (poll timer never fires on this BSP).
+        // The bare lwIP path syncs in ~5 s reliably, so we stay on it.
+        esp_sntp_stop();
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, s_ntp_server_static);
         if (use_dhcp) {
-            // Slot 1 = manual fallback. If the DHCP server provides
-            // option-42, lwIP overwrites slot 0; otherwise slot 1 remains
-            // as the user's manual server and the clock still syncs.
+            // Slot 1 = manual fallback. If DHCP option-42 arrives, lwIP
+            // overwrites slot 0; otherwise slot 1 stays as the manual
+            // server and the clock still syncs.
             esp_sntp_setservername(1, s_ntp_server_static);
             esp_sntp_servermode_dhcp(true);
         } else {
