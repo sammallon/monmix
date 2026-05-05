@@ -138,10 +138,12 @@ static esp_err_t init_panel(esp_lcd_panel_io_handle_t *io_out,
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_dbi(dsi_bus, &dbi_cfg, &io),
                         TAG, "dbi io");
 
-    // Hand-built dpi config — the EK79007 1.0.4 macro references fields
-    // (pixel_format, flags.use_dma2d) that don't exist on IDF v6.0.1's
-    // esp_lcd_dpi_panel_config_t. Timings come from Elecrow's Lesson07
-    // tuning (board_config.h) for this SKU.
+    // Hand-built dpi config. EK79007 2.0.2 ships an IDF v6-aware macro
+    // (EK79007_1024_600_PANEL_60HZ_CONFIG_CF) but switching to it would
+    // still require overriding 4 fields -- 51 vs 52 MHz clock, 70 vs 10
+    // hsync pulse width, 10 vs 1 vsync pulse width, plus adding
+    // out_color_format which the macro omits. Timings come from Elecrow's
+    // Lesson07 tuning (board_config.h) for this SKU.
     esp_lcd_dpi_panel_config_t dpi_cfg = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
