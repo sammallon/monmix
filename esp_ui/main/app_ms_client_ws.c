@@ -130,6 +130,14 @@ static float   s_pending_set_value[APP_CONFIG_MAX_CHANNELS];
 static int     s_pending_set_mix  [APP_CONFIG_MAX_CHANNELS];
 static uint8_t s_pending_resends  [APP_CONFIG_MAX_CHANNELS];
 
+// Cached level-format pref. Drives which format we subscribe `lvl` and
+// `mix.lvl` paths in -- one subscription per channel, no dual-sub, no
+// REST polling. NORM gets `lvl/norm` (audio-tapered slider matching MS);
+// DB gets `lvl/val` (linear-in-dB slider, dB readout direct from sub).
+// Initialized from prefs in ws_start; updated by ws_set_level_format on
+// user toggle, which re-subscribes every tracked channel + master.
+static app_level_format_t s_level_format = APP_LEVEL_FORMAT_NORM;
+
 // #30: realtime metering. Single /console/metering2 subscription that
 // covers every tracked channel. Server paces at the requested interval
 // (verified 10 Hz with INTERVAL_MS=100 against the offline MS instance,
@@ -200,6 +208,8 @@ static void ws_set_mute (int ms_channel_id, bool mute);
 static void ws_set_name (int ms_channel_id, const char *name);
 static void ws_set_master_level(float level);
 static void ws_set_master_mute (bool mute);
+static void ws_set_level_format(app_level_format_t f);
+static int  master_channel_id  (void);
 static void ws_set_meter_enabled(bool on);
 static void ws_stop(void);
 static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data);
@@ -547,6 +557,7 @@ static const ms_client_iface_t s_iface = {
     .fetch_channel_routability = ws_fetch_channel_routability,
     .is_channel_routable       = ws_is_channel_routable,
     .set_meter_enabled     = ws_set_meter_enabled,
+    .set_level_format      = ws_set_level_format,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -677,15 +688,18 @@ static void ws_watchdog_task(void *arg)
     }
 }
 
-// P8: REST GET the current `lvl` for one channel/mix and parse the value.
-// Returns true + writes *out_level on 200 OK with a numeric body.value.
-static bool poll_fetch_level(int ms_channel_id, int mix_idx, float *out_level)
+// P8: REST GET the current `lvl` for one channel/mix and parse the value
+// as slider position 0..1. Format-aware: in DB mode we GET /val (dB) and
+// convert, in NORM mode we GET /norm directly. Returns true on 200 OK
+// with a numeric body.value.
+static bool poll_fetch_level(int ms_channel_id, int mix_idx, float *out_position)
 {
+    const char *fmt = (s_level_format == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
     char url[128];
     snprintf(url, sizeof(url),
-             "http://%s:%u/console/data/get/ch.%d.levelData.%d.lvl/norm",
+             "http://%s:%u/console/data/get/ch.%d.levelData.%d.lvl/%s",
              app_config_ms_host(), (unsigned) app_config_ms_port(),
-             ms_channel_id, mix_idx);
+             ms_channel_id, mix_idx, fmt);
 
     poll_sink_t sink = {0};
     esp_http_client_config_t cfg = {
@@ -712,7 +726,14 @@ static bool poll_fetch_level(int ms_channel_id, int mix_idx, float *out_level)
     if (!root) return false;
     cJSON *jv = cJSON_GetObjectItem(root, "value");
     bool ok = cJSON_IsNumber(jv);
-    if (ok) *out_level = (float) jv->valuedouble;
+    if (ok) {
+        float v = (float) jv->valuedouble;
+        if (s_level_format == APP_LEVEL_FORMAT_DB) {
+            *out_position = app_db_to_position(v);
+        } else {
+            *out_position = v;
+        }
+    }
     cJSON_Delete(root);
     return ok;
 }
@@ -750,8 +771,14 @@ static void poll_watchdog_scan(void)
                        ch_id, mix, (double) sent, (double) board);
             // Server-snap is source of truth — route through app_state with
             // notify=true so the dirty-sweep redraws the slider, exactly
-            // like a normal WS broadcast would.
-            app_state_set_level(i, board, true);
+            // like a normal WS broadcast would. board is slider position
+            // 0..1; in DB mode convert to dB before storing in level_db.
+            if (s_level_format == APP_LEVEL_FORMAT_DB) {
+                float db = app_position_to_db(board);
+                app_state_set_level_db(i, db, true);
+            } else {
+                app_state_set_level(i, board, true);
+            }
         } else if (s_pending_resends[i] < POLL_RESEND_BUDGET) {
             // Tertiary fallback: re-send the SET. Bounded to one retry to
             // avoid pinning the WS task on a stuck connection.
@@ -788,6 +815,11 @@ static bool ws_start(void)
 {
     if (!ws_create_and_start()) return false;
 
+    // Snapshot the current level-format so the first on_connected_subscribe_all
+    // picks the right set of subscriptions. Live toggles afterward go
+    // through ws_set_level_format.
+    s_level_format = app_prefs_get_level_format();
+
     // Spin up the reconnect watchdog once. ws_start is called once from
     // app_main; if that ever changes we'd need a one-shot guard here.
     xTaskCreate(ws_watchdog_task,   "ms_ws_wdt",   4096, NULL, 5, NULL);
@@ -798,10 +830,56 @@ static bool ws_start(void)
     return true;
 }
 
-static void ws_set_level(int ms_channel_id, float level)
+// Re-subscribe every fader (input + master) under the new format. Per
+// repro_ms_subscribe_format.py, MS treats subscriptions as path-keyed:
+// re-subscribing the same path with a different format REPLACES the
+// previous one. So we just sub the new format and the old one drops
+// implicitly. MS also pushes the current value immediately on subscribe,
+// so the slider/readout refresh without waiting for a move.
+//
+// Pending-set values are cleared because they were stamped against the
+// old format's units (norm vs dB); a stale resend after a toggle would
+// send the wrong wire format.
+static void ws_set_level_format(app_level_format_t f)
 {
-    if (level < 0.0f) level = 0.0f;
-    if (level > 1.0f) level = 1.0f;
+    if (s_level_format == f) return;
+    s_level_format = f;
+
+    if (!s_ws || !esp_websocket_client_is_connected(s_ws)) {
+        // Format will be picked up by the next on_connected_subscribe_all.
+        return;
+    }
+
+    const char *level_fmt = (f == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
+
+    for (size_t i = 0; i < app_state_count(); ++i) {
+        int ch_id = app_state_id_for_idx(i);
+        if (ch_id < 0) continue;
+        char dotted[48];
+        snprintf(dotted, sizeof(dotted),
+                 "ch.%d.levelData.%d.lvl", ch_id, s_mix_bus_idx);
+        subscribe_path(dotted, level_fmt);
+        if (i < APP_CONFIG_MAX_CHANNELS) {
+            s_pending_set_at_us[i] = 0;
+            s_pending_resends [i] = 0;
+        }
+    }
+
+    int master_id = master_channel_id();
+    if (master_id >= 0) {
+        char dotted[32];
+        snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", master_id);
+        subscribe_path(dotted, level_fmt);
+    }
+}
+
+// Caller passes the slider position 0..1. The wire format depends on the
+// current level-format pref: NORM sends norm directly via /lvl/norm; DB
+// converts to dB via the linear-in-dB mapping and sends via /lvl/val.
+static void ws_set_level(int ms_channel_id, float position)
+{
+    if (position < 0.0f) position = 0.0f;
+    if (position > 1.0f) position = 1.0f;
 
     if (!s_ws || !esp_websocket_client_is_connected(s_ws)) {
         ESP_LOGW(TAG, "set_level dropped: ws not connected");
@@ -809,13 +887,19 @@ static void ws_set_level(int ms_channel_id, float level)
     }
 
     char path[80];
-    snprintf(path, sizeof(path),
-             "/console/data/set/ch.%d.levelData.%d.lvl/norm",
-             ms_channel_id, s_mix_bus_idx);
-
     char body[48];
-    snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)level);
-
+    if (s_level_format == APP_LEVEL_FORMAT_DB) {
+        float db = app_position_to_db(position);
+        snprintf(path, sizeof(path),
+                 "/console/data/set/ch.%d.levelData.%d.lvl/val",
+                 ms_channel_id, s_mix_bus_idx);
+        snprintf(body, sizeof(body), "{\"value\":%.4f}", (double)db);
+    } else {
+        snprintf(path, sizeof(path),
+                 "/console/data/set/ch.%d.levelData.%d.lvl/norm",
+                 ms_channel_id, s_mix_bus_idx);
+        snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)position);
+    }
     send_envelope("POST", path, body);
 
     // Arm the outstanding-SET tracker. Cleared in handle_broadcast on the
@@ -823,11 +907,12 @@ static void ws_set_level(int ms_channel_id, float level)
     // by slot index, not channel id, so reordered slots stay aligned with
     // the broadcast handler's lookup. Reset retry budget on every fresh
     // user-driven SET so a re-send earlier in the session doesn't poison
-    // a later legit drop.
+    // a later legit drop. We stash the slider position (0..1) so the
+    // resync re-send maps back through the current format.
     int idx = app_state_idx_for_id(ms_channel_id);
     if (idx >= 0 && idx < APP_CONFIG_MAX_CHANNELS) {
         s_pending_set_at_us[idx] = esp_timer_get_time();
-        s_pending_set_value[idx] = level;
+        s_pending_set_value[idx] = position;
         s_pending_set_mix  [idx] = s_mix_bus_idx;
         s_pending_resends  [idx] = 0;
     }
@@ -843,19 +928,29 @@ static int master_channel_id(void)
     return s_mix_offset + s_mix_bus_idx;
 }
 
-static void ws_set_master_level(float level)
+// Caller passes slider position 0..1. Same format-aware conversion as
+// ws_set_level -- the master rides `mix.lvl` which accepts both norm and
+// val format selectors.
+static void ws_set_master_level(float position)
 {
-    if (level < 0.0f) level = 0.0f;
-    if (level > 1.0f) level = 1.0f;
+    if (position < 0.0f) position = 0.0f;
+    if (position > 1.0f) position = 1.0f;
     if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return;
     int id = master_channel_id();
     if (id < 0) return;
 
     char path[64];
-    snprintf(path, sizeof(path),
-             "/console/data/set/ch.%d.mix.lvl/norm", id);
     char body[48];
-    snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)level);
+    if (s_level_format == APP_LEVEL_FORMAT_DB) {
+        float db = app_position_to_db(position);
+        snprintf(path, sizeof(path),
+                 "/console/data/set/ch.%d.mix.lvl/val", id);
+        snprintf(body, sizeof(body), "{\"value\":%.4f}", (double)db);
+    } else {
+        snprintf(path, sizeof(path),
+                 "/console/data/set/ch.%d.mix.lvl/norm", id);
+        snprintf(body, sizeof(body), "{\"value\":%.6f}", (double)position);
+    }
     send_envelope("POST", path, body);
 }
 
@@ -950,6 +1045,7 @@ static void subscribe_path(const char *dotted, const char *format)
              "{\"path\":\"%s\",\"format\":\"%s\"}", dotted, format);
     send_envelope("POST", "/console/data/subscribe", body);
 }
+
 
 // #30: send metering2 subscribe/unsubscribe. Body is bigger than the
 // stack-allocated frame in send_envelope (256 B) for >8 channels, so
@@ -1083,9 +1179,14 @@ static void handle_metering(int sub_id, cJSON *jbody)
 
 static void on_connected_subscribe_all(void)
 {
-    // For each tracked channel, subscribe to its fader (norm 0..1), scribble
-    // strip name, and mute state. The initial-value broadcasts populate
-    // app_state before the user touches anything.
+    // For each tracked channel, subscribe to its fader, scribble-strip
+    // name, and mute state. The fader is subscribed in EITHER norm or val
+    // format -- never both. NORM mode gets the audio-tapered MS norm
+    // (slider position == norm); DB mode gets dB and the slider position
+    // is derived linearly across APP_DB_MIN..APP_DB_MAX. Toggling the
+    // level-format pref calls ws_set_level_format which re-subscribes
+    // every channel under the new format.
+    const char *level_fmt = (s_level_format == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
     for (size_t i = 0; i < app_state_count(); ++i) {
         int ch_id = app_state_id_for_idx(i);
         if (ch_id < 0) continue;
@@ -1093,15 +1194,7 @@ static void on_connected_subscribe_all(void)
         char dotted[48];
         snprintf(dotted, sizeof(dotted),
                  "ch.%d.levelData.%d.lvl", ch_id, s_mix_bus_idx);
-        subscribe_path(dotted, "norm");
-
-        // Same level node, different alias + format → MS sends dB. We need
-        // both because norm drives the slider linearly and dB drives the
-        // user-facing readout (with non-linear MS-specific mapping that we
-        // can't compute locally).
-        snprintf(dotted, sizeof(dotted),
-                 "ch.%d.levelData.%d.level", ch_id, s_mix_bus_idx);
-        subscribe_path(dotted, "val");
+        subscribe_path(dotted, level_fmt);
 
         snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", ch_id);
         subscribe_path(dotted, "val");
@@ -1138,16 +1231,16 @@ static void on_connected_subscribe_all(void)
     }
 
     // Master strip — the mix bus's own output. Path shape differs from
-    // input strips: `ch.<N>.mix.lvl` (norm only — there's no `level`
-    // alias on the master, see repro_ms_master_fader.py findings) and
-    // `ch.<N>.mix.on`. Master `cfg.name` subscription is already covered
-    // by the mix-name loop above. Re-aimed at the new id on every
-    // set_mix via ws_resubscribe → here.
+    // input strips: `ch.<N>.mix.lvl` (no `level` alias -- see
+    // repro_ms_master_fader.py) and `ch.<N>.mix.on`. Same format-aware
+    // single-sub pattern as inputs: NORM gets norm, DB gets val. Master
+    // `cfg.name` is already subscribed by the mix-name loop above.
+    // Re-aimed at the new id on every set_mix via ws_resubscribe → here.
     int master_id = master_channel_id();
     if (master_id >= 0) {
         char dotted[32];
         snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", master_id);
-        subscribe_path(dotted, "norm");
+        subscribe_path(dotted, level_fmt);
         snprintf(dotted, sizeof(dotted), "ch.%d.mix.on", master_id);
         subscribe_path(dotted, "val");
         // Hand the id to app_state so the master-state's mute/level
@@ -1231,9 +1324,15 @@ static void handle_broadcast(const char *json, size_t len)
                 if (idx < APP_CONFIG_MAX_CHANNELS) {
                     s_pending_set_at_us[idx] = 0;
                 }
-                app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
-            } else if (strcmp(suffix, "level") == 0 && cJSON_IsNumber(jvalue)) {
-                app_state_set_level_db((size_t)idx, (float)jvalue->valuedouble, true);
+                // Format-aware: in DB mode the broadcast carries dB; in
+                // NORM mode it carries norm. Update the matching state
+                // field; the UI's apply_pending picks the right one based
+                // on the current format pref.
+                if (s_level_format == APP_LEVEL_FORMAT_DB) {
+                    app_state_set_level_db((size_t)idx, (float)jvalue->valuedouble, true);
+                } else {
+                    app_state_set_level((size_t)idx, (float)jvalue->valuedouble, true);
+                }
             } else if (strcmp(suffix, "on") == 0 && cJSON_IsBool(jvalue)) {
                 // MS `.on` true = audible, false = muted. Flip to our
                 // user-facing boolean (true = "this channel is silenced").
@@ -1282,13 +1381,16 @@ static void handle_broadcast(const char *json, size_t len)
     // Master strip values: ch.<N>.mix.<lvl|on>. Filter by current master id
     // — old subs from a prior mix can still fire (true unsubscribe is a
     // follow-up, same caveat as the per-channel re-subscribe note in
-    // ws_set_mix). lvl arrives as norm only; master has no `level` alias
-    // (verified in repro_ms_master_fader.py) so dB-format readout falls
-    // back to the slider percent in app_ui.
+    // ws_set_mix). Format-aware like input strips: DB mode subs `mix.lvl`
+    // as val (dB), NORM mode as norm.
     if (sscanf(dotted, "ch.%d.mix.%15s", &ch, suffix) == 2 &&
         ch == master_channel_id()) {
         if (strcmp(suffix, "lvl") == 0 && cJSON_IsNumber(jvalue)) {
-            app_state_master_set_level((float)jvalue->valuedouble, true);
+            if (s_level_format == APP_LEVEL_FORMAT_DB) {
+                app_state_master_set_level_db((float)jvalue->valuedouble, true);
+            } else {
+                app_state_master_set_level((float)jvalue->valuedouble, true);
+            }
         } else if (strcmp(suffix, "on") == 0 && cJSON_IsBool(jvalue)) {
             bool ms_on = cJSON_IsTrue(jvalue);
             app_state_master_set_mute(!ms_on, true);

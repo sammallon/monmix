@@ -1,6 +1,45 @@
 #pragma once
 
+#include <math.h>
 #include <stdbool.h>
+
+#include "app_prefs.h"
+
+// MS lvl/val range on the Si Expression 2 (verified by repro_ms_master_fader.py).
+#define APP_DB_MIN   (-138.0f)
+#define APP_DB_MAX   (10.0f)
+#define APP_DB_RANGE (APP_DB_MAX - APP_DB_MIN)
+
+// DB-mode slider taper: 4th-root curve so unity gain (0 dB) lands at
+// ~75% slider position and useful headroom (-15 dB..+10 dB) gets the
+// top quarter of travel. Linear-in-dB compressed everything useful
+// into the top 11% (since 0 dB sits at (138/148)=93% on a linear ramp);
+// pow 0.25 expands that out to roughly an audio-taper feel.
+//
+//   pos -> db: db = APP_DB_MIN + APP_DB_RANGE * pos^0.25
+//   db -> pos: pos = ((db - APP_DB_MIN) / APP_DB_RANGE)^4
+//
+// Sample points (k=0.25):
+//   pos 0.10 -> -54 dB        pos 0.50 -> -13 dB
+//   pos 0.25 -> -33 dB        pos 0.75 ->   0 dB
+//   pos 0.90 ->  +6 dB        pos 1.00 -> +10 dB
+//
+// Implemented with sqrtf (forward = 4th root via two sqrts) and a
+// 4-mul (inverse) -- avoids powf and stays out of libm hot paths.
+static inline float app_db_to_position(float db)
+{
+    if (db <= APP_DB_MIN) return 0.0f;
+    if (db >= APP_DB_MAX) return 1.0f;
+    float linear = (db - APP_DB_MIN) / APP_DB_RANGE;
+    return linear * linear * linear * linear;
+}
+
+static inline float app_position_to_db(float pos)
+{
+    if (pos <= 0.0f) return APP_DB_MIN;
+    if (pos >= 1.0f) return APP_DB_MAX;
+    return APP_DB_MIN + APP_DB_RANGE * sqrtf(sqrtf(pos));
+}
 
 typedef enum {
     APP_MS_STATE_BOOT = 0,    // before start()
@@ -117,6 +156,15 @@ typedef struct {
     // every reconnect/resubscribe so the subscription survives WS
     // bounce. Routes incoming dB values through app_state_set_meter_db.
     void (*set_meter_enabled)(bool on);
+
+    // Tell the client which format the UI is currently displaying. Used
+    // to gate the dB-only subscriptions: in NORM mode only `lvl/norm` is
+    // subscribed (input strips and master); in DB mode the input strips
+    // also subscribe `level/val` and the master arms a debounced REST
+    // fetch for `mix.lvl/val` (master has no `level` alias to subscribe
+    // alongside `lvl`, see repro_ms_subscribe_format.py). Idempotent;
+    // called on every level-format pref change.
+    void (*set_level_format)(app_level_format_t f);
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);

@@ -450,10 +450,18 @@ static void on_slider_changed(lv_event_t *e)
     size_t    idx    = (size_t)(uintptr_t)lv_event_get_user_data(e);
     lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
     int       v      = lv_slider_get_value(slider);
-    float     level  = (float)v / 100.0f;
+    float     position = (float)v / 100.0f;
 
-    // Update local state without notifying — UI already reflects this value.
-    app_state_set_level(idx, level, false);
+    // Single subscription per channel: either lvl/norm (NORM) or lvl/val
+    // (DB). Update the matching app_state field so apply_pending picks
+    // the right one without waiting for the echo.
+    app_level_format_t fmt = app_prefs_get_level_format();
+    if (fmt == APP_LEVEL_FORMAT_DB) {
+        float db = app_position_to_db(position);
+        app_state_set_level_db(idx, db, false);
+    } else {
+        app_state_set_level(idx, position, false);
+    }
 
     // Rate-limit outbound SETs to ~20 Hz per channel. Each SET produces a
     // server-snap echo on the same WS, so unlimited drag-frequency SETs
@@ -461,15 +469,18 @@ static void on_slider_changed(lv_event_t *e)
     // The final value is sent on slider release, see on_slider_released.
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (now - s_last_send_ms[idx] >= SET_MIN_INTERVAL_MS) {
-        send_level_now(idx, level);
+        send_level_now(idx, position);
     }
 
-    // Mid-drag the dB hasn't echoed back yet, so use the slider's
-    // immediate value for the readout. The post-drag MS broadcast
-    // updates app_state.level_db and apply_pending takes over.
+    // Local readout — value is known immediately from slider position, no
+    // need to wait for the echo.
     char buf[12];
-    if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
-        snprintf(buf, sizeof(buf), "...");
+    if (fmt == APP_LEVEL_FORMAT_DB) {
+        if (v <= 0) {
+            snprintf(buf, sizeof(buf), "-\xe2\x88\x9e dB");
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f dB", app_position_to_db(position));
+        }
     } else {
         snprintf(buf, sizeof(buf), "%d", v);
     }
@@ -584,26 +595,34 @@ static void apply_pending(void *unused)
         if (picker_visible && i == s_picker_target_idx) {
             picker_refresh_title();
         }
-        int v = (int)(ch.level * 100.0f);
         // LV_ANIM_OFF: network echoes can arrive every ~10ms during a drag;
         // queueing/cancelling 200ms animations on each one trashes LVGL.
-        lv_slider_set_value(s_widgets[i].slider, v, LV_ANIM_OFF);
+        // Slider position is computed from whichever state field matches
+        // the active format (only that one is being kept fresh by the
+        // single-format subscription).
+        app_level_format_t fmt = app_prefs_get_level_format();
+        int v;
         char buf[12];
-        if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
+        if (fmt == APP_LEVEL_FORMAT_DB) {
             // MS reports min ~= -138 dB on the Si Expression 2; display
-            // "-inf dB" there since the channel is effectively off. Above the
-            // floor we round to the nearest dB -- a half-dB step is finer
-            // than the mixer's quantization, no need for decimals on a
-            // glance-readout. Infinity glyph (U+221E) requires
+            // "-inf dB" there since the channel is effectively off. Above
+            // the floor we round to the nearest dB -- a half-dB step is
+            // finer than the mixer's quantization, no need for decimals
+            // on a glance-readout. Infinity glyph (U+221E) requires
             // font_monmix_level set on the label by build_fader.
-            if (ch.level_db <= -138.0f) {
+            float db = ch.level_db;
+            v = (int)(app_db_to_position(db) * 100.0f);
+            if (db <= APP_DB_MIN) {
                 snprintf(buf, sizeof(buf), "-\xe2\x88\x9e dB");
             } else {
-                snprintf(buf, sizeof(buf), "%.0f dB", ch.level_db);
+                if (db > APP_DB_MAX) db = APP_DB_MAX;
+                snprintf(buf, sizeof(buf), "%.0f dB", db);
             }
         } else {
+            v = (int)(ch.level * 100.0f);
             snprintf(buf, sizeof(buf), "%d", v);
         }
+        lv_slider_set_value(s_widgets[i].slider, v, LV_ANIM_OFF);
         lv_label_set_text(s_widgets[i].label_val, buf);
         lv_label_set_text(s_widgets[i].label_name, ch.name);
         if (s_widgets[i].btn_mute) {
@@ -628,8 +647,14 @@ static void apply_pending(void *unused)
         // signal-present mode is the legacy "level > 0 && !mute" derive.
         app_signal_indicator_t mode = app_prefs_get_signal_indicator();
         if (s_widgets[i].signal_dot) {
+            // Position-above-floor check: only one of level/level_db is
+            // kept fresh (single subscription per channel) so derive from
+            // the field that matches the current format.
+            float pos = (fmt == APP_LEVEL_FORMAT_DB)
+                ? app_db_to_position(ch.level_db)
+                : ch.level;
             bool show_dot = (mode == APP_SIGNAL_INDICATOR_PRESENT) &&
-                            !ch.mute && ch.level > 0.01f;
+                            !ch.mute && pos > 0.01f;
             if (show_dot) {
                 lv_obj_set_style_bg_color(s_widgets[i].signal_dot,
                                           lv_color_hex(0x40C040), 0);
@@ -647,17 +672,28 @@ static void apply_pending(void *unused)
         }
     }
 
-    // Master strip — same redraw shape as the input strips. Master has no
-    // `level` (dB) alias on MS, so the dB-format readout falls back to the
-    // slider percent.
+    // Master strip — same format-aware redraw shape as the input strips.
     if (s_master_dirty && s_master_widgets.slider) {
         s_master_dirty = false;
         app_channel_t m;
         if (app_state_master_get(&m)) {
-            int v = (int)(m.level * 100.0f);
-            lv_slider_set_value(s_master_widgets.slider, v, LV_ANIM_OFF);
+            app_level_format_t fmt = app_prefs_get_level_format();
+            int v;
             char buf[12];
-            snprintf(buf, sizeof(buf), "%d", v);
+            if (fmt == APP_LEVEL_FORMAT_DB) {
+                float db = m.level_db;
+                v = (int)(app_db_to_position(db) * 100.0f);
+                if (db <= APP_DB_MIN) {
+                    snprintf(buf, sizeof(buf), "-\xe2\x88\x9e dB");
+                } else {
+                    if (db > APP_DB_MAX) db = APP_DB_MAX;
+                    snprintf(buf, sizeof(buf), "%.0f dB", db);
+                }
+            } else {
+                v = (int)(m.level * 100.0f);
+                snprintf(buf, sizeof(buf), "%d", v);
+            }
+            lv_slider_set_value(s_master_widgets.slider, v, LV_ANIM_OFF);
             lv_label_set_text(s_master_widgets.label_val, buf);
             lv_label_set_text(s_master_widgets.label_name, m.name);
             if (s_master_widgets.btn_mute) {
@@ -1074,7 +1110,17 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
 
     lv_obj_t *slider = lv_slider_create(box);
     lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, (int)(ch.level * 100.0f), LV_ANIM_OFF);
+    {
+        // Initial value tracks whichever state field the active format
+        // keeps fresh; apply_pending will correct on the first broadcast.
+        int init_v;
+        if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
+            init_v = (int)(app_db_to_position(ch.level_db) * 100.0f);
+        } else {
+            init_v = (int)(ch.level * 100.0f);
+        }
+        lv_slider_set_value(slider, init_v, LV_ANIM_OFF);
+    }
     lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
     lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_event_cb(slider, on_slider_changed, LV_EVENT_VALUE_CHANGED,
@@ -1133,10 +1179,16 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
 static void on_master_slider_changed(lv_event_t *e)
 {
     lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
-    int   v     = lv_slider_get_value(slider);
-    float level = (float) v / 100.0f;
+    int   v        = lv_slider_get_value(slider);
+    float position = (float) v / 100.0f;
 
-    app_state_master_set_level(level, false);
+    app_level_format_t fmt = app_prefs_get_level_format();
+    if (fmt == APP_LEVEL_FORMAT_DB) {
+        float db = app_position_to_db(position);
+        app_state_master_set_level_db(db, false);
+    } else {
+        app_state_master_set_level(position, false);
+    }
 
     // Same 20 Hz rate-limit shape as the per-channel sliders. Master gets
     // its own send timestamp so a fast input drag doesn't gate master
@@ -1144,12 +1196,20 @@ static void on_master_slider_changed(lv_event_t *e)
     static uint32_t s_master_last_send_ms;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
     if (now - s_master_last_send_ms >= SET_MIN_INTERVAL_MS) {
-        if (s_ms && s_ms->set_master_level) s_ms->set_master_level(level);
+        if (s_ms && s_ms->set_master_level) s_ms->set_master_level(position);
         s_master_last_send_ms = now;
     }
 
     char buf[12];
-    snprintf(buf, sizeof(buf), "%d", v);
+    if (fmt == APP_LEVEL_FORMAT_DB) {
+        if (v <= 0) {
+            snprintf(buf, sizeof(buf), "-\xe2\x88\x9e dB");
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f dB", app_position_to_db(position));
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "%d", v);
+    }
     lv_label_set_text(s_master_widgets.label_val, buf);
 }
 
@@ -1223,7 +1283,15 @@ static void build_master_strip(lv_obj_t *parent)
 
     lv_obj_t *slider = lv_slider_create(box);
     lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, (int)(m.level * 100.0f), LV_ANIM_OFF);
+    {
+        int init_v;
+        if (app_prefs_get_level_format() == APP_LEVEL_FORMAT_DB) {
+            init_v = (int)(app_db_to_position(m.level_db) * 100.0f);
+        } else {
+            init_v = (int)(m.level * 100.0f);
+        }
+        lv_slider_set_value(slider, init_v, LV_ANIM_OFF);
+    }
     lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
     lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
     // Master always reads as the unity-gain accent color — no per-channel
@@ -1577,6 +1645,7 @@ static void on_lvl_norm_clicked(lv_event_t *e)
 {
     (void) e;
     app_prefs_set_level_format(APP_LEVEL_FORMAT_NORM);
+    if (s_ms && s_ms->set_level_format) s_ms->set_level_format(APP_LEVEL_FORMAT_NORM);
     lv_obj_t *btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
     update_radio_visuals(btns, 2, 0);
 }
@@ -1585,6 +1654,7 @@ static void on_lvl_db_clicked(lv_event_t *e)
 {
     (void) e;
     app_prefs_set_level_format(APP_LEVEL_FORMAT_DB);
+    if (s_ms && s_ms->set_level_format) s_ms->set_level_format(APP_LEVEL_FORMAT_DB);
     lv_obj_t *btns[2] = { s_lvl_norm_btn, s_lvl_db_btn };
     update_radio_visuals(btns, 2, 1);
 }

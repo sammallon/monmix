@@ -437,11 +437,15 @@ static int cmd_level_format(int argc, char **argv)
     }
     if (strcmp(argv[1], "norm") == 0) {
         app_prefs_set_level_format(APP_LEVEL_FORMAT_NORM);
+        const ms_client_iface_t *ms = app_ms_client_ws();
+        if (ms && ms->set_level_format) ms->set_level_format(APP_LEVEL_FORMAT_NORM);
         printf("level-format: norm\n");
         return 0;
     }
     if (strcmp(argv[1], "db") == 0) {
         app_prefs_set_level_format(APP_LEVEL_FORMAT_DB);
+        const ms_client_iface_t *ms = app_ms_client_ws();
+        if (ms && ms->set_level_format) ms->set_level_format(APP_LEVEL_FORMAT_DB);
         printf("level-format: db\n");
         return 0;
     }
