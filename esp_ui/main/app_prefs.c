@@ -53,6 +53,8 @@ static const char *TAG = "app_prefs";
 #define NVS_K_WIFI_DNS_MT    "wifi_dns_mt"
 #define NVS_K_NTP            "ntp"
 #define NVS_K_NTP_MT         "ntp_mt"
+#define NVS_K_NTP_DHCP       "ntp_dhcp"
+#define NVS_K_NTP_DHCP_MT    "ntp_dhcp_mt"
 #define NVS_K_TZ             "tz"
 #define NVS_K_TZ_MT          "tz_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
@@ -91,6 +93,7 @@ typedef enum {
     K_WIFI_GW,
     K_WIFI_DNS,
     K_NTP_SERVER,
+    K_NTP_USE_DHCP,
     K_TZ,
     K_COUNT,
 } prefs_key_t;
@@ -113,6 +116,7 @@ typedef struct {
     char                   wifi_gw [APP_PREFS_IP_STR_MAX];
     char                   wifi_dns[APP_PREFS_IP_STR_MAX];
     char                   ntp_server[APP_PREFS_STR_MAX];
+    bool                   ntp_use_dhcp;
     char                   display_tz[APP_PREFS_STR_MAX];
 } prefs_bag_t;
 
@@ -133,6 +137,7 @@ static char                    s_wifi_nm [APP_PREFS_IP_STR_MAX];
 static char                    s_wifi_gw [APP_PREFS_IP_STR_MAX];
 static char                    s_wifi_dns[APP_PREFS_IP_STR_MAX];
 static char                    s_ntp_server[APP_PREFS_STR_MAX] = DEFAULT_NTP_SERVER;
+static bool                    s_ntp_use_dhcp = true;
 static char                    s_display_tz[APP_PREFS_STR_MAX] = DEFAULT_DISPLAY_TZ;
 static uint64_t                s_mtime[K_COUNT];   // mtime of effective value, per key
 static uint64_t                s_mtime_floor;      // monotonic counter base across reboots
@@ -218,8 +223,9 @@ static const char *key_name(prefs_key_t k)
         case K_WIFI_NM:    return "wifi_static_netmask";
         case K_WIFI_GW:    return "wifi_static_gateway";
         case K_WIFI_DNS:   return "wifi_static_dns";
-        case K_NTP_SERVER: return "ntp_server";
-        case K_TZ:         return "display_tz";
+        case K_NTP_SERVER:   return "ntp_server";
+        case K_NTP_USE_DHCP: return "ntp_use_dhcp";
+        case K_TZ:           return "display_tz";
         default:           return "?";
     }
 }
@@ -306,6 +312,7 @@ static void nvs_load(prefs_bag_t *bag)
     bag->disp_rot           = APP_DISPLAY_ROTATION_0;
     bag->brightness_pct     = BRIGHTNESS_DEFAULT_PCT;
     bag->selected_mix_index = 0;
+    bag->ntp_use_dhcp = true;
     copy_str_bounded(bag->ntp_server, sizeof(bag->ntp_server), DEFAULT_NTP_SERVER);
     copy_str_bounded(bag->display_tz, sizeof(bag->display_tz), DEFAULT_DISPLAY_TZ);
 
@@ -366,6 +373,13 @@ static void nvs_load(prefs_bag_t *bag)
         bag->present[K_WIFI_STATIC] = true;
         bag->wifi_static = (u8 != 0);
         nvs_get_u64_opt(h, NVS_K_WIFI_STATIC_MT, &bag->mtime[K_WIFI_STATIC]);
+    }
+    if (nvs_get_u8(h, NVS_K_NTP_DHCP, &u8) == ESP_OK) {
+        bag->present[K_NTP_USE_DHCP] = true;
+        bag->ntp_use_dhcp = (u8 != 0);
+        nvs_get_u64_opt(h, NVS_K_NTP_DHCP_MT, &bag->mtime[K_NTP_USE_DHCP]);
+    } else {
+        bag->ntp_use_dhcp = true;  // default
     }
     struct { const char *k; const char *mk; prefs_key_t pk; char *dst; } str_keys[] = {
         { NVS_K_WIFI_IP,  NVS_K_WIFI_IP_MT,  K_WIFI_IP,  bag->wifi_ip  },
@@ -440,6 +454,10 @@ static bool nvs_write_key(prefs_key_t k, const void *value, size_t value_len, ui
             err = nvs_set_u8(h, NVS_K_WIFI_STATIC, *(const uint8_t *)value);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_STATIC_MT, mtime);
             break;
+        case K_NTP_USE_DHCP:
+            err = nvs_set_u8(h, NVS_K_NTP_DHCP, *(const uint8_t *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_NTP_DHCP_MT, mtime);
+            break;
         case K_WIFI_IP:
             err = nvs_set_str(h, NVS_K_WIFI_IP, (const char *)value);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_IP_MT, mtime);
@@ -504,6 +522,7 @@ static bool sd_load(prefs_bag_t *bag)
     bag->disp_rot           = APP_DISPLAY_ROTATION_0;
     bag->brightness_pct     = BRIGHTNESS_DEFAULT_PCT;
     bag->selected_mix_index = 0;
+    bag->ntp_use_dhcp = true;
     copy_str_bounded(bag->ntp_server, sizeof(bag->ntp_server), DEFAULT_NTP_SERVER);
     copy_str_bounded(bag->display_tz, sizeof(bag->display_tz), DEFAULT_DISPLAY_TZ);
 
@@ -592,6 +611,13 @@ static bool sd_load(prefs_bag_t *bag)
                                               : (jws->valuedouble != 0);
         bag->mtime[K_WIFI_STATIC] = json_get_u64(root, "wifi_use_static_mt");
     }
+    cJSON *jud = cJSON_GetObjectItem(root, "ntp_use_dhcp");
+    if (cJSON_IsBool(jud) || cJSON_IsNumber(jud)) {
+        bag->present[K_NTP_USE_DHCP] = true;
+        bag->ntp_use_dhcp = cJSON_IsBool(jud) ? cJSON_IsTrue(jud)
+                                              : (jud->valuedouble != 0);
+        bag->mtime[K_NTP_USE_DHCP] = json_get_u64(root, "ntp_use_dhcp_mt");
+    }
     struct { const char *jk; const char *mk; prefs_key_t pk; char *dst; } str_keys[] = {
         { "wifi_static_ip",      "wifi_static_ip_mt",      K_WIFI_IP,  bag->wifi_ip  },
         { "wifi_static_netmask", "wifi_static_netmask_mt", K_WIFI_NM,  bag->wifi_nm  },
@@ -663,6 +689,8 @@ static bool sd_save_locked(void)
     cJSON_AddNumberToObject(root, "wifi_static_dns_mt",    (double) s_mtime[K_WIFI_DNS]);
     cJSON_AddStringToObject(root, "ntp_server",            s_ntp_server);
     cJSON_AddNumberToObject(root, "ntp_server_mt",         (double) s_mtime[K_NTP_SERVER]);
+    cJSON_AddBoolToObject  (root, "ntp_use_dhcp",          s_ntp_use_dhcp);
+    cJSON_AddNumberToObject(root, "ntp_use_dhcp_mt",       (double) s_mtime[K_NTP_USE_DHCP]);
     cJSON_AddStringToObject(root, "display_timezone",      s_display_tz);
     cJSON_AddNumberToObject(root, "display_timezone_mt",   (double) s_mtime[K_TZ]);
 
@@ -739,6 +767,10 @@ static bool prefs_write_nvs_locked(prefs_key_t k)
             return nvs_write_key(k, s_wifi_dns, strlen(s_wifi_dns) + 1, s_mtime[k], s_mtime_floor);
         case K_NTP_SERVER:
             return nvs_write_key(k, s_ntp_server, strlen(s_ntp_server) + 1, s_mtime[k], s_mtime_floor);
+        case K_NTP_USE_DHCP: {
+            uint8_t v = s_ntp_use_dhcp ? 1 : 0;
+            return nvs_write_key(k, &v, 1, s_mtime[k], s_mtime_floor);
+        }
         case K_TZ:
             return nvs_write_key(k, s_display_tz, strlen(s_display_tz) + 1, s_mtime[k], s_mtime_floor);
         default:
@@ -827,8 +859,9 @@ static void merge_bags(const prefs_bag_t *nvs, const prefs_bag_t *sd, bool sd_lo
                 case K_WIFI_NM:    copy_ip_str(s_wifi_nm,  sizeof(s_wifi_nm),  winner->wifi_nm);  break;
                 case K_WIFI_GW:    copy_ip_str(s_wifi_gw,  sizeof(s_wifi_gw),  winner->wifi_gw);  break;
                 case K_WIFI_DNS:   copy_ip_str(s_wifi_dns, sizeof(s_wifi_dns), winner->wifi_dns); break;
-                case K_NTP_SERVER: copy_str_bounded(s_ntp_server, sizeof(s_ntp_server), winner->ntp_server); break;
-                case K_TZ:         copy_str_bounded(s_display_tz, sizeof(s_display_tz), winner->display_tz); break;
+                case K_NTP_SERVER:   copy_str_bounded(s_ntp_server, sizeof(s_ntp_server), winner->ntp_server); break;
+                case K_NTP_USE_DHCP: s_ntp_use_dhcp = winner->ntp_use_dhcp; break;
+                case K_TZ:           copy_str_bounded(s_display_tz, sizeof(s_display_tz), winner->display_tz); break;
                 default:           break;
             }
             s_mtime[k] = winner->mtime[k];
@@ -1100,6 +1133,18 @@ const char *app_prefs_get_display_tz(char *out, size_t out_len)
 void app_prefs_set_display_tz(const char *s)
 { set_big_str(K_TZ, s_display_tz, s); }
 
+bool app_prefs_get_ntp_use_dhcp(void) { return s_ntp_use_dhcp; }
+
+void app_prefs_set_ntp_use_dhcp(bool on)
+{
+    if (!s_mutex || s_ntp_use_dhcp == on) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_ntp_use_dhcp = on;
+    prefs_commit_locked(K_NTP_USE_DHCP);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -1191,6 +1236,11 @@ static void dump_bag(const char *label, const prefs_bag_t *bag, bool loaded)
         printf("    ntp_server       = '%s'   mt=%llu\n",
                bag->ntp_server, (unsigned long long) bag->mtime[K_NTP_SERVER]);
     else printf("    ntp_server       = <absent>\n");
+    if (bag->present[K_NTP_USE_DHCP])
+        printf("    ntp_use_dhcp     = %s   mt=%llu\n",
+               bag->ntp_use_dhcp ? "true" : "false",
+               (unsigned long long) bag->mtime[K_NTP_USE_DHCP]);
+    else printf("    ntp_use_dhcp     = <absent>\n");
     if (bag->present[K_TZ])
         printf("    display_tz       = '%s'   mt=%llu\n",
                bag->display_tz, (unsigned long long) bag->mtime[K_TZ]);
@@ -1241,6 +1291,9 @@ void app_prefs_debug_dump(void)
            s_wifi_dns, (unsigned long long) s_mtime[K_WIFI_DNS]);
     printf("  ntp_server       = '%s'   mt=%llu\n",
            s_ntp_server, (unsigned long long) s_mtime[K_NTP_SERVER]);
+    printf("  ntp_use_dhcp     = %s   mt=%llu\n",
+           s_ntp_use_dhcp ? "true" : "false",
+           (unsigned long long) s_mtime[K_NTP_USE_DHCP]);
     printf("  display_tz       = '%s'   mt=%llu\n",
            s_display_tz, (unsigned long long) s_mtime[K_TZ]);
     printf("  mtime_floor      = %llu\n", (unsigned long long) s_mtime_floor);

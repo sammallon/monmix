@@ -243,6 +243,7 @@ static lv_obj_t *s_wcfg_nm_ta;
 static lv_obj_t *s_wcfg_gw_ta;
 static lv_obj_t *s_wcfg_dns_ta;
 static lv_obj_t *s_wcfg_ntp_ta;
+static lv_obj_t *s_wcfg_ntp_dhcp_cb;     // checkbox: honor DHCP-supplied NTP
 static bool     s_wcfg_use_static;       // working state of the radio
 static bool     s_wcfg_orig_use_static;
 static char     s_wcfg_orig_ip [APP_PREFS_IP_STR_MAX];
@@ -250,6 +251,7 @@ static char     s_wcfg_orig_nm [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_gw [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_dns[APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_ntp[APP_PREFS_STR_MAX];
+static bool     s_wcfg_orig_ntp_use_dhcp;
 
 // MS connection settings panel (entry: MS icon). Save = ws_reconnect()
 // (live), no reboot -- just kicks the WS client to use the new host:port.
@@ -2665,6 +2667,10 @@ static bool wcfg_has_unsaved_changes(void)
     if (s_wcfg_gw_ta && strcmp(lv_textarea_get_text(s_wcfg_gw_ta),  s_wcfg_orig_gw)  != 0) return true;
     if (s_wcfg_dns_ta && strcmp(lv_textarea_get_text(s_wcfg_dns_ta), s_wcfg_orig_dns) != 0) return true;
     if (s_wcfg_ntp_ta && strcmp(lv_textarea_get_text(s_wcfg_ntp_ta), s_wcfg_orig_ntp) != 0) return true;
+    if (s_wcfg_ntp_dhcp_cb) {
+        bool checked = lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
+        if (checked != s_wcfg_orig_ntp_use_dhcp) return true;
+    }
     return false;
 }
 
@@ -2843,6 +2849,9 @@ static void on_wcfg_save_yes(lv_event_t *e)
     }
     if (s_wcfg_ntp_ta) {
         app_prefs_set_ntp_server(lv_textarea_get_text(s_wcfg_ntp_ta));
+    }
+    if (s_wcfg_ntp_dhcp_cb) {
+        app_prefs_set_ntp_use_dhcp(lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED));
     }
 
     // Reboot path -- the safe fallback. The live path below tries first;
@@ -3259,6 +3268,14 @@ static void build_wcfg_overlay(void)
                         LV_EVENT_FOCUSED, NULL);
     y += row_dy;
 
+    // "Honor DHCP NTP" checkbox -- when checked (default), a DHCP-supplied
+    // NTP server (option 42) takes priority and the manual server above is
+    // the fallback. Unchecked = use only the manual server.
+    s_wcfg_ntp_dhcp_cb = lv_checkbox_create(ov);
+    lv_checkbox_set_text(s_wcfg_ntp_dhcp_cb, "Use DHCP-provided NTP server when available");
+    lv_obj_align(s_wcfg_ntp_dhcp_cb, LV_ALIGN_TOP_LEFT, 80, y);
+    y += row_dy;
+
     s_wcfg_status_label = lv_label_create(ov);
     lv_label_set_text(s_wcfg_status_label, "");
     lv_label_set_recolor(s_wcfg_status_label, true);
@@ -3298,6 +3315,11 @@ static void wcfg_open(void)
     lv_textarea_set_text(s_wcfg_dns_ta, s_wcfg_orig_dns);
     app_prefs_get_ntp_server(s_wcfg_orig_ntp, sizeof(s_wcfg_orig_ntp));
     if (s_wcfg_ntp_ta) lv_textarea_set_text(s_wcfg_ntp_ta, s_wcfg_orig_ntp);
+    s_wcfg_orig_ntp_use_dhcp = app_prefs_get_ntp_use_dhcp();
+    if (s_wcfg_ntp_dhcp_cb) {
+        if (s_wcfg_orig_ntp_use_dhcp) lv_obj_add_state   (s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
+        else                          lv_obj_remove_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
+    }
     wcfg_apply_static_visibility();
 
     lv_label_set_text(s_wcfg_status_label, "");
@@ -4156,19 +4178,22 @@ static void start_clock_once(void)
     s_sntp_started = true;
 
     // TZ + SNTP server come from prefs (set in main via app_time_apply_tz +
-    // app_time_init). DHCP-supplied NTP (option 42) layered on top: slot 0
-    // is reserved for DHCP, the user's pref is the static fallback in slot 1.
+    // app_time_init). When ntp_use_dhcp is true (default), DHCP option 42
+    // takes slot 0 and the user's pref is the static fallback in slot 1.
+    // When false, only the user's manual server is used -- DHCP-supplied
+    // NTP is ignored even if the network offers it.
     char user_ntp[APP_PREFS_STR_MAX];
     app_prefs_get_ntp_server(user_ntp, sizeof(user_ntp));
     if (user_ntp[0] == '\0') {
         // App_time_init handles plain init; nothing to do.
     } else {
+        bool use_dhcp = app_prefs_get_ntp_use_dhcp();
         esp_netif_sntp_deinit();   // drop any prior init from app_time_init
         esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
             2, ESP_SNTP_SERVER_LIST(user_ntp, user_ntp));
-        cfg.server_from_dhcp           = true;
-        cfg.renew_servers_after_new_IP = true;
-        cfg.index_of_first_server      = 1;
+        cfg.server_from_dhcp           = use_dhcp;
+        cfg.renew_servers_after_new_IP = use_dhcp;
+        cfg.index_of_first_server      = use_dhcp ? 1 : 0;
         cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
         esp_netif_sntp_init(&cfg);
     }

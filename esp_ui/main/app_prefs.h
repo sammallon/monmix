@@ -114,6 +114,12 @@ void        app_prefs_set_ntp_server     (const char *s);
 const char *app_prefs_get_display_tz     (char *out, size_t out_len);
 void        app_prefs_set_display_tz     (const char *s);
 
+// When true, a DHCP-supplied NTP server (option 42) takes priority and the
+// user's manual ntp_server is the fallback. When false, only the manual
+// server is used. Default true.
+bool app_prefs_get_ntp_use_dhcp(void);
+void app_prefs_set_ntp_use_dhcp(bool on);
+
 // Subscribe to pref changes -- typically the UI registers once at init
 // time and re-reads whatever it cares about on each notification.
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx);
