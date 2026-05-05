@@ -3760,10 +3760,17 @@ static void chpick_open(void)
     size_t cur_count = 0;
     const int *cur = app_config_channel_ids(&cur_count);
     for (int i = 0; i < bound; ++i) {
-        for (size_t j = 0; j < cur_count; ++j) {
-            if (cur[j] == i) {
-                s_chpick_state[i] = true;
-                break;
+        // W6.1: a stale saved id pointing at a non-routable strip would have
+        // no widget to uncheck it; force-clear so save can persist a clean
+        // selection without the user having to do anything.
+        bool routable = !(s_ms && s_ms->is_channel_routable) ||
+                        s_ms->is_channel_routable(i);
+        if (routable) {
+            for (size_t j = 0; j < cur_count; ++j) {
+                if (cur[j] == i) {
+                    s_chpick_state[i] = true;
+                    break;
+                }
             }
         }
         s_chpick_orig[i] = s_chpick_state[i];
@@ -3777,6 +3784,12 @@ static void chpick_open(void)
     const int row_w = (SCREEN_W - 32 - 8 - 18) / 4;
     const int row_h = 22;
     for (int i = 0; i < bound; ++i) {
+        // W6.1: skip non-routable channel types (mix/matrix/main). Indices
+        // stay aligned to MS channel ids -- s_chpick_state[i] sticks to
+        // its semantic meaning, just no widget for the skipped slot.
+        if (s_ms && s_ms->is_channel_routable && !s_ms->is_channel_routable(i)) {
+            continue;
+        }
         lv_obj_t *row = lv_obj_create(s_chpick_list);
         lv_obj_set_size(row, row_w, row_h);
         lv_obj_set_style_pad_all(row, 2, 0);

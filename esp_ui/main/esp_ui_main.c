@@ -150,6 +150,13 @@ void app_main(void)
         ms->fetch_all_strip_names(info.total);
     }
 
+    // W6.1: probe each channel's routability (200 vs 404 on
+    // ch.<n>.levelData.0.lvl) so the channel picker hides mix/matrix/main
+    // strips. Same blocking-sweep pattern as the names fetch above.
+    if (info_ok && info.total > 0 && ms->fetch_channel_routability) {
+        ms->fetch_channel_routability(info.total);
+    }
+
     // P11: REST-fetch ch.<N>.info.isActive for every mix bus before the
     // saved-index validation below. The WS subscribe path keeps the mask
     // live afterwards; this synchronous prime is just so the boot path
