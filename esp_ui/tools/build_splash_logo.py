@@ -69,22 +69,25 @@ def recolor_text():
 
 
 def render_png():
-    """Render the recoloured SVG at native size, then resize down via PIL.
-    svglib's drawing.scale() corrupts the visible content (paths fall outside
-    the new clip rect) so we keep the geometry untouched and let PIL do the
-    final downscale.
+    """Render the recoloured SVG with a transparent background and downscale
+    via PIL. Transparent bg (rather than a baked-in dark) means LVGL composites
+    the logo over the screen bg directly -- so the logo bg always matches the
+    screen bg exactly, with no RGB565 round-trip drift from the PNG decode +
+    LANCZOS downsample shifting the solid pixels by 1-2 LSB.
 
-    renderPM defaults to a white background -- bake the dark splash bg in
-    instead so the recoloured-white text actually reads, and so we can output
-    a small RGB565 (no alpha) array."""
+    Cost: alpha channel doubles the asset (RGB565A8 instead of RGB565), but
+    the splash is still ~60 KB which is acceptable.
+
+    svglib's drawing.scale() corrupts visible content (paths fall outside the
+    new clip rect) so we keep the geometry untouched and let PIL do the final
+    downscale."""
     drawing = svg2rlg(str(TMP_SVG))
     full_png = TMP_PNG.with_name("_splash_full.png")
-    # bg=0x101010 matches the splash screen background colour set in
-    # app_display.c. configPIL=0 keeps PIL out of the path so renderPM uses
-    # pycairo end-to-end.
+    # bg=None keeps the alpha channel; configPIL=None keeps PIL out of the
+    # path so renderPM uses pycairo end-to-end.
     renderPM.drawToFile(drawing, str(full_png), fmt="PNG",
-                        bg=0x101010, configPIL=None)
-    img = Image.open(full_png).convert("RGB")
+                        bg=None, configPIL=None)
+    img = Image.open(full_png).convert("RGBA")
     ratio = WIDTH_PX / img.size[0]
     out = img.resize((WIDTH_PX, int(img.size[1] * ratio)), Image.LANCZOS)
     out.save(TMP_PNG)
@@ -96,9 +99,11 @@ def run_lvgl_conv():
         sys.executable,
         str(LVGL_CONV),
         "--ofmt", "C",
-        # RGB565 (no alpha) -- the splash bg colour is baked into the PNG so
-        # we don't need per-pixel alpha and halve the flash footprint.
-        "--cf", "RGB565",
+        # RGB565A8 -- per-pixel alpha so LVGL composites the logo cleanly
+        # over the screen bg. Avoids the colour mismatch you get when baking
+        # the dark bg into the PNG (LANCZOS + RGB565 quantisation shifts
+        # solid pixels off the screen-bg target by 1-2 LSB).
+        "--cf", "RGB565A8",
         "--name", "splash_logo",
         "-o", str(OUT_DIR),
         str(TMP_PNG),
