@@ -22,7 +22,12 @@
 #define LCD_BL_GPIO           31
 #define LCD_BL_PWM_HZ         30000
 #define LCD_BL_DUTY_RES       LEDC_TIMER_10_BIT
-#define LCD_BL_INITIAL_PCT    80
+// Backlight starts at 0 so the user never sees the uninitialised PSRAM
+// framebuffer (which renders as a bright blue band on this panel).
+// esp_ui_main ramps the backlight up to the saved pref value AFTER
+// app_ui_init has built the splash and LVGL has flushed at least one
+// dark frame, so the first thing the user sees is the splash.
+#define LCD_BL_INITIAL_PCT    0
 
 #define TOUCH_RST_GPIO        40
 #define TOUCH_INT_GPIO        42

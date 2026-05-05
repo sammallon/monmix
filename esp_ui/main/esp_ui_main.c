@@ -74,10 +74,6 @@ void app_main(void)
         return;
     }
 
-    // Apply persisted brightness. init_backlight seeded with the compile-time
-    // default (80%); now that prefs are loaded, switch to the user's choice.
-    app_display_set_backlight_pct(app_prefs_get_brightness_pct());
-
     // Virtual touch indev for the `touch` console command. Must come
     // after app_display_init brings up LVGL.
     app_touch_inject_init();
@@ -85,6 +81,11 @@ void app_main(void)
     const ms_client_iface_t *ms = app_ms_client_ws();
     app_ui_init(ms);
     app_ui_set_status("Connecting WiFi...");
+
+    // Backlight stayed at 0 through display+UI bring-up so the user
+    // never sees the uninitialised framebuffer (bright blue on this
+    // panel). Splash widget is up by now -- ramp to the saved pref.
+    app_display_set_backlight_pct(app_prefs_get_brightness_pct());
 
     // Apply DHCP / static-IP choice from prefs now that they're loaded. If
     // the WiFi driver already auto-started DHCP after init_radio, this
