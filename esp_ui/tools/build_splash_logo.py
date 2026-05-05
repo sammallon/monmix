@@ -42,10 +42,12 @@ LVGL_CONV_CANDIDATES = [
 ]
 LVGL_CONV = next((p for p in LVGL_CONV_CANDIDATES if p.exists()), LVGL_CONV_CANDIDATES[0])
 
-# Splash render width. SVG aspect is ~1.79:1; 192*107*2 = 41 KB in flash for
-# RGB565, comfortably under the 50 KB target. Logo still reads cleanly on the
-# 1024-wide panel.
-WIDTH_PX = 192
+# Splash render width. 1024-wide panel, target ~66% of width for the logo
+# = 675 px. SVG aspect ~1.79:1 -> ~378 px tall (63% of the 600 px height).
+# Asset cost: 675 * 378 * 3 = 766 KB in flash for RGB565A8. Comfortable in
+# the 4 MB app partition (about 19% of it). Rendered at near-native SVG
+# size (773 px wide) so LANCZOS downscale is gentle and the result is clean.
+WIDTH_PX = 675
 
 def recolor_text():
     """Add fill=#ffffff to the text path (id=text2). Pure text substitution
