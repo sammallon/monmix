@@ -56,6 +56,16 @@ EXT_RAM_BSS_ATTR static char s_mix_names[MAX_MIX_BUSES][32];
 // REST fetch (or initial WS broadcast) populates it.
 static bool s_mix_routed[MAX_MIX_BUSES] = { [0 ... MAX_MIX_BUSES - 1] = true };
 
+// P3: cache of every strip's scribble-strip name. The channel picker
+// overlay shows ALL strips on the connected console, not just the ones
+// tracked in app_state, so we need a name slot per MS channel id rather
+// than per app_state index. Sized to match APP_UI_MAX_PICKER_ROWS (128)
+// -- this header isn't included here to keep the layering one-way, so
+// the constant is duplicated. Si Expression reports 80; 128 covers all
+// reasonable consoles. PSRAM-backed: ~4 KB.
+#define MS_MAX_STRIP_NAMES 128
+EXT_RAM_BSS_ATTR static char s_all_strip_names[MS_MAX_STRIP_NAMES][32];
+
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
 
@@ -304,6 +314,72 @@ static void ws_fetch_mix_routing(void)
     notify_subscribers();
 }
 
+// P3: blocking REST GET of one ch.<n>.cfg.name. Writes into the all-strip
+// cache slot directly on success. Failures are silent -- the slot stays
+// empty and the picker falls back to "CH NN" until the WS broadcast (or
+// a later sweep) populates it.
+static void fetch_one_strip_name(int ch_id)
+{
+    if (ch_id < 0 || ch_id >= MS_MAX_STRIP_NAMES) return;
+
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://%s:%u/console/data/get/ch.%d.cfg.name/val",
+             app_config_ms_host(), (unsigned) app_config_ms_port(), ch_id);
+
+    poll_sink_t sink = {0};
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = poll_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = POLL_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return;
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200 || sink.len == 0) return;
+    sink.buf[sink.len < sizeof(sink.buf) ? sink.len : sizeof(sink.buf) - 1] = '\0';
+
+    cJSON *root = cJSON_Parse(sink.buf);
+    if (!root) return;
+    cJSON *jv = cJSON_GetObjectItem(root, "value");
+    if (cJSON_IsString(jv) && jv->valuestring) {
+        strncpy(s_all_strip_names[ch_id], jv->valuestring,
+                sizeof(s_all_strip_names[ch_id]) - 1);
+        s_all_strip_names[ch_id][sizeof(s_all_strip_names[ch_id]) - 1] = '\0';
+    }
+    cJSON_Delete(root);
+}
+
+// P3: one-shot REST sweep of every strip's name. Called from app_main once
+// after set_mix_layout, before ws_start, so the channel picker shows
+// MS-side names from first open. WS subscribe path keeps the cache live
+// for the tracked channels; renames on un-tracked strips are picked up
+// at next reboot's sweep (acceptable -- the picker is rarely opened and
+// MS rename is rare).
+static void ws_fetch_all_strip_names(int total)
+{
+    if (total < 0) return;
+    if (total > MS_MAX_STRIP_NAMES) total = MS_MAX_STRIP_NAMES;
+    int populated = 0;
+    for (int i = 0; i < total; ++i) {
+        fetch_one_strip_name(i);
+        if (s_all_strip_names[i][0]) populated++;
+    }
+    ESP_LOGI(TAG, "fetched %d/%d strip names", populated, total);
+    notify_subscribers();
+}
+
+static const char *ws_get_strip_name(int ms_channel_id)
+{
+    if (ms_channel_id < 0 || ms_channel_id >= MS_MAX_STRIP_NAMES) return NULL;
+    if (s_all_strip_names[ms_channel_id][0] == '\0') return NULL;
+    return s_all_strip_names[ms_channel_id];
+}
+
 static bool ws_create_and_start(void);  // fwd
 
 static void ws_reconnect(void)
@@ -359,8 +435,10 @@ static const ms_client_iface_t s_iface = {
     .fetch_mix_routing  = ws_fetch_mix_routing,
     .resubscribe        = ws_resubscribe,
     .reconnect          = ws_reconnect,
-    .set_master_level   = ws_set_master_level,
-    .set_master_mute    = ws_set_master_mute,
+    .set_master_level      = ws_set_master_level,
+    .set_master_mute       = ws_set_master_mute,
+    .fetch_all_strip_names = ws_fetch_all_strip_names,
+    .get_strip_name        = ws_get_strip_name,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)
@@ -912,6 +990,14 @@ static void handle_broadcast(const char *json, size_t len)
         if (idx >= 0) {
             app_state_set_name((size_t)idx, jvalue->valuestring, true);
         }
+        // P3: always update the all-strip cache so the channel picker
+        // overlay reflects the latest names regardless of whether this
+        // channel happens to be tracked in app_state.
+        if (ch >= 0 && ch < MS_MAX_STRIP_NAMES) {
+            strncpy(s_all_strip_names[ch], jvalue->valuestring,
+                    sizeof(s_all_strip_names[ch]) - 1);
+            s_all_strip_names[ch][sizeof(s_all_strip_names[ch]) - 1] = '\0';
+        }
         // Mix scribble-strip names use the same path; if this ch falls in
         // the mix range, cache the name for the selector popup.
         if (s_mix_count > 0 && ch >= s_mix_offset &&
@@ -920,8 +1006,11 @@ static void handle_broadcast(const char *json, size_t len)
             strncpy(s_mix_names[mix_idx], jvalue->valuestring,
                     sizeof(s_mix_names[mix_idx]) - 1);
             s_mix_names[mix_idx][sizeof(s_mix_names[mix_idx]) - 1] = '\0';
-            notify_subscribers();
         }
+        // Notify on every name broadcast -- the chpick overlay refresh
+        // hangs off this notification too. mix_picker_refresh_labels and
+        // chpick_refresh_labels are both gated on visibility.
+        notify_subscribers();
         // Master strip name follows the active mix's cfg.name. The cache
         // above keeps the picker labels current; this branch keeps the
         // visible master strip's name in sync.
