@@ -155,9 +155,9 @@ WiFi/MS credentials, channel picker across the full strip count of
 the connected console (cap 16 on the fader UI), and the reliability
 hardening pass (heap heartbeat, WS reconnect watchdog with
 wifi-reassoc, TCP keepalive, WS ping/pong, error-event
-instrumentation). M5 = OSC backend; M6 = BLE/SoftAP provisioning;
-M7 = display power mgmt; M8 = brightness + rotation prefs (pulled
-forward into the 2026-05-04 UI polish batch — see plan
+instrumentation). M5 = OSC backend; M6 cancelled (touch UI covers provisioning);
+M7 = display power mgmt; M8 done (brightness + rotation prefs,
+landed in the 2026-05-04 UI polish batch — see plan
 `during-and-after-yesterday-s-adaptive-fog.md`).
 
 UI polish batch in flight (plan `during-and-after-yesterday-s-adaptive-fog.md`):
