@@ -244,6 +244,10 @@ static char     s_mcfg_orig_port[8];
 // SSID scan results popup. Used only by the WiFi panel.
 static lv_obj_t *s_ssid_list_popup;
 static lv_obj_t *s_ssid_list;
+static lv_obj_t *s_ssid_list_spinner;        // shown while scan in progress
+static lv_obj_t *s_ssid_list_scanning_label; // "Scanning..."
+static bool      s_ssid_list_scanning;       // popup is in scanning state
+static bool      s_ssid_list_retried_empty;  // already retried once on empty
 
 // Channel picker overlay (entry: Settings -> Edit Channels...).
 // Shows every channel on the connected console as a row with a checkbox;
@@ -2645,11 +2649,28 @@ static void build_wcfg_save_confirm(void)
 
 static void ssid_list_populate_async(void *arg);
 static void on_ssid_row_clicked(lv_event_t *e);
+static void on_wifi_scan_done(void *ctx);
 
 static void on_ssid_list_close(lv_event_t *e)
 {
     (void)e;
     if (s_ssid_list_popup) lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Toggle the popup between scanning (spinner + label) and results (list).
+static void ssid_list_set_scanning(bool scanning)
+{
+    s_ssid_list_scanning = scanning;
+    if (!s_ssid_list_popup) return;
+    if (scanning) {
+        if (s_ssid_list)            lv_obj_add_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
+        if (s_ssid_list_spinner)    lv_obj_remove_flag(s_ssid_list_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (s_ssid_list_scanning_label) lv_obj_remove_flag(s_ssid_list_scanning_label, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (s_ssid_list_spinner)    lv_obj_add_flag(s_ssid_list_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (s_ssid_list_scanning_label) lv_obj_add_flag(s_ssid_list_scanning_label, LV_OBJ_FLAG_HIDDEN);
+        if (s_ssid_list)            lv_obj_remove_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void on_wifi_scan_done(void *ctx)
@@ -2688,6 +2709,17 @@ static void build_ssid_list_popup(void)
     lv_obj_set_size(s_ssid_list, 436, 290);
     lv_obj_align(s_ssid_list, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
+    // Scanning-state widgets occupy the same area; toggled by
+    // ssid_list_set_scanning. The spinner is parented to the popup so it
+    // stays in the foreground stacking when the list is hidden.
+    s_ssid_list_spinner = lv_spinner_create(p);
+    lv_obj_set_size(s_ssid_list_spinner, 60, 60);
+    lv_obj_align(s_ssid_list_spinner, LV_ALIGN_CENTER, 0, -10);
+    s_ssid_list_scanning_label = lv_label_create(p);
+    lv_label_set_text(s_ssid_list_scanning_label, "Scanning...");
+    lv_obj_align_to(s_ssid_list_scanning_label, s_ssid_list_spinner,
+                    LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
+
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -2695,11 +2727,23 @@ static void ssid_list_populate_async(void *arg)
 {
     (void)arg;
     if (!s_ssid_list_popup) build_ssid_list_popup();
-    lv_obj_clean(s_ssid_list);
 
     char results[APP_WIFI_SCAN_MAX_RESULTS][33];
     size_t n = app_wifi_scan_results(results, APP_WIFI_SCAN_MAX_RESULTS);
 
+    // Empty result on first try -> retry once. The slave can return 0
+    // entries while the C6's scan cache is still warming up; a second
+    // pass usually populates it.
+    if (n == 0 && !s_ssid_list_retried_empty) {
+        s_ssid_list_retried_empty = true;
+        ssid_list_set_scanning(true);
+        lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_ssid_list_popup);
+        (void) app_wifi_scan_start(on_wifi_scan_done, NULL);
+        return;
+    }
+
+    lv_obj_clean(s_ssid_list);
     if (n == 0) {
         lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WARNING,
                                            "No networks found");
@@ -2717,6 +2761,7 @@ static void ssid_list_populate_async(void *arg)
         lv_label_set_text(s_wcfg_scan_btn_label, "Scan");
     }
 
+    ssid_list_set_scanning(false);
     lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_ssid_list_popup);
 }
@@ -2737,14 +2782,22 @@ static void on_wcfg_scan_clicked(lv_event_t *e)
 {
     (void)e;
     wcfg_hide_keyboard();
-    if (!app_wifi_scan_start(on_wifi_scan_done, NULL)) {
+    if (!s_ssid_list_popup) build_ssid_list_popup();
+    s_ssid_list_retried_empty = false;
+    app_wifi_scan_result_t r = app_wifi_scan_start(on_wifi_scan_done, NULL);
+    if (r == APP_WIFI_SCAN_FAILED) {
         lv_label_set_text(s_wcfg_status_label,
-                          "#FF6060 Scan already in progress.#");
+                          "#FF6060 Scan failed.#");
         return;
     }
+    // Both STARTED and ALREADY_RUNNING land here -- open the popup in the
+    // scanning state and wait for SCAN_DONE to populate it.
     lv_obj_add_state(s_wcfg_scan_btn, LV_STATE_DISABLED);
     lv_label_set_text(s_wcfg_scan_btn_label, "Scanning...");
     lv_label_set_text(s_wcfg_status_label, "");
+    ssid_list_set_scanning(true);
+    lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ssid_list_popup);
 }
 
 // Show / hide the static-IP field group based on the radio's working state.
