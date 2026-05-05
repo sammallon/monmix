@@ -188,10 +188,28 @@ static esp_err_t init_panel(esp_lcd_panel_io_handle_t *io_out,
     // Note: EK79007's init sequence already enables display output; the
     // explicit disp_on_off command isn't supported (returns ESP_ERR_NOT_SUPPORTED).
 
-    // Note: esp_lcd_panel_mirror returns OK on EK79007 but is a no-op (the
-    // driver tracks the bit but doesn't reprogram the scan direction).
-    // Rotation is therefore done as an LVGL transform on the root object;
-    // see app_ui.c.
+    // Enable DMA2D for the DPI panel (cache-coherent fast path on P4).
+    // IDF v5 had use_dma2d as a flag in dpi_config; IDF v6 dropped that
+    // field and made it an explicit post-init opt-in. Without DMA2D every
+    // flush goes through CPU memcpy + esp_cache_msync, which the user
+    // observes as choppy on-screen updates -- enabling this is what makes
+    // the panel "look beautiful and smooth". Elecrow's factory firmware
+    // sets use_dma2d=true in the legacy IDF v5 form; this is the
+    // equivalent on v6.
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_enable_dma2d(panel), TAG, "dma2d enable");
+
+    // Note on rotation: esp_lcd_panel_mirror is empirically a no-op on this
+    // CrowPanel SKU. Verified 2026-05-05: every MADCTL value (0x00, 0x01,
+    // 0x02, 0x03, 0xC0, 0xC1, 0xC2, 0xC3, 0xFF), both post-init AND
+    // prepended to the init sequence before SLEEP_OUT, produced zero visible
+    // change. The EK79007's UPDN/SHLR bits drive the panel-module's gate
+    // driver via TCON output pins; on this assembly those signals appear to
+    // be hardwired or bypassed, so MADCTL writes change the EK79007's
+    // internal register without affecting actual scan direction. DBI
+    // read-back also non-functional (all reads return 0x00). Other DBI
+    // writes do reach the panel -- that's how 0x80-0x86 init + SLEEP_OUT
+    // bring the display up. Software rotation via LVGL remains the only
+    // path for 180-deg on this board.
 
     *io_out    = io;
     *panel_out = panel;
