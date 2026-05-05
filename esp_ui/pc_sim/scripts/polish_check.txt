@@ -1,0 +1,7 @@
+# Quick visual check that Workstream C polish landed:
+#   - dark theme (was light grey before)
+#   - status label shows time (was "Booting..." before)
+#   - mix indicator pill visible (real-MS path was missing it before)
+sleep 2000
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/polish_check.bmp
+quit

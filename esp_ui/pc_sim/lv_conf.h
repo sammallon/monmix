@@ -41,8 +41,13 @@
 #define LV_USE_ASSERT_STYLE         0
 #define LV_USE_ASSERT_MEM_INTEGRITY 0
 #define LV_USE_ASSERT_OBJ           0
-#define LV_ASSERT_HANDLER_INCLUDE   <assert.h>
-#define LV_ASSERT_HANDLER           assert(0);
+// LV_ASSERT_HANDLER must NOT use assert() under MSVC -- assert() pops the
+// "Microsoft Visual C++ Runtime Library" Abort/Retry/Ignore dialog and
+// blocks the sim until a human dismisses it, which is a non-starter for
+// scripted/CI runs. Print + _exit avoids the dialog entirely while still
+// surfacing the message on stderr.
+#define LV_ASSERT_HANDLER_INCLUDE   <stdio.h>
+#define LV_ASSERT_HANDLER           do { fprintf(stderr, "LVGL ASSERT at %s:%d\n", __FILE__, __LINE__); fflush(stderr); _Exit(98); } while (0);
 
 // Fonts — match what the tablet enables. font_monmix_level.c uses 14.
 #define LV_FONT_MONTSERRAT_8    1

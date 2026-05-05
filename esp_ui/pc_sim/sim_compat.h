@@ -43,9 +43,32 @@ static inline void vTaskDelay(uint32_t ticks) { usleep((unsigned)ticks * 1000u);
 // app_ui.c's clock_tick reads localtime_r(&now, &lt); shim it here.
 #ifdef _MSC_VER
 #include <time.h>
+#include <string.h>
 static __inline struct tm *localtime_r(const time_t *t, struct tm *out) {
     return (localtime_s(out, t) == 0) ? out : (struct tm *)0;
 }
+
+// MSVC's strftime asserts via the invalid-parameter handler on GNU-only
+// format specifiers; app_ui.c's clock_tick uses %l (space-padded 12-hour
+// without leading zero), which is a GNU extension. Translate to MSVC's
+// %#I (12-hour with leading-zero stripped) before delegating.
+static __inline size_t strftime_sim(char *buf, size_t maxsz, const char *fmt, const struct tm *tm) {
+    char rewritten[128];
+    size_t fi = 0, oi = 0;
+    while (fmt[fi] && oi + 4 < sizeof(rewritten)) {
+        if (fmt[fi] == '%' && fmt[fi + 1] == 'l') {
+            rewritten[oi++] = '%';
+            rewritten[oi++] = '#';
+            rewritten[oi++] = 'I';
+            fi += 2;
+        } else {
+            rewritten[oi++] = fmt[fi++];
+        }
+    }
+    rewritten[oi] = 0;
+    return strftime(buf, maxsz, rewritten, tm);
+}
+#define strftime strftime_sim
 #endif
 
 #endif // SIM_COMPAT_H

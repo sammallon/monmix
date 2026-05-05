@@ -21,6 +21,7 @@
 
 #include "app_state.h"
 #include "app_prefs.h"
+#include "app_ui.h"
 
 #include <SDL.h>
 #include "mongoose.h"
@@ -313,30 +314,46 @@ static void ws_evt(struct mg_connection *c, int ev, void *ev_data) {
 }
 
 static void info_evt(struct mg_connection *c, int ev, void *ev_data) {
-    if (ev == MG_EV_HTTP_MSG) {
+    if (ev == MG_EV_CONNECT) {
+        // mg_http_connect opens the TCP socket but doesn't issue the
+        // request. Send the GET on connect; mg_http_get_request_uri
+        // requires a URL with the path included for that to work.
+        mg_printf(c, "GET /console/information HTTP/1.0\r\nHost: %s:%d\r\n\r\n",
+                  g_ms.host, g_ms.port);
+    } else if (ev == MG_EV_ERROR) {
+        printf("ms_real: info GET error: %s\n", (const char *)ev_data);
+    } else if (ev == MG_EV_HTTP_MSG) {
         struct mg_http_message *hm = (struct mg_http_message *)ev_data;
-        // Look for "channelTypes":[{"id":"Mix","offset":N,"count":M}, ...]
-        // Grab Mix offset/count to seed mix_layout. Simple substring match
-        // since proper JSONPath through mongoose's helpers is verbose.
-        // mongoose's body is *not* NUL-terminated; copy a window of it to
-        // a stack buffer so plain strstr is safe.
         struct mg_str body = hm->body;
-        char tmp[2048];
-        size_t len = body.len < sizeof(tmp) - 1 ? body.len : sizeof(tmp) - 1;
-        memcpy(tmp, body.buf, len);
-        tmp[len] = 0;
-        const char *p = strstr(tmp, "\"id\":\"Mix\"");
-        if (p) {
-            struct mg_str tail = mg_str_n(p, (size_t)(tmp + len - p));
+
+        // Walk channelTypes[i] until the array ends. Real MS reports
+        // name="Mix" (with offset+count); stash both and tell the UI so
+        // the mix-indicator pill becomes eligible to show.
+        for (int i = 0; i < 32; ++i) {
+            char namepath[40], offpath[40], cntpath[40];
+            snprintf(namepath, sizeof(namepath), "$.channelTypes[%d].name",   i);
+            snprintf(offpath,  sizeof(offpath),  "$.channelTypes[%d].offset", i);
+            snprintf(cntpath,  sizeof(cntpath),  "$.channelTypes[%d].count",  i);
+            char *name = mg_json_get_str(body, namepath);
+            if (!name) break;
             double off = 0, cnt = 0;
-            if (mg_json_get_num(tail, "$.offset", &off) &&
-                mg_json_get_num(tail, "$.count",  &cnt)) {
+            mg_json_get_num(body, offpath, &off);
+            mg_json_get_num(body, cntpath, &cnt);
+            if (strcmp(name, "Mix") == 0) {
                 g_ms.mix_offset = (int)off;
                 g_ms.mix_count  = (int)cnt;
-                printf("ms_real: mix layout offset=%d count=%d\n",
+                printf("ms_real: mix offset=%d count=%d\n",
                        g_ms.mix_offset, g_ms.mix_count);
+                app_ui_set_mix_count(g_ms.mix_count);
             }
+            free(name);
         }
+
+        double total = 0;
+        if (mg_json_get_num(body, "$.totalChannels", &total) && total > 0) {
+            app_ui_set_channel_total((int)total);
+        }
+
         c->is_draining = 1;
     }
 }

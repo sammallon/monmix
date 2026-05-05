@@ -29,6 +29,47 @@
 #include <stdbool.h>
 #include <string.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <crtdbg.h>
+#endif
+
+// Suppress every Windows popup the runtime might raise on a crash:
+//   - the MSVC debug-runtime assert dialog (Abort/Retry/Ignore)
+//   - the abort()-on-uncaught-fault dialog
+//   - the Windows Error Reporting "this program has stopped" dialog
+// Each of these blocks the sim until a human dismisses it -- fine when
+// you're in front of the machine, useless for scripted/CI runs. With
+// these set, a crash exits with a non-zero code and stderr message
+// instead of putting up UI.
+#ifdef _WIN32
+static void quiet_invalid_parameter(
+    const wchar_t *expr, const wchar_t *func, const wchar_t *file,
+    unsigned int line, uintptr_t reserved) {
+    (void)expr; (void)func; (void)file; (void)line; (void)reserved;
+    // Swallow. Without this handler MSVC raises STATUS_STACK_BUFFER_OVERRUN
+    // (0xC0000409) on certain stdlib calls (e.g. strftime with a non-MSVC
+    // format spec). Returning lets the call complete normally with
+    // whatever the function's documented "bad input" behaviour is.
+}
+#endif
+
+static void silence_windows_crash_popups(void) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    _set_invalid_parameter_handler(quiet_invalid_parameter);
+    _set_thread_local_invalid_parameter_handler(quiet_invalid_parameter);
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR,  _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ERROR,  _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_WARN,   _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_WARN,   _CRTDBG_FILE_STDERR);
+#endif
+}
+
 #include "lvgl.h"
 #include "drivers/sdl/lv_sdl_window.h"
 #include "drivers/sdl/lv_sdl_mouse.h"
@@ -41,6 +82,7 @@
 #include "app_state.h"
 #include "app_ui.h"
 
+#include "app_display.h"
 #include "ms_client_real.h"
 #include "throttle.h"
 
@@ -176,10 +218,12 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
 }
 
 int main(int argc, char **argv) {
+    silence_windows_crash_popups();
     const char *script_path = NULL;
     const char *ms_host     = NULL;
     int         ms_port     = 8080;
     bool        do_throttle = false;
+    bool        headless    = false;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--script") && i + 1 < argc) {
             script_path = argv[++i];
@@ -189,6 +233,8 @@ int main(int argc, char **argv) {
             ms_port = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--throttle")) {
             do_throttle = true;
+        } else if (!strcmp(argv[i], "--headless")) {
+            headless = true;
         }
     }
     if (do_throttle) throttle_apply();
@@ -203,6 +249,13 @@ int main(int argc, char **argv) {
     g_disp = lv_sdl_window_create(WIN_W, WIN_H);
     lv_sdl_window_set_title(g_disp, "monmix sim");
     g_sdl_window = lv_sdl_window_get_window(g_disp);
+
+    // Headless: hide the SDL window after creation so scripted runs don't
+    // pop a window onto the user's screen. Rendering still happens to the
+    // off-screen renderer, so screenshot commands work normally.
+    if (headless && g_sdl_window) {
+        SDL_HideWindow(g_sdl_window);
+    }
 
     lv_sdl_mouse_create();
     lv_sdl_keyboard_create();
@@ -227,6 +280,21 @@ int main(int argc, char **argv) {
     }
     ms->start();
     app_ui_present_channels();
+
+    // app_display_apply_theme is only called from app_ui's on_prefs_change
+    // (i.e. on actual pref CHANGES). On the tablet, main/app_display.c's
+    // app_display_init applies the theme at boot; the sim's mock_display
+    // doesn't, so apply once manually here. Otherwise the sim renders in
+    // LVGL's bare default theme (light) regardless of the dark pref.
+    app_display_apply_theme(app_prefs_get_theme());
+
+    // The mock wifi observer is registered during app_ui_init but the
+    // tablet only fires a state-change after the radio actually associates.
+    // Force one synchronous dispatch here so on_wifi_state_change runs and
+    // start_clock_once registers the clock timer (otherwise the status
+    // label sits at "Booting..." forever).
+    extern void mock_app_wifi_fire_initial_change(void);
+    mock_app_wifi_fire_initial_change();
 
     FILE *script = NULL;
     if (script_path) {
