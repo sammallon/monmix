@@ -141,6 +141,14 @@ void app_main(void)
         ms->set_mix_layout(info.mix_offset, info.mix_count);
     }
 
+    // P3: prime the all-strip-name cache so the channel picker overlay
+    // shows MS-side names from first open. Blocking ~2.4 s on an 80-ch
+    // Si Expression; runs once on connect, before ws_start, so the cost
+    // hides inside the existing boot wait.
+    if (info_ok && info.total > 0 && ms->fetch_all_strip_names) {
+        ms->fetch_all_strip_names(info.total);
+    }
+
     // P11: REST-fetch ch.<N>.info.isActive for every mix bus before the
     // saved-index validation below. The WS subscribe path keeps the mask
     // live afterwards; this synchronous prime is just so the boot path

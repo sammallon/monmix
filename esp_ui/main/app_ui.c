@@ -343,6 +343,7 @@ static void mcfg_open(void);
 static void mcfg_close(void);
 static void chpick_open(void);
 static void chpick_close(void);
+static void chpick_refresh_labels(void);
 static void on_edit_channels_clicked(lv_event_t *e);
 
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
@@ -3560,7 +3561,13 @@ static void chpick_open(void)
 
         lv_obj_t *cb = lv_checkbox_create(row);
         char buf[24];
-        snprintf(buf, sizeof(buf), "CH %02d", i + 1);
+        // P3: prefer the MS-side scribble-strip name; fall back to the
+        // CH NN placeholder when MS hasn't named the strip yet (or the
+        // initial sweep hasn't reached this id, e.g. on a flaky network).
+        const char *name = (s_ms && s_ms->get_strip_name)
+                               ? s_ms->get_strip_name(i) : NULL;
+        if (name) snprintf(buf, sizeof(buf), "%s", name);
+        else      snprintf(buf, sizeof(buf), "CH %02d", i + 1);
         lv_checkbox_set_text(cb, buf);
         if (s_chpick_state[i]) lv_obj_add_state(cb, LV_STATE_CHECKED);
         lv_obj_align(cb, LV_ALIGN_LEFT_MID, 0, 0);
@@ -3574,6 +3581,27 @@ static void chpick_open(void)
     lv_label_set_text(s_chpick_status_label, "");
     lv_obj_remove_flag(s_chpick_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_chpick_overlay);
+}
+
+// P3: re-pull every checkbox label from the all-strip-name cache. Called
+// from ms_apply_async on every name broadcast so live renames in MS show
+// in the picker without re-opening it. Gated on overlay visibility so a
+// background rename is essentially free.
+static void chpick_refresh_labels(void)
+{
+    if (!s_chpick_overlay) return;
+    if (lv_obj_has_flag(s_chpick_overlay, LV_OBJ_FLAG_HIDDEN)) return;
+    if (!s_ms || !s_ms->get_strip_name) return;
+    int bound = s_total_channels < APP_UI_MAX_PICKER_ROWS
+                ? s_total_channels : APP_UI_MAX_PICKER_ROWS;
+    for (int i = 0; i < bound; ++i) {
+        if (!s_chpick_checks[i]) continue;
+        char buf[24];
+        const char *name = s_ms->get_strip_name(i);
+        if (name) snprintf(buf, sizeof(buf), "%s", name);
+        else      snprintf(buf, sizeof(buf), "CH %02d", i + 1);
+        lv_checkbox_set_text(s_chpick_checks[i], buf);
+    }
 }
 
 static void chpick_close(void)
@@ -4032,6 +4060,9 @@ static void ms_apply_async(void *unused)
     // long session the LVGL allocator's free-list looped or
     // corrupted, hanging taskLVGL inside lv_malloc.
     mix_picker_refresh_labels();
+    // P3: refresh chpick rows from the all-strip-name cache so a live
+    // MS rename shows without re-open. No-op if the overlay is closed.
+    chpick_refresh_labels();
     if (s_ms_panel && !lv_obj_has_flag(s_ms_panel, LV_OBJ_FLAG_HIDDEN)) {
         ms_panel_refresh();
     }

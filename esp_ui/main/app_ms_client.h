@@ -77,6 +77,19 @@ typedef struct {
     // the mapping so callers don't have to track the layout.
     void (*set_master_level)(float level);
     void (*set_master_mute) (bool mute);
+
+    // P3: prime the all-strip-name cache by REST-sweeping ch.<n>.cfg.name
+    // for every id in 0..total-1. The picker overlay wants names for ALL
+    // strips on the connected console, not just those tracked in
+    // app_state. Blocking; ~30 ms per GET on stage WiFi -> ~2.4 s for an
+    // 80-channel Si Expression. Called once after set_mix_layout from
+    // app_main; the WS broadcast handler keeps the cache live thereafter.
+    void (*fetch_all_strip_names)(int total);
+
+    // P3: read a cached scribble-strip name by raw MS channel id (NOT
+    // the app_state slot index). Returns NULL when MS hasn't broadcast
+    // a name for this id yet -- caller should fall back to "CH NN".
+    const char *(*get_strip_name)(int ms_channel_id);
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);
