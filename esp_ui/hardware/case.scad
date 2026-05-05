@@ -175,6 +175,21 @@ text_font     = "Segoe Script:style=Bold";
 engrave_depth = 1.4;       // = 5 × 0.28 mm draft layer / 7 × 0.20 mm fine
 
 // ---------------------------------------------------------------------------
+// PRINT-FIT CORRECTIONS (from 0.2 mm draft 2026-05-04, new filament roll).
+// Orientation: display up, USB cluster on right — +X right, +Y top, -Z back.
+// Tweak cutout cuts to match the printed result; the physical measurements
+// above are unchanged.
+// ---------------------------------------------------------------------------
+
+// Active-display cutout: shift up; right-edge-only extension.
+front_opening_dy           = 0.5;
+front_opening_extend_right = 0.5;
+
+// SD-card cutout: shift toward back; back-edge-only extension.
+sd_cutout_shift_back  = 0.4;
+sd_cutout_extend_back = 0.4;
+
+// ---------------------------------------------------------------------------
 // DERIVED.
 // ---------------------------------------------------------------------------
 
@@ -286,10 +301,13 @@ module pcb_cavity() {
 module front_opening_tapered() {
     // Inner face slightly larger than active area so the lip overlaps the
     // black-mask glass border (screen_overhang per side).
-    iw = active_W + 2 * screen_overhang;
+    iw = active_W + front_opening_extend_right + 2 * screen_overhang;
     ih = active_H + 2 * screen_overhang;
+    // Right-edge-only extension shifts cx by half so the left edge stays put.
+    cx = active_cx + front_opening_extend_right / 2;
+    cy = active_cy + front_opening_dy;
     tapered_rect(
-        active_cx, active_cy,
+        cx, cy,
         iw, ih, -0.02,
         iw + 2 * front_taper, ih + 2 * front_taper,
         front_face_t + 0.02);
@@ -298,14 +316,17 @@ module front_opening_tapered() {
 module sd_cutout_tapered() {
     s = connector_slack;
     iw = sd_W + 2 * s;
-    ih = sd_H + 2 * s;
+    ih = sd_H + sd_cutout_extend_back + 2 * s;
     ow = iw + 2 * side_taper;
     oh = ih + 2 * side_taper;
+    // Back-edge-only extension shifts cz by half so the screen-side edge
+    // stays put; then translate the whole cutout toward the back.
+    cz = sd_z - sd_cutout_shift_back - sd_cutout_extend_back / 2;
     // Cutout runs along Y; small face at inner Y, large face at outer Y.
     hull() {
-        translate([sd_x, inner_H / 2 - 0.02, sd_z])
+        translate([sd_x, inner_H / 2 - 0.02, cz])
             cube([iw, 0.01, ih], center = true);
-        translate([sd_x, shell_H / 2 + 0.02, sd_z])
+        translate([sd_x, shell_H / 2 + 0.02, cz])
             cube([ow, 0.01, oh], center = true);
     }
 }
