@@ -210,10 +210,25 @@ static void send_set_str(const char *dotted, const char *s) {
     outq_push(buf);
 }
 
+// Master strip's MS channel id is the mix-bus's own channel id, which
+// is mix_offset + selected_mix_idx. Computed (not cached) because the
+// layout changes at runtime via set_mix_layout and the selected mix
+// changes via set_mix; reading the live values keeps subscribe / SET /
+// broadcast-routing paths in sync without a separate notification.
+// Returns -1 when the mix layout hasn't been received yet (boot before
+// /console/information).
 static int master_channel_id(void) {
-    app_channel_t m;
-    if (!app_state_master_get(&m)) return -1;
-    return m.id;
+    if (g.mix_count <= 0)                          return -1;
+    if (g.mix_idx < 0 || g.mix_idx >= g.mix_count) return -1;
+    return g.mix_offset + g.mix_idx;
+}
+
+// Whenever the master id changes (mix layout arrived, or user picked a
+// different mix), push it into app_state so app_ui's master strip + the
+// inbound broadcast handler's id-comparison see the right value.
+// Idempotent: app_state_master_set_id no-ops on unchanged id.
+static void sync_master_id_to_app_state(void) {
+    app_state_master_set_id(master_channel_id());
 }
 
 static void subscribe_channel(int ch_id, int mix_idx) {
@@ -608,12 +623,14 @@ static int  ws_get_mix(void)   { return g.mix_idx; }
 static void ws_set_mix(int idx) {
     g.mix_idx     = idx;
     g.subscribed  = false;
+    sync_master_id_to_app_state();
     if (g.ws_open) subscribe_all();
 }
 
 static void ws_set_mix_layout(int offset, int count) {
     g.mix_offset = offset;
     g.mix_count  = count;
+    sync_master_id_to_app_state();
     if (count > 0) {
         g.mix_list_received = true;
         if (g.ws_open) subscribe_mix_names();

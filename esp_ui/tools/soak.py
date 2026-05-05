@@ -240,9 +240,50 @@ def touch(ser: serial.Serial, x: int, y: int) -> None:
 # slider center ~300, mute btn ~498. Used by the device-side touch path.
 SLIDER_Y = 300
 MUTE_Y   = 498
+GEAR_X, GEAR_Y     = 1002, 16    # status-bar gear button
+SETTINGS_X_X, SETTINGS_X_Y = 990, 28  # close-X inside settings overlay
+
 def slot_x(idx: int) -> int:
     slot_w = 1024 // 12
     return slot_w // 2 + (idx % 12) * slot_w
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Settings-overlay interaction. Two paths fold into the soak:
+#   (a) console-driven pref toggles -- level-format / signal-indicator /
+#       theme. These run via the REPL and exercise the same on_prefs_change
+#       callback chain that the UI tap path triggers, including the
+#       resubscribe in ms_client_ws.set_level_format.
+#   (b) overlay-tap path -- tap the gear, screenshot the open overlay so
+#       we can spot rendering regressions, tap the close-X. Catches things
+#       a pref toggle alone wouldn't (overlay layout, modality, etc).
+# ─────────────────────────────────────────────────────────────────────────
+
+def cycle_pref_via_console(ser: serial.Serial, idx: int) -> str:
+    """Issue one pref toggle through the REPL. Cycles through a small
+    set on each call; returns the command string for logging."""
+    rotation = [
+        "level-format db",
+        "level-format norm",
+        "signal-indicator signal-present",
+        "signal-indicator none",
+        "theme light",
+        "theme dark",
+    ]
+    cmd = rotation[idx % len(rotation)]
+    send_and_drain(ser, cmd, idle_grace=0.5, max_wait=4)
+    return cmd
+
+
+def overlay_open_close(ser: serial.Serial, name: str) -> bool:
+    """Tap gear, snap a screenshot of the overlay, tap close. Returns
+    True if both taps and the screenshot succeeded."""
+    touch(ser, GEAR_X, GEAR_Y)
+    time.sleep(0.5)  # let the overlay finish its open animation
+    ok = screenshot(ser, name)
+    touch(ser, SETTINGS_X_X, SETTINGS_X_Y)
+    time.sleep(0.3)
+    return ok
 
 
 def main() -> None:
@@ -256,6 +297,8 @@ def main() -> None:
     ap.add_argument("--touch-every",  type=int,  default=30,         help="seconds between device-side touches")
     ap.add_argument("--num-channels", type=int,  default=12,         help="how many input channels to drive")
     ap.add_argument("--num-mixes",    type=int,  default=14,         help="upper bound on mix count to probe; the driver auto-detects which mixes accept SETs (un-routed ones return 404)")
+    ap.add_argument("--pref-every",   type=int,  default=90,         help="seconds between console-driven pref toggles (level-format / signal-indicator / theme)")
+    ap.add_argument("--overlay-every",type=int,  default=180,        help="seconds between settings-overlay open/close cycles")
     args = ap.parse_args()
 
     print(f"=== monmix soak: {args.hours} h, {args.rest_rps} rps REST, "
@@ -295,8 +338,11 @@ def main() -> None:
         next_touch_t   = time.time() + args.touch_every
         rest_period    = 1.0 / max(args.rest_rps, 0.01)
         next_rest_t    = time.time() + rest_period
+        next_pref_t    = time.time() + args.pref_every
+        next_overlay_t = time.time() + args.overlay_every
+        pref_idx       = 0
 
-        shots = touches = sets = 0
+        shots = touches = sets = prefs_done = overlays = 0
         start_t = time.time()
 
         try:
@@ -337,6 +383,25 @@ def main() -> None:
                         touch(ser, x, MUTE_Y)
                     touches += 1
 
+                # --- Console pref toggle (level-format / signal-indicator / theme) ---
+                if now >= next_pref_t:
+                    next_pref_t = now + args.pref_every
+                    cmd = cycle_pref_via_console(ser, pref_idx)
+                    pref_idx += 1
+                    prefs_done += 1
+                    print(f"  pref: {cmd}")
+
+                # --- Settings overlay open/snap/close ---
+                if now >= next_overlay_t:
+                    next_overlay_t = now + args.overlay_every
+                    # Push REST out of the way during the screenshot dance
+                    next_rest_t = now + 15.0
+                    elapsed_min = int((now - start_t) / 60)
+                    name = f"soak-overlay-{overlays:02d}-t{elapsed_min:03d}m"
+                    ser.read(65536)
+                    if overlay_open_close(ser, name):
+                        overlays += 1
+
                 # --- Periodic screenshot ---
                 if now >= next_shot_t:
                     next_shot_t = now + args.shot_every
@@ -359,7 +424,8 @@ def main() -> None:
                 if int(now) % 60 == 0:
                     elapsed = int(now - start_t)
                     print(f"[{elapsed//60:3d}m {elapsed%60:02d}s] "
-                          f"rest={sets} touch={touches} shot={shots}")
+                          f"rest={sets} touch={touches} shot={shots} "
+                          f"prefs={prefs_done} overlay={overlays}")
                     time.sleep(1)  # avoid log spam from tight loop hitting %60==0
 
                 time.sleep(0.05)
