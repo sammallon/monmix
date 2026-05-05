@@ -393,6 +393,7 @@ static int worker_thread(void *unused) {
     g_ms.ws_conn = mg_ws_connect(&g_ms.mgr, g_ms.ws_url, ws_evt, NULL, NULL);
 
     uint32_t last_reconnect_attempt_ms = 0;
+    uint32_t last_ping_ms              = 0;
 
     while (g_ms.running) {
         mg_mgr_poll(&g_ms.mgr, 25);
@@ -409,10 +410,21 @@ static int worker_thread(void *unused) {
             }
         }
 
+        // Periodic WS PING. Without this MS closes idle sockets after
+        // ~25 s and we'd cycle WS open/closed forever even with no user
+        // activity. mongoose auto-pongs received PINGs but doesn't send
+        // them on its own, so we drive the keepalive ourselves. 15 s
+        // gives a comfortable margin under any reasonable server-side
+        // idle timeout.
+        uint32_t now = SDL_GetTicks();
+        if (g_ms.ws_open && g_ms.ws_conn && now - last_ping_ms > 15000) {
+            mg_ws_send(g_ms.ws_conn, NULL, 0, WEBSOCKET_OP_PING);
+            last_ping_ms = now;
+        }
+
         // Reconnect if dropped. mongoose closes the conn on error/disconnect
         // and we don't have a built-in retry — re-attempt every 2 s.
         if (!g_ms.ws_conn) {
-            uint32_t now = SDL_GetTicks();
             if (now - last_reconnect_attempt_ms > 2000) {
                 last_reconnect_attempt_ms = now;
                 g_ms.ws_conn = mg_ws_connect(&g_ms.mgr, g_ms.ws_url, ws_evt, NULL, NULL);

@@ -1,0 +1,5 @@
+# Sit idle for 60 seconds and watch for spontaneous WS disconnects.
+# If MS or mongoose drops the connection without provocation, we'll see
+# "WS closed" in the log during this window.
+sleep 60000
+quit

@@ -471,6 +471,7 @@ static void ws_task(void *unused) {
 
     g.ws_conn = mg_ws_connect(&g.mgr, g.ws_url, ws_evt, NULL, NULL);
 
+    uint32_t last_ping_ms = 0;
     while (g.running) {
         mg_mgr_poll(&g.mgr, MGR_POLL_MS);
 
@@ -485,8 +486,19 @@ static void ws_task(void *unused) {
             }
         }
 
+        // Periodic WS PING. Without this MS closes idle sockets after
+        // ~25 s and the WS cycles open/closed forever even with no user
+        // activity. mongoose auto-pongs received PINGs but doesn't send
+        // them on its own, so we drive the keepalive ourselves. 15 s
+        // gives a comfortable margin under any reasonable server-side
+        // idle timeout.
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (g.ws_open && g.ws_conn && now - last_ping_ms > 15000) {
+            mg_ws_send(g.ws_conn, NULL, 0, WEBSOCKET_OP_PING);
+            last_ping_ms = now;
+        }
+
         if (!g.ws_conn) {
-            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
             if (now - g.last_reconnect_ms > RECONNECT_RETRY_MS) {
                 g.last_reconnect_ms = now;
                 set_state(APP_MS_STATE_CONNECTING);
