@@ -177,6 +177,11 @@ static lv_obj_t *s_mix_picker_popup;
 // per-channel arrays similarly.
 EXT_RAM_BSS_ATTR static lv_obj_t *s_mix_picker_btn_labels[24];
 static int       s_mix_count;            // 0 = popup not yet usable
+// P5: forced-reveal override for the `mix-show` console command. When true,
+// mix_indicator_apply_visibility ignores the (ms_connected && mix_list_ready)
+// gate and unconditionally shows the button. Useful for diagnosing whether
+// the button is hidden because of state-tracking or a layout/draw bug.
+static bool      s_mix_force_show;
 // P11: snapshot of the routed-mix mask the popup was last built against.
 // When the live MS routing changes, ms_apply_async tears down the popup so
 // the next open rebuilds it with the new layout.
@@ -339,6 +344,7 @@ static void mix_picker_open(void);
 static void mix_picker_close(void);
 static void mix_picker_refresh_labels(void);
 static void mix_indicator_refresh(void);
+static void mix_indicator_apply_visibility(void);
 static void on_mix_indicator_clicked(lv_event_t *e);
 static void on_name_clicked(lv_event_t *e);
 static void wcfg_open(void);
@@ -2256,12 +2262,15 @@ void app_ui_set_mix_count(int count)
     s_mix_count = count;
     if (!s_mix_indicator) return;
     if (!lvgl_port_lock(1000)) return;
-    if (s_mix_count > 0) {
-        lv_obj_remove_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
-        mix_indicator_refresh();
-    } else {
-        lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
-    }
+    // P5: visibility is now driven by mix_indicator_apply_visibility from
+    // the ms_apply_async sweep, not from this entry point. The boot path
+    // calls this once with the (potentially zero) count from
+    // /console/information; the sweep AND-gates that against
+    // (ms_connected && mix_list_ready) and shows the button only when
+    // both sides are true. A first-boot with MS unreachable now recovers
+    // automatically on first WS connect via the post-connect refetch.
+    if (s_mix_count > 0) mix_indicator_refresh();
+    mix_indicator_apply_visibility();
     // If the popup was already built for an earlier count, drop it so
     // the next open builds a fresh grid sized to the new count. The
     // child labels go with it; clear our cached pointers so we don't
@@ -2271,6 +2280,36 @@ void app_ui_set_mix_count(int count)
         s_mix_picker_popup = NULL;
         memset(s_mix_picker_btn_labels, 0, sizeof(s_mix_picker_btn_labels));
     }
+    lvgl_port_unlock();
+}
+
+// P5: single source of truth for the mix-indicator's HIDDEN flag. Reads
+// (ms_connected && mix_list_ready) plus the s_mix_force_show override.
+// Called from the ms_apply_async sweep so visibility tracks both the WS
+// state and the mix-list-received bit; never called directly from a WS
+// callback (which would race with the LVGL task on the timer list).
+static void mix_indicator_apply_visibility(void)
+{
+    if (!s_mix_indicator) return;
+    bool ms_connected = (s_ms && s_ms->get_state &&
+                         s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    bool list_ready   = (s_ms && s_ms->is_mix_list_ready &&
+                         s_ms->is_mix_list_ready());
+    bool show = s_mix_force_show ||
+                (ms_connected && list_ready && s_mix_count > 0);
+    if (show) lv_obj_remove_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag   (s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
+}
+
+// P5: forced-reveal toggle for the `mix-show` console command. Called from
+// the REPL task — needs lvgl_port_lock since it touches the visibility
+// flag directly (the REPL is not the LVGL task).
+void app_ui_force_mix_show(bool force)
+{
+    s_mix_force_show = force;
+    if (!s_mix_indicator) return;
+    if (!lvgl_port_lock(1000)) return;
+    mix_indicator_apply_visibility();
     lvgl_port_unlock();
 }
 
@@ -4091,6 +4130,11 @@ static void ms_apply_async(void *unused)
 {
     (void)unused;
     ms_icon_refresh();
+    // P5: AND-gated visibility lives here, not in the WS callback. After
+    // a reconnect the iface flips both halves of the gate (mix_list_ready
+    // re-arms on WEBSOCKET_EVENT_CONNECTED; the connected state via
+    // get_state) and a single sweep makes both visible at once.
+    mix_indicator_apply_visibility();
     mix_indicator_refresh();
     // P11: routed-set changes invalidate the picker grid (mix-row count
     // and ordering depends on the mask). Tear down so the next open

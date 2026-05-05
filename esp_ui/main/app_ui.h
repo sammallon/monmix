@@ -42,3 +42,8 @@ void app_ui_set_channel_total(int count);
 // task; uses lv_async_call internally. Calls made before app_ui_init runs
 // are no-ops.
 void app_ui_set_status(const char *text);
+
+// P5: force the mix-indicator visible regardless of the WS-connected /
+// mix-list-ready gate. Pass false to release the override and revert to
+// the gated path. Used by the `mix-show` console command for diagnosis.
+void app_ui_force_mix_show(bool force);
