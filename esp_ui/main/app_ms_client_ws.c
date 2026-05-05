@@ -76,6 +76,14 @@ static bool s_mix_routed[MAX_MIX_BUSES] = { [0 ... MAX_MIX_BUSES - 1] = true };
 #define MS_MAX_STRIP_NAMES 128
 EXT_RAM_BSS_ATTR static char s_all_strip_names[MS_MAX_STRIP_NAMES][32];
 
+// W6.1: per-channel routability mask. ch.<n>.levelData.0.lvl returns 200
+// for input/aux/stereo channels (routable to a mix bus) and 404 for
+// mix/matrix/main strips (can't be routed onto a mix bus -- mixes can't
+// contain themselves or other mixes). Default true so a never-fetched
+// state shows everything rather than hiding everything.
+static bool s_channel_routable[MS_MAX_STRIP_NAMES] = {0};
+static bool s_channel_routable_inited = false;
+
 static esp_websocket_client_handle_t s_ws;
 static app_ms_state_t                s_state = APP_MS_STATE_BOOT;
 
@@ -427,6 +435,55 @@ static const char *ws_get_strip_name(int ms_channel_id)
     return s_all_strip_names[ms_channel_id];
 }
 
+// W6.1: probe one channel for routability via REST. 200 -> routable,
+// 404 -> not (mix/matrix/main). 404 is a normal negative answer here, not
+// an error -- treat it as the signal, log louder cases only.
+static bool fetch_one_channel_routable(int ch_id)
+{
+    char url[128];
+    snprintf(url, sizeof(url),
+             "http://%s:%u/console/data/get/ch.%d.levelData.0.lvl/val",
+             app_config_ms_host(), (unsigned) app_config_ms_port(), ch_id);
+
+    poll_sink_t sink = {0};
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = poll_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = POLL_HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return true;  // network blip -> don't hide the channel
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK) return true;  // transient: keep visible
+    if (status == 404) return false;
+    return true;  // 200 (or anything else non-404): treat as routable
+}
+
+static void ws_fetch_channel_routability(int total)
+{
+    if (total < 0) return;
+    if (total > MS_MAX_STRIP_NAMES) total = MS_MAX_STRIP_NAMES;
+    int routable = 0;
+    for (int i = 0; i < total; ++i) {
+        s_channel_routable[i] = fetch_one_channel_routable(i);
+        if (s_channel_routable[i]) routable++;
+    }
+    s_channel_routable_inited = true;
+    ESP_LOGI(TAG, "channel routability: %d/%d routable to mix", routable, total);
+    notify_subscribers();
+}
+
+static bool ws_is_channel_routable(int ms_channel_id)
+{
+    if (ms_channel_id < 0 || ms_channel_id >= MS_MAX_STRIP_NAMES) return true;
+    if (!s_channel_routable_inited) return true;
+    return s_channel_routable[ms_channel_id];
+}
+
 static bool ws_create_and_start(void);  // fwd
 
 static void ws_reconnect(void)
@@ -487,6 +544,8 @@ static const ms_client_iface_t s_iface = {
     .set_master_mute       = ws_set_master_mute,
     .fetch_all_strip_names = ws_fetch_all_strip_names,
     .get_strip_name        = ws_get_strip_name,
+    .fetch_channel_routability = ws_fetch_channel_routability,
+    .is_channel_routable       = ws_is_channel_routable,
     .set_meter_enabled     = ws_set_meter_enabled,
 };
 

@@ -98,6 +98,18 @@ typedef struct {
     // a name for this id yet -- caller should fall back to "CH NN".
     const char *(*get_strip_name)(int ms_channel_id);
 
+    // W6.1: REST-probe ch.<n>.levelData.0.lvl for every channel id in
+    // 0..total-1; 200 -> routable to a mix, 404 -> not (mix/matrix/main
+    // self-routes). Same scale + cadence as fetch_all_strip_names; called
+    // once after set_mix_layout, before ws_start. Cache stays valid for
+    // the session (channel TYPE doesn't change without an MS profile
+    // swap, which restarts the WS anyway).
+    void (*fetch_channel_routability)(int total);
+
+    // W6.1: getter for the cached routability bit. Defaults to true so a
+    // never-fetched state never accidentally hides everything.
+    bool (*is_channel_routable)(int ms_channel_id);
+
     // #30: real metering subscription. on=true subscribes the current
     // tracked channel set to /console/metering2 at ~10 Hz; on=false
     // unsubscribes. Idempotent. Called by the UI when the user changes
