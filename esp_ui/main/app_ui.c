@@ -2774,10 +2774,12 @@ static void on_wcfg_textarea_focused(lv_event_t *e)
                              numeric ? LV_KEYBOARD_MODE_NUMBER
                                      : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+        // Keyboard is a sibling of the overlay (under the screen) so the
+        // overlay can scroll without dragging the keyboard around. But that
+        // means the overlay was last in z-order and hides the keyboard --
+        // promote it to the front whenever it becomes visible.
+        lv_obj_move_foreground(s_wcfg_keyboard);
     }
-    // Scroll the focused field above the keyboard. lv_obj_scroll_to_view
-    // walks the parent chain looking for a scrollable -- the overlay is
-    // marked scrollable in build_wcfg_overlay so this DTRT.
     lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
 
@@ -3446,10 +3448,10 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
                              numeric ? LV_KEYBOARD_MODE_NUMBER
                                      : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+        // Keyboard is a sibling of the overlay; promote to foreground so it
+        // isn't drawn behind the overlay (same fix as on_wcfg_textarea_focused).
+        lv_obj_move_foreground(s_mcfg_keyboard);
     }
-    // Scroll the focused field above the keyboard. Same pattern as the
-    // wifi-config overlay; the overlay was made vertically scrollable in
-    // build_mcfg_overlay so this DTRT.
     lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
 
