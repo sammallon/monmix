@@ -1,0 +1,18 @@
+# Repro for the level-format-switch bug. Pre-fix expectation:
+#   00_baseline.bmp  — sliders at MS-driven values (post-WS subscribe)
+#   01_after_db.bmp  — sliders all snap to 0 because broadcasts route
+#                       wrong format / re-subscribe never fired
+# Post-fix expectation:
+#   01_after_db.bmp  — sliders still positioned to match MS state, just
+#                       in dB-tapered position rather than NORM-tapered
+
+sleep 1500
+echo phase=baseline
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/fmt_00_baseline.bmp
+
+set_format db
+sleep 1500
+echo phase=after_switch_to_db
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/fmt_01_after_db.bmp
+
+quit

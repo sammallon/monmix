@@ -96,6 +96,7 @@ static SDL_Window  *g_sdl_window;
 static lv_display_t *g_disp;
 static int           g_last_x;
 static int           g_last_y;
+static const ms_client_iface_t *g_ms;
 
 static void inject_motion(int x, int y) {
     g_last_x = x; g_last_y = y;
@@ -209,6 +210,16 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             printf("%s screenshot %s rc=%d\n", rc == 0 ? "OK" : "ERR", path, rc);
         } else if (sscanf(cmd, "echo %1023[^\n]", text) == 1) {
             printf("OK echo %s\n", text);
+        } else if (sscanf(cmd, "set_format %15s", text) == 1) {
+            // Mirror app_ui's on_lvl_*_clicked handler exactly: persist
+            // the pref AND tell the ms_client to re-subscribe in the new
+            // format. Otherwise pref-change observers fire but the lvl
+            // subscription stays in the old format.
+            app_level_format_t f = (strcmp(text, "db") == 0)
+                ? APP_LEVEL_FORMAT_DB : APP_LEVEL_FORMAT_NORM;
+            app_prefs_set_level_format(f);
+            if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
+            printf("OK set_format %s\n", text);
         } else if (strcmp(cmd, "quit") == 0) {
             printf("OK quit\n");
             return 1;
@@ -280,6 +291,7 @@ int main(int argc, char **argv) {
     const ms_client_iface_t *ms = ms_host
         ? ms_client_real_create(ms_host, ms_port)
         : app_ms_client_ws();
+    g_ms = ms;
     app_ui_init(ms);
     app_ui_set_channel_total(80);
     app_ui_set_mix_count(14);

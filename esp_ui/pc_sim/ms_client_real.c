@@ -158,23 +158,28 @@ static void send_set_str(const char *dotted, const char *s) {
     outq_push(buf);
 }
 
-// Subscribe to everything for one channel index.
+// Subscribe to everything for one channel index. The lvl path's format
+// matches g_ms.level_fmt so DB <-> NORM switches re-subscribe in the
+// right shape; otherwise broadcasts arrive in the wrong field of
+// app_state and the UI's sweep reads zeroes.
 static void subscribe_channel(int ch_id, int mix_idx) {
+    const char *lvl_fmt = (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
     char dotted[64];
     snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", ch_id);
     send_subscribe(dotted, "val");
     snprintf(dotted, sizeof(dotted), "ch.%d.levelData.%d.lvl", ch_id, mix_idx);
-    send_subscribe(dotted, "norm");
+    send_subscribe(dotted, lvl_fmt);
     snprintf(dotted, sizeof(dotted), "ch.%d.levelData.%d.on", ch_id, mix_idx);
     send_subscribe(dotted, "val");
 }
 
 static void subscribe_master(int master_id) {
+    const char *lvl_fmt = (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
     char dotted[64];
     snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", master_id);
     send_subscribe(dotted, "val");
     snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", master_id);
-    send_subscribe(dotted, "norm");
+    send_subscribe(dotted, lvl_fmt);
     snprintf(dotted, sizeof(dotted), "ch.%d.mix.on", master_id);
     send_subscribe(dotted, "val");
 }
@@ -229,7 +234,15 @@ static void route_inbound(const char *path, double num_value, const char *str_va
     if (strncmp(suf, prefix, plen) == 0) {
         const char *tail = suf + plen;
         if (strcmp(tail, "lvl") == 0 && idx >= 0) {
-            app_state_set_level(idx, (float)num_value, true);
+            // Same dotted path carries either NORM (0..1) or VAL (dB)
+            // depending on the format we subscribed in. Route to the
+            // matching app_state slot so apply_pending finds it where it
+            // expects.
+            if (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) {
+                app_state_set_level_db(idx, (float)num_value, true);
+            } else {
+                app_state_set_level(idx, (float)num_value, true);
+            }
         } else if (strcmp(tail, "on") == 0 && idx >= 0 && is_bool) {
             // MS reports "on" = audible = NOT muted.
             app_state_set_mute(idx, !bool_value, true);
@@ -238,7 +251,11 @@ static void route_inbound(const char *path, double num_value, const char *str_va
     }
     if (is_master) {
         if (strcmp(suf, "mix.lvl") == 0) {
-            app_state_master_set_level((float)num_value, true);
+            if (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) {
+                app_state_master_set_level_db((float)num_value, true);
+            } else {
+                app_state_master_set_level((float)num_value, true);
+            }
         } else if (strcmp(suf, "mix.on") == 0 && is_bool) {
             app_state_master_set_mute(!bool_value, true);
         }
@@ -468,7 +485,8 @@ static void m_register(app_ms_on_change_t cb, void *ctx) {
 }
 
 static int m_get_mix(void)          { return g_ms.mix_idx; }
-static void m_set_mix(int idx)      {
+static void m_set_mix(int idx) {
+    if (g_ms.mix_idx == idx) return;
     g_ms.mix_idx = idx;
     g_ms.subscribed = false;
     if (g_ms.ws_open) subscribe_all();
@@ -495,7 +513,16 @@ static const char *m_get_strip_name(int id) {
 static void m_fetch_channel_routability(int total) { (void)total; }
 static bool m_is_channel_routable(int id)          { (void)id; return true; }
 static void m_set_meter_enabled(bool on)           { (void)on; }
-static void m_set_level_format(app_level_format_t f) { g_ms.level_fmt = f; }
+static void m_set_level_format(app_level_format_t f) {
+    if (g_ms.level_fmt == f) return;
+    g_ms.level_fmt = f;
+    // The lvl subscription embeds the format in the path's tail; switching
+    // requires re-issuing the subscribes so MS broadcasts in the new
+    // shape. Without this the UI's pref-change sweep reads zeroes from
+    // the field that was never populated in the new format.
+    g_ms.subscribed = false;
+    if (g_ms.ws_open) subscribe_all();
+}
 
 static const ms_client_iface_t s_iface = {
     .start                       = m_start,
