@@ -300,9 +300,11 @@ bool app_display_init(void)
     // is a long visible gap between display power-on and the first widget
     // being mounted (WiFi associate, MS info fetch, channel enumeration);
     // without this the user stares at a bright pale-blue rectangle through
-    // the whole boot. 0x101010 matches the splash logo's baked bg so the
-    // logo blends seamlessly. Both light and dark default themes leave this
-    // alone -- they style children, not the active screen's bg directly.
+    // the whole boot. The splash logo asset is RGB565A8 with a transparent
+    // canvas (build_splash_logo.py alpha-keys pure-black pixels), so the
+    // screen bg shows through everywhere outside the logo paths -- no
+    // quantisation seam, no halo. Both light and dark default themes leave
+    // the active screen's bg alone -- they style children only.
     if (lvgl_port_lock(0)) {
         lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x101010), 0);
         lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, 0);

@@ -69,28 +69,40 @@ def recolor_text():
 
 
 def render_png():
-    """Render the recoloured SVG with a transparent background and downscale
-    via PIL. Transparent bg (rather than a baked-in dark) means LVGL composites
-    the logo over the screen bg directly -- so the logo bg always matches the
-    screen bg exactly, with no RGB565 round-trip drift from the PNG decode +
-    LANCZOS downsample shifting the solid pixels by 1-2 LSB.
+    """Render the recoloured SVG and post-process to transparent bg. The user
+    asked for a transparent SVG canvas so the logo composites over whatever
+    screen bg LVGL picks (no quantisation drift from a baked-in dark bg).
+    renderPM's bg=None doesn't actually emit transparent pixels -- it falls
+    back to black -- and cairosvg can't load libcairo on this host. So we
+    render with bg=black and post-process: any pixel that's still pure black
+    after rendering = canvas, set alpha=0. The SVG has no intentional black
+    fills (cls-1 = white, cls-2 = teal, recoloured text = white) so pure-black
+    pixels are unambiguously canvas.
 
-    Cost: alpha channel doubles the asset (RGB565A8 instead of RGB565), but
-    the splash is still ~60 KB which is acceptable.
+    Anti-aliased edges between logo and canvas blend the logo colour with
+    black; those pixels stay opaque with a slight dark fringe. Acceptable
+    for a 1-pixel boundary against a dark screen bg.
 
-    svglib's drawing.scale() corrupts visible content (paths fall outside the
-    new clip rect) so we keep the geometry untouched and let PIL do the final
-    downscale."""
+    svglib's drawing.scale() corrupts visible content so we keep the geometry
+    untouched and let PIL do the final downscale."""
     drawing = svg2rlg(str(TMP_SVG))
     full_png = TMP_PNG.with_name("_splash_full.png")
-    # bg=None keeps the alpha channel; configPIL=None keeps PIL out of the
-    # path so renderPM uses pycairo end-to-end.
+    # bg=0x000000 fills the canvas with black; we'll alpha-key it below.
     renderPM.drawToFile(drawing, str(full_png), fmt="PNG",
-                        bg=None, configPIL=None)
-    img = Image.open(full_png).convert("RGBA")
+                        bg=0x000000, configPIL=None)
+    img = Image.open(full_png).convert("RGB")
     ratio = WIDTH_PX / img.size[0]
-    out = img.resize((WIDTH_PX, int(img.size[1] * ratio)), Image.LANCZOS)
-    out.save(TMP_PNG)
+    img = img.resize((WIDTH_PX, int(img.size[1] * ratio)), Image.LANCZOS)
+    # Alpha-key pure black -> transparent.
+    rgba = img.convert("RGBA")
+    pixels = rgba.load()
+    w, h = rgba.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, _ = pixels[x, y]
+            if r == 0 and g == 0 and b == 0:
+                pixels[x, y] = (0, 0, 0, 0)
+    rgba.save(TMP_PNG)
 
 
 def run_lvgl_conv():
