@@ -2663,10 +2663,21 @@ static void on_name_clicked(lv_event_t *e)
 static void wcfg_hide_keyboard(void)
 {
     if (s_wcfg_keyboard) lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    // Restore the overlay's full-screen height so the form is fully visible
+    // when the keyboard is dismissed. The focus handler shrinks it to
+    // SCREEN_H/2 to enable scroll-into-view for fields below the keyboard.
+    if (s_wcfg_overlay) {
+        lv_obj_set_height(s_wcfg_overlay, SCREEN_H);
+        lv_obj_scroll_to_y(s_wcfg_overlay, 0, LV_ANIM_ON);
+    }
 }
 static void mcfg_hide_keyboard(void)
 {
     if (s_mcfg_keyboard) lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (s_mcfg_overlay) {
+        lv_obj_set_height(s_mcfg_overlay, SCREEN_H);
+        lv_obj_scroll_to_y(s_mcfg_overlay, 0, LV_ANIM_ON);
+    }
 }
 
 // --- WiFi panel ----------------------------------------------------------
@@ -2779,6 +2790,11 @@ static void on_wcfg_textarea_focused(lv_event_t *e)
         // means the overlay was last in z-order and hides the keyboard --
         // promote it to the front whenever it becomes visible.
         lv_obj_move_foreground(s_wcfg_keyboard);
+        // Shrink the overlay to the visible-above-keyboard height so its
+        // children that extended into the bottom-half become scrollable.
+        // Without this, scroll_to_view sees the whole-screen overlay as
+        // "visible" and refuses to scroll.
+        lv_obj_set_height(s_wcfg_overlay, SCREEN_H / 2);
     }
     lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
@@ -3449,8 +3465,12 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
                                      : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
         // Keyboard is a sibling of the overlay; promote to foreground so it
-        // isn't drawn behind the overlay (same fix as on_wcfg_textarea_focused).
+        // isn't drawn behind the overlay.
         lv_obj_move_foreground(s_mcfg_keyboard);
+        // Shrink the overlay so children below the visible-above-keyboard
+        // edge become scrollable; scroll_to_view treats the full-screen
+        // overlay as "all visible" otherwise.
+        lv_obj_set_height(s_mcfg_overlay, SCREEN_H / 2);
     }
     lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
