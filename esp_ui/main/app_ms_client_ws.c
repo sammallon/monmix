@@ -545,10 +545,21 @@ static void ws_stop(void) {
 }
 
 static void ws_set_level(int id, float level) {
+    // app_ui.c always hands us a NORM position (0..1) regardless of
+    // the active level format pref. In DB mode we need to convert to
+    // dB before sending down the /val path -- otherwise MS receives
+    // a "0.5 dB" SET when the slider was at 50% (which the audio-
+    // taper maps to ~-13 dB), snaps to ~+0.5 dB, broadcasts back, and
+    // the slider visibly jumps to ~76% on release. Symptom report
+    // was "fader slides but doesn't move MS, then snaps back on
+    // release" -- this is the conversion that was missing.
     char dotted[80];
     snprintf(dotted, sizeof(dotted), "ch.%d.levelData.%d.lvl", id, g.mix_idx);
-    if (g.level_format == APP_LEVEL_FORMAT_DB) send_set_val_db(dotted, level);
-    else                                       send_set_norm  (dotted, level);
+    if (g.level_format == APP_LEVEL_FORMAT_DB) {
+        send_set_val_db(dotted, app_position_to_db(level));
+    } else {
+        send_set_norm(dotted, level);
+    }
 }
 
 static void ws_set_mute(int id, bool mute) {
@@ -568,8 +579,8 @@ static void ws_set_master_level(float level) {
     if (mid < 0) return;
     char dotted[80];
     snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", mid);
-    if (g.level_format == APP_LEVEL_FORMAT_DB) send_set_val_db(dotted, level);
-    else                                       send_set_norm  (dotted, level);
+    // Always /norm (see ws_set_level for rationale).
+    send_set_norm(dotted, level);
 }
 
 static void ws_set_master_mute(bool mute) {
