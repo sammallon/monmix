@@ -4186,25 +4186,25 @@ static void toast_hide(lv_timer_t *t)
 static void build_toast(void)
 {
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_t *t = lv_obj_create(scr);
-    lv_obj_set_size(t, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_align(t, LV_ALIGN_CENTER, 0, 100);
-    lv_obj_set_style_pad_all(t, 16, 0);
-    lv_obj_set_style_radius(t, 8, 0);
-    lv_obj_set_style_border_width(t, 0, 0);
-    lv_obj_clear_flag(t, LV_OBJ_FLAG_SCROLLABLE);
+    s_toast = lv_obj_create(scr);
+    lv_obj_set_size(s_toast, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(s_toast, LV_ALIGN_CENTER, 0, 100);
+    lv_obj_set_style_pad_all(s_toast, 16, 0);
+    lv_obj_set_style_radius(s_toast, 8, 0);
+    lv_obj_set_style_border_width(s_toast, 0, 0);
+    lv_obj_clear_flag(s_toast, LV_OBJ_FLAG_SCROLLABLE);
     // Bright amber on dark text — high contrast against the dark theme's
     // near-black backgrounds and the saturated slider colors. Default theme
     // styling rendered as dark-grey-on-dark-grey, which user reported as
     // hard to see when a slider was nearby.
-    lv_obj_set_style_bg_color(t, lv_color_hex(0xF0B030), 0);
-    lv_obj_set_style_bg_opa(t, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(s_toast, lv_color_hex(0xF0B030), 0);
+    lv_obj_set_style_bg_opa(s_toast, LV_OPA_COVER, 0);
 
-    s_toast_label = lv_label_create(t);
+    s_toast_label = lv_label_create(s_toast);
     lv_label_set_text(s_toast_label, "");
     lv_obj_set_style_text_color(s_toast_label, lv_color_hex(0x101010), 0);
     lv_obj_center(s_toast_label);
-    lv_obj_add_flag(t, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void toast_show(const char *text)
