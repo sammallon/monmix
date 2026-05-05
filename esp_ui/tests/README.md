@@ -54,10 +54,21 @@ Run: `bash tests/unit/run.sh` (Linux/WSL) or `pwsh tests/unit/run.ps1`
 ## hw — same scripts, against the live tablet
 
 Convention: a sim test that should also pass on hardware sets
-`"hw": True` in its dict. `tests/hw/run.py` replays the scripts via
-`tools/run_steps.py`'s REPL adapter (which already speaks `touch X Y
-tap`, `screenshot`, etc.), captures the on-device frame via
-`tools/fetch_screenshot.py`, and applies the same expectations.
+`"hw_compatible": True` in its dict, optionally with an `hw_expect`
+override for sim-only stdout markers (e.g. `OK quit`).
+`tests/hw/run.py` replays the scripts via `tools/run_steps.py`'s REPL
+adapter (which already speaks `tap:X,Y`, `wait:MS`, `shot:NAME`,
+`cmd:CMD`), captures the on-device frame, and applies the same
+expectations.
+
+Source the IDF PowerShell profile first so the venv that has
+`pyserial` is on PATH:
+
+```powershell
+. 'C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1' *> $null
+$env:MONMIX_HW_PORT = 'COM3'
+python tests/hw/run.py
+```
 
 Hardware tests are not in CI; they're for parity verification when a
 sim regression test catches something that ought to also be true on
