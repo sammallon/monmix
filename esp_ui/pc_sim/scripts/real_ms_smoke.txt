@@ -1,0 +1,14 @@
+# Smoke-test the real MS connection. With --ms-host pointed at the user's
+# Mixing Station instance, the WS subscribe should populate fader names
+# and levels within a few hundred ms. Then a tap on a fader should send
+# a SET that the data-explorer in MS can confirm.
+sleep 1500
+echo phase=after_ws_subscribe
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/real_00_subscribed.bmp
+sleep 500
+# Press near the middle of ch 4's slider track to push it to ~50% norm.
+tap 297 280
+sleep 600
+echo phase=after_set
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/real_01_after_set.bmp
+quit

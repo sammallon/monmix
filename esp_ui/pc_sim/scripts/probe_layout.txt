@@ -1,0 +1,5 @@
+# Boot the UI fully, then capture one frame so we can see where the
+# fader strips and mute buttons land in screen coords.
+sleep 800
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/baseline.bmp
+quit

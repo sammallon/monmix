@@ -1,0 +1,5 @@
+# Per-host build trees + FetchContent caches. Two of them so Windows-side
+# (build-windows/) and WSL-side (build-linux/) builds don't fight over a
+# shared CMakeCache.txt.
+build-windows/
+build-linux/

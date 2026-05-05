@@ -1,0 +1,29 @@
+# Repro for the mute-button panic. Pre-fix this run aborts on tap;
+# post-fix the amber "Mute disabled" toast banner appears for 2 s.
+# MUTE EN starts off by default — exactly the panic precondition.
+
+sleep 800
+echo phase=baseline
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/00_baseline.bmp
+
+# ch 4 mute button center is roughly (298, 498) on the 1024x600 panel.
+echo phase=tap_mute
+tap 298 498
+
+# 200 ms after tap, the toast should be fully shown.
+sleep 200
+echo phase=toast_shown
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/01_after_mute_tap.bmp
+
+# Toast auto-hides at 2 s. Wait past that and confirm it's gone.
+sleep 2200
+echo phase=toast_hidden
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/02_after_timeout.bmp
+
+# Tap a second mute to confirm the timer-reuse path also doesn't crash.
+echo phase=second_tap
+tap 552 498
+sleep 200
+screenshot S:/playground/monmix/esp_ui/tmp/sim_screenshots/03_second_toast.bmp
+
+quit
