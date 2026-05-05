@@ -61,10 +61,18 @@ typedef void (*app_wifi_scan_done_t)(void *ctx);
 
 #define APP_WIFI_SCAN_MAX_RESULTS 24
 
+typedef enum {
+    APP_WIFI_SCAN_STARTED,         // fresh scan kicked off; cb fires on done
+    APP_WIFI_SCAN_ALREADY_RUNNING, // scan was already in-flight; cb still bound
+    APP_WIFI_SCAN_FAILED,          // could not start and none in progress
+} app_wifi_scan_result_t;
+
 // Trigger an asynchronous scan. The done_cb fires from the WiFi event task
 // when results are ready; call app_wifi_scan_results to read them.
-// Returns false if a scan is already in progress.
-bool app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx);
+// If a scan is already running the new cb replaces the old and the result
+// is APP_WIFI_SCAN_ALREADY_RUNNING -- callers should treat that the same as
+// STARTED and just wait for the cb.
+app_wifi_scan_result_t app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx);
 
 // Read the latest scan results. Returns the number of SSIDs filled in;
 // caller passes a `dst` of at least max_count strings each at least

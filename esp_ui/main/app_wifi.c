@@ -117,6 +117,12 @@ void app_wifi_init_radio(void)
     const char *pass = app_config_wifi_pass();
     memcpy(cfg.sta.ssid,     ssid, strlen(ssid));
     memcpy(cfg.sta.password, pass, strlen(pass));
+    // Hidden-SSID support: WIFI_FAST_SCAN (the default) only probes channels
+    // until it sees a beacon advertising the SSID, which hidden APs don't do.
+    // ALL_CHANNEL_SCAN sweeps every channel and sends directed probe requests
+    // for the configured SSID -- that's what makes hidden APs respond. Costs
+    // ~2s extra on first associate. bssid_set stays false (zero-init).
+    cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
@@ -207,6 +213,9 @@ bool app_wifi_reconfigure(void)
     const char *pass = app_config_wifi_pass();
     memcpy(cfg.sta.ssid,     ssid, strlen(ssid));
     memcpy(cfg.sta.password, pass, strlen(pass));
+    // See app_wifi_init_radio: ALL_CHANNEL_SCAN is required to associate with
+    // hidden APs (e.g. "MVAC"). bssid_set stays false (zero-init).
+    cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
 
     // Returning errors here is unusual -- esp_wifi_disconnect on a not-yet-
     // connected client returns ESP_ERR_WIFI_NOT_CONNECT, harmless.
@@ -291,21 +300,28 @@ static void on_scan_done(void)
     if (s_scan_done_cb) s_scan_done_cb(s_scan_done_ctx);
 }
 
-bool app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx)
+app_wifi_scan_result_t app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx)
 {
-    if (s_scan_in_progress) return false;
+    // Bind the cb up front -- if a scan is already running the popup still
+    // wants to be notified when WIFI_EVENT_SCAN_DONE fires, so we attach to
+    // the in-flight scan instead of failing.
     s_scan_done_cb  = done_cb;
     s_scan_done_ctx = ctx;
-    s_scan_in_progress = true;
+    if (s_scan_in_progress) return APP_WIFI_SCAN_ALREADY_RUNNING;
 
+    s_scan_in_progress = true;
     wifi_scan_config_t cfg = {0};
     esp_err_t err = esp_wifi_scan_start(&cfg, false);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
-        s_scan_in_progress = false;
-        return false;
+    if (err == ESP_OK) return APP_WIFI_SCAN_STARTED;
+    if (err == ESP_ERR_WIFI_STATE) {
+        // Driver says a scan is already running but our flag was clear --
+        // treat as ALREADY_RUNNING so the cb fires when SCAN_DONE arrives.
+        ESP_LOGI(TAG, "scan_start: driver already scanning, attaching cb");
+        return APP_WIFI_SCAN_ALREADY_RUNNING;
     }
-    return true;
+    ESP_LOGW(TAG, "scan_start failed: %s", esp_err_to_name(err));
+    s_scan_in_progress = false;
+    return APP_WIFI_SCAN_FAILED;
 }
 
 size_t app_wifi_scan_results(char (*dst)[33], size_t max_count)
