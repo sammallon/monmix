@@ -3,3 +3,7 @@
 # shared CMakeCache.txt.
 build-windows/
 build-linux/
+
+# Local sim state -- nvs.json + sdcard/* mirror written by mock_nvs and
+# the redirected fopen path. Per-developer; never commit.
+pc_sim_state/

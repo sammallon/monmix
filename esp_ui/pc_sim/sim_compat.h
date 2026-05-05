@@ -71,4 +71,51 @@ static __inline size_t strftime_sim(char *buf, size_t maxsz, const char *fmt, co
 #define strftime strftime_sim
 #endif
 
+// ────────────────────────────────────────────────────────────────────────────
+// /sdcard/... path hijack for the real main/app_prefs.c. The tablet mounts
+// FATFS at /sdcard; the sim has nothing of the sort, so any fopen / remove
+// / rename of a "/sdcard/..." path is rewritten to land inside
+// pc_sim_state/sdcard/ in the cwd. app_prefs.c writes its SD-mirror JSON
+// there without modification. mock_nvs.c sets SIM_COMPAT_NO_FOPEN_HIJACK
+// before including this header so its own fopen calls (to a non-/sdcard
+// path) bypass the wrapper.
+#if !defined(SIM_COMPAT_NO_FOPEN_HIJACK)
+#include <stdio.h>
+#include <string.h>
+
+static __inline FILE *sim_fopen(const char *path, const char *mode) {
+    if (path && strncmp(path, "/sdcard/", 8) == 0) {
+        char redirected[512];
+        snprintf(redirected, sizeof(redirected), "pc_sim_state/sdcard/%s", path + 8);
+        return fopen(redirected, mode);
+    }
+    return fopen(path, mode);
+}
+
+static __inline int sim_remove(const char *path) {
+    if (path && strncmp(path, "/sdcard/", 8) == 0) {
+        char redirected[512];
+        snprintf(redirected, sizeof(redirected), "pc_sim_state/sdcard/%s", path + 8);
+        return remove(redirected);
+    }
+    return remove(path);
+}
+
+static __inline int sim_rename(const char *oldp, const char *newp) {
+    char r1[512], r2[512];
+    const char *o = oldp, *n = newp;
+    if (oldp && strncmp(oldp, "/sdcard/", 8) == 0) {
+        snprintf(r1, sizeof(r1), "pc_sim_state/sdcard/%s", oldp + 8); o = r1;
+    }
+    if (newp && strncmp(newp, "/sdcard/", 8) == 0) {
+        snprintf(r2, sizeof(r2), "pc_sim_state/sdcard/%s", newp + 8); n = r2;
+    }
+    return rename(o, n);
+}
+
+#define fopen  sim_fopen
+#define remove sim_remove
+#define rename sim_rename
+#endif
+
 #endif // SIM_COMPAT_H

@@ -80,11 +80,14 @@ static void silence_windows_crash_popups(void) {
 #include "app_ms_client.h"
 #include "app_prefs.h"
 #include "app_state.h"
+#include "app_storage.h"
 #include "app_ui.h"
 
 #include "app_display.h"
 #include "ms_client_real.h"
 #include "throttle.h"
+
+#include "nvs.h"  // for nvs_flash_init
 
 #define WIN_W   1024
 #define WIN_H   600
@@ -260,6 +263,13 @@ int main(int argc, char **argv) {
     lv_sdl_mouse_create();
     lv_sdl_keyboard_create();
     lv_sdl_mousewheel_create();
+
+    // Match the tablet's boot order from esp_ui_main.c: nvs_flash_init
+    // first (so the namespace is mountable), then app_storage_init for
+    // the SD mirror, then app_prefs_init reconciles them.
+    nvs_flash_init();
+    app_storage_init();
+    app_prefs_init();
 
     size_t      n;
     const int  *ids = app_config_channel_ids(&n);

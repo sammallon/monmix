@@ -66,6 +66,23 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(mongoose)
 set(MONGOOSE_DIR ${mongoose_SOURCE_DIR})
 
+# cJSON for the real main/app_prefs.c -- it serializes the SD-mirror
+# JSON via cJSON. On the tablet this is the espressif/cjson registry
+# component; on PC we vendor the upstream sources directly.
+FetchContent_Declare(
+    cjson
+    URL      https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz
+    URL_HASH SHA256=3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5
+)
+# Populate without MakeAvailable so cJSON's own CMake (which builds
+# tests + a static lib) doesn't run inside our project. We only want
+# the .c+.h sources.
+FetchContent_GetProperties(cjson)
+if(NOT cjson_POPULATED)
+    FetchContent_Populate(cjson)
+endif()
+set(CJSON_DIR ${cjson_SOURCE_DIR})
+
 # ──────────────────────────────────────────────────────────────────────
 # LVGL static library, configured from our pc_sim/lv_conf.h (and NOT
 # from the ESP-IDF Kconfig generation that the tablet build uses).
@@ -97,16 +114,20 @@ endif()
 set(REUSED_MAIN_SRC
     ${MAIN_DIR}/app_ui.c
     ${MAIN_DIR}/app_state.c
+    ${MAIN_DIR}/app_prefs.c
     ${MAIN_DIR}/images/splash_logo.c
     ${MAIN_DIR}/fonts/font_monmix_level.c
 )
 
+# mock_app_prefs.c is gone -- the real main/app_prefs.c is compiled
+# instead, against the file-backed NVS in mock_nvs.c and a sim-local SD
+# mirror in mock_app_storage.c.
 set(MOCK_SRC
     mocks/mock_app_config.c
     mocks/mock_app_display.c
     mocks/mock_app_logd.c
     mocks/mock_app_ms_client.c
-    mocks/mock_app_prefs.c
+    mocks/mock_app_storage.c
     mocks/mock_app_time.c
     mocks/mock_app_wifi.c
     mocks/mock_esp_lvgl_port.c
@@ -114,12 +135,14 @@ set(MOCK_SRC
     mocks/mock_esp_system.c
     mocks/mock_esp_timer.c
     mocks/mock_freertos.c
+    mocks/mock_nvs.c
 )
 
 set(SIM_SRC
     ms_client_real.c
     throttle.c
     ${MONGOOSE_DIR}/mongoose.c
+    ${CJSON_DIR}/cJSON.c
 )
 
 add_executable(monmix_sim
@@ -137,6 +160,7 @@ target_include_directories(monmix_sim PRIVATE
     ${MAIN_DIR}
     ${SDL2_INCLUDES}
     ${MONGOOSE_DIR}
+    ${CJSON_DIR}
 )
 
 # Mongoose configuration — keep TLS off (local MS is plain HTTP/WS), keep
