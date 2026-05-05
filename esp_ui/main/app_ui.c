@@ -2775,6 +2775,10 @@ static void on_wcfg_textarea_focused(lv_event_t *e)
                                      : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
+    // Scroll the focused field above the keyboard. lv_obj_scroll_to_view
+    // walks the parent chain looking for a scrollable -- the overlay is
+    // marked scrollable in build_wcfg_overlay so this DTRT.
+    lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
 
 static void on_wcfg_keyboard_event(lv_event_t *e)
@@ -3114,7 +3118,14 @@ static void build_wcfg_overlay(void)
     lv_obj_set_pos(ov, 0, 0);
     lv_obj_set_style_radius(ov, 0, 0);
     lv_obj_set_style_pad_all(ov, 16, 0);
-    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    // Form scrolls vertically so the keyboard pop-up doesn't permanently
+    // hide bottom-row fields (NTP textarea + DHCP-NTP checkbox). The
+    // textarea-focus handler calls lv_obj_scroll_to_view to bring the focused
+    // field above the keyboard. Keyboard is parented to the screen (not the
+    // overlay) so scrolling the form leaves the keyboard pinned at the
+    // bottom of the screen.
+    lv_obj_set_scroll_dir(ov, LV_DIR_VER);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
     s_wcfg_overlay = ov;
 
     lv_obj_t *title = lv_label_create(ov);
@@ -3295,7 +3306,11 @@ static void build_wcfg_overlay(void)
     lv_label_set_recolor(s_wcfg_status_label, true);
     lv_obj_align(s_wcfg_status_label, LV_ALIGN_TOP_LEFT, 0, y);
 
-    s_wcfg_keyboard = lv_keyboard_create(ov);
+    // Keyboard is parented to the screen, NOT the overlay, so scrolling the
+    // overlay leaves the keyboard pinned at the bottom of the screen. Without
+    // this the keyboard would scroll with the form and stop covering the
+    // wrong fields.
+    s_wcfg_keyboard = lv_keyboard_create(scr);
     lv_obj_set_size(s_wcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
     lv_obj_align(s_wcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_wcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -3432,6 +3447,10 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
                                      : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
+    // Scroll the focused field above the keyboard. Same pattern as the
+    // wifi-config overlay; the overlay was made vertically scrollable in
+    // build_mcfg_overlay so this DTRT.
+    lv_obj_scroll_to_view(ta, LV_ANIM_ON);
 }
 
 static void on_mcfg_keyboard_event(lv_event_t *e)
@@ -3493,7 +3512,12 @@ static void build_mcfg_overlay(void)
     lv_obj_set_pos(ov, 0, 0);
     lv_obj_set_style_radius(ov, 0, 0);
     lv_obj_set_style_pad_all(ov, 16, 0);
-    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    // Same scroll pattern as build_wcfg_overlay: the keyboard pop-up halves
+    // the visible area; making the overlay vertically scrollable + having
+    // the focus handler call lv_obj_scroll_to_view brings any covered field
+    // above the keyboard. Keyboard parent is the screen so it stays pinned.
+    lv_obj_set_scroll_dir(ov, LV_DIR_VER);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
     s_mcfg_overlay = ov;
 
     lv_obj_t *title = lv_label_create(ov);
@@ -3548,7 +3572,7 @@ static void build_mcfg_overlay(void)
     lv_label_set_recolor(s_mcfg_status_label, true);
     lv_obj_align(s_mcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 2 + 4);
 
-    s_mcfg_keyboard = lv_keyboard_create(ov);
+    s_mcfg_keyboard = lv_keyboard_create(scr);
     lv_obj_set_size(s_mcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
     lv_obj_align(s_mcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
