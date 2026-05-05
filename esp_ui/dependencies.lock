@@ -1,4 +1,14 @@
 dependencies:
+  cesanta/mongoose:
+    component_hash: e4f893b0f71d20b9191bf0354e94f6c662c023a39cd540a6f5db587d818a24b3
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 7.8.2
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -107,16 +117,6 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.1.2
-  espressif/esp_websocket_client:
-    component_hash: 3fb288702517ef4d75bf933a115f1056ee0c2540d964f9e1d856e0bb67e1dfeb
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.7.0
   espressif/esp_wifi_remote:
     component_hash: 4ad3e3ec9ce7d26fde1ccd2b550b88952cc96ac089a06e0247f69d005cc31e1f
     dependencies:
@@ -163,15 +163,15 @@ dependencies:
       type: service
     version: 9.4.0
 direct_dependencies:
+- cesanta/mongoose
 - espressif/cjson
 - espressif/esp_hosted
 - espressif/esp_lcd_ek79007
 - espressif/esp_lcd_touch_gt911
 - espressif/esp_lvgl_port
-- espressif/esp_websocket_client
 - espressif/esp_wifi_remote
 - idf
 - lvgl/lvgl
-manifest_hash: 843fc6460f987a17107fbc5e8974f42bd4286b31fcc29c2f50adfe83a9c3365d
+manifest_hash: 349993b21d74fdb720bfd16b3d99746dc6c2f8a37ffabd4a1d7c0cf1d313421f
 target: esp32p4
 version: 3.0.0

@@ -35,5 +35,10 @@ idf_component_register(
         console
         mbedtls
         esp_http_client
+        esp_timer
         esp_rom
 )
+# Mongoose now does the WS pipe + offline-mixer attach POST. esp_http_client
+# stays for app_ms_info.c's pre-WS /console/information probe (it runs
+# before the WS task is up; quicker to keep one focused REST call than to
+# block the WS task on the boot fetch).

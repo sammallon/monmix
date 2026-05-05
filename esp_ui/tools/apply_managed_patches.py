@@ -74,9 +74,61 @@ def patch_sdio_drv() -> bool:
     return True
 
 
+MONGOOSE_CMAKE = (
+    ROOT
+    / "managed_components"
+    / "cesanta__mongoose"
+    / "CMakeLists.txt"
+)
+
+MONGOOSE_REQS_OLD = "REQUIRES lwip mbedtls)"
+MONGOOSE_REQS_NEW = "REQUIRES lwip mbedtls esp_timer)"
+MONGOOSE_TLS_OLD  = "MG_ENABLE_MBEDTLS=1"
+MONGOOSE_TLS_NEW  = "MG_ENABLE_MBEDTLS=0"
+
+
+def patch_mongoose_cmakelists() -> bool:
+    # cesanta/mongoose 7.8.2's idf component CMakeLists has two issues
+    # against IDF v6.0.1:
+    #   1. esp_timer missing from REQUIRES — mongoose.h #include's it,
+    #      so the build fails with "esp_timer.h: No such file or directory"
+    #      until added.
+    #   2. Hardcodes MG_ENABLE_MBEDTLS=1, which pulls in TLS code that
+    #      uses mbedtls 2.x APIs (mbedtls_ssl_conf_rng signature, 5-arg
+    #      mbedtls_pk_parse_key) — IDF v6 ships mbedtls 3.x with new
+    #      shapes. We don't talk TLS to the local MS instance, so just
+    #      flip the define to 0.
+    # Patch reapplied on every configure so reconfigure-after-clean still
+    # builds.
+    if not MONGOOSE_CMAKE.exists():
+        return False
+    src = MONGOOSE_CMAKE.read_text(encoding="utf-8")
+    changed = False
+    if "esp_timer" not in src:
+        if MONGOOSE_REQS_OLD not in src:
+            sys.stderr.write(
+                f"apply_managed_patches: REQUIRES anchor not found in {MONGOOSE_CMAKE}.\n"
+                "Mongoose version drift -- update tools/apply_managed_patches.py.\n"
+            )
+            sys.exit(2)
+        src = src.replace(MONGOOSE_REQS_OLD, MONGOOSE_REQS_NEW, 1)
+        changed = True
+    if MONGOOSE_TLS_OLD in src:
+        src = src.replace(MONGOOSE_TLS_OLD, MONGOOSE_TLS_NEW, 1)
+        changed = True
+    if changed:
+        MONGOOSE_CMAKE.write_text(src, encoding="utf-8")
+    return changed
+
+
 if __name__ == "__main__":
     if patch_sdio_drv():
         print(
             "apply_managed_patches: applied CMD52 TOKEN_RDATA workaround "
             "to esp_hosted/sdio_drv.c"
+        )
+    if patch_mongoose_cmakelists():
+        print(
+            "apply_managed_patches: added esp_timer to "
+            "cesanta__mongoose REQUIRES"
         )

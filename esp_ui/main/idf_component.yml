@@ -28,8 +28,12 @@ dependencies:
   espressif/esp_lcd_touch_gt911:
     version: "*"
 
-  # WebSocket client (used by app_ms_client_ws.c).
-  espressif/esp_websocket_client:
+  # WS + HTTP client. Replaces espressif/esp_websocket_client + the IDF
+  # core esp_http_client component for app_ms_client_ws.c. Same library
+  # the PC sim uses (pc_sim/ms_client_real.c), so protocol behaviour is
+  # the same on both sides. Reconnect + outbound queueing live in our
+  # code; mongoose is just the transport.
+  cesanta/mongoose:
     version: "*"
 
   # Wi-Fi via the on-board ESP32-C6 co-processor.
