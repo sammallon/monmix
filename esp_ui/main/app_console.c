@@ -28,6 +28,7 @@
 #include "app_prefs.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
+#include "app_ui.h"
 
 static const char *TAG = "app_console";
 
@@ -620,6 +621,26 @@ static int cmd_log_trace(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `mix-show [on|off]` — diagnostic forced reveal of the mix-bus selector
+// button. Bypasses the (ms_connected && mix_list_ready) gate so we can tell
+// whether a stuck-hidden button is the gate's fault or a deeper layout/draw
+// issue. With no arg, defaults to "on". Call `mix-show off` to release.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_mix_show(int argc, char **argv)
+{
+    bool on = true;
+    if (argc >= 2) {
+        if      (strcmp(argv[1], "on")  == 0) on = true;
+        else if (strcmp(argv[1], "off") == 0) on = false;
+        else { printf("usage: mix-show [on|off]\n"); return 1; }
+    }
+    app_ui_force_mix_show(on);
+    printf("mix-show: %s\n", on ? "on (forced visible)" : "off (gated)");
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // REPL bootstrap.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -639,6 +660,7 @@ void app_console_init(void)
         { .command = "ms-info",      .help = "fetch /console/information from MS, print channel arch", .func = cmd_ms_info      },
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
         { .command = "prefs-dump",   .help = "dump effective + NVS + SD prefs state (P0 verify)", .func = cmd_prefs_dump   },
+        { .command = "mix-show",     .help = "[on|off] force mix-indicator visible (diagnose P5)", .func = cmd_mix_show     },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

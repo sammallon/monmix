@@ -1,6 +1,7 @@
 #include "app_config.h"
 #include "app_logd.h"
 #include "app_ms_client.h"
+#include "app_ms_info.h"
 #include "app_state.h"
 
 #include "esp_attr.h"
@@ -50,6 +51,14 @@ static int s_mix_bus_idx;
 static int  s_mix_offset;
 static int  s_mix_count;
 EXT_RAM_BSS_ATTR static char s_mix_names[MAX_MIX_BUSES][32];
+
+// P5: true once we have a non-empty mix-bus layout AND a live WS connection.
+// Cleared on disconnect so the next reconnect rebuilds it (and on the
+// reconnect-while-MS-was-unreachable-at-boot case, on_ws_event re-fetches
+// /console/information to populate s_mix_count before flipping this flag).
+// The UI's mix-indicator visibility AND-gates this with the WS connected
+// state — see mix_indicator_apply_visibility in app_ui.c.
+static volatile bool s_mix_list_received;
 
 // P11: per-mix routing flag from ch.<mix_offset+i>.info.isActive. Default
 // true so a stale state never accidentally hides every mix before the
@@ -180,6 +189,18 @@ static void ws_set_mix_layout(int offset, int count)
     if (count  > MAX_MIX_BUSES) count  = MAX_MIX_BUSES;
     s_mix_offset = offset;
     s_mix_count  = count;
+    // P5: if WS is already connected when the layout lands (boot ordering
+    // or a re-fetch after the user updates MS host/port), flip the
+    // received flag now and notify so the UI's mix-indicator gate can
+    // refresh. Otherwise wait for WEBSOCKET_EVENT_CONNECTED.
+    if (count > 0 && s_ws && esp_websocket_client_is_connected(s_ws)) {
+        s_mix_list_received = true;
+        notify_subscribers();
+    } else if (count == 0) {
+        // Caller cleared the layout (rare). Hide the gate.
+        s_mix_list_received = false;
+        notify_subscribers();
+    }
     // The actual ch.<offset+i>.cfg.name subscriptions happen in
     // on_connected_subscribe_all so they fire on first connect AND
     // every reconnect. app_main typically calls this before ws_start
@@ -188,6 +209,11 @@ static void ws_set_mix_layout(int offset, int count)
     if (s_ws && esp_websocket_client_is_connected(s_ws)) {
         on_connected_subscribe_all();
     }
+}
+
+static bool ws_is_mix_list_ready(void)
+{
+    return s_mix_list_received;
 }
 
 static const char *ws_get_mix_name(int mix_idx)
@@ -357,6 +383,7 @@ static const ms_client_iface_t s_iface = {
     .get_mix_name       = ws_get_mix_name,
     .is_mix_routed      = ws_is_mix_routed,
     .fetch_mix_routing  = ws_fetch_mix_routing,
+    .is_mix_list_ready  = ws_is_mix_list_ready,
     .resubscribe        = ws_resubscribe,
     .reconnect          = ws_reconnect,
     .set_master_level   = ws_set_master_level,
@@ -957,8 +984,31 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
         ESP_LOGI(TAG, "connected");
         APP_LOGD_I("ms_ws", "connected to %s:%u",
                    app_config_ms_host(), (unsigned) app_config_ms_port());
+        // P5: if the boot path skipped /console/information (MS unreachable
+        // at app_main time), the mix layout is empty and the indicator
+        // would stay hidden forever. Re-fetch here so the FIRST WS connect
+        // — including the one after a config-change reboot when the host
+        // came up just slightly later than the device — populates the
+        // layout before we touch the visibility gate. Cheap (~50 ms) and
+        // idempotent on subsequent reconnects.
+        if (s_mix_count == 0) {
+            app_ms_info_t info;
+            if (app_ms_info_fetch(app_config_ms_host(),
+                                  app_config_ms_port(), &info) &&
+                info.mix_count > 0) {
+                ws_set_mix_layout(info.mix_offset, info.mix_count);
+                ESP_LOGI(TAG, "post-connect refetch: mix_count=%d", info.mix_count);
+            }
+        }
+        // Layout-known case: flip the received flag now (set_state already
+        // notified for the connect transition; this fires the second
+        // notify so the UI sees BOTH bits set in one apply sweep).
+        if (s_mix_count > 0 && !s_mix_list_received) {
+            s_mix_list_received = true;
+        }
         set_state(APP_MS_STATE_CONNECTED);
         on_connected_subscribe_all();
+        notify_subscribers();
         break;
     }
 
@@ -974,6 +1024,11 @@ static void on_ws_event(void *arg, esp_event_base_t base, int32_t id, void *data
     case WEBSOCKET_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "disconnected");
         APP_LOGD_W("ms_ws", "disconnected");
+        // P5: clear the mix-list-received flag so the UI's apply-sweep
+        // hides the indicator until the next CONNECTED event re-establishes
+        // it. Without this, a wedged-then-recreated WS could leave the
+        // button visible while the underlying subscriptions were torn down.
+        s_mix_list_received = false;
         set_state(APP_MS_STATE_DISCONNECTED);
         break;
 

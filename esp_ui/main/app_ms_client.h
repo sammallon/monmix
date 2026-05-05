@@ -59,6 +59,13 @@ typedef struct {
     // afterwards.
     void (*fetch_mix_routing)(void);
 
+    // P5: true once the mix-bus layout is known (count > 0) AND we have an
+    // active WS connection. Cleared on WEBSOCKET_EVENT_DISCONNECTED so the
+    // UI can fall back to "loading" until the next connect re-establishes
+    // the list. The mix-indicator visibility uses this as one half of its
+    // gate (the other being get_state() == CONNECTED).
+    bool (*is_mix_list_ready)(void);
+
     // Re-subscribe every tracked channel under the current mix bus. Used
     // by the discovery flow after reseeding app_state. No-op when the WS
     // isn't connected.
