@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "esp_check.h"
@@ -14,6 +15,7 @@
 #include "esp_ldo_regulator.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
+#include "esp_system.h"
 
 // Pin map and panel timings for the CrowPanel Advanced 10.1" (Elecrow SKU
 // DHE04310D). Values cross-checked against
@@ -59,6 +61,24 @@
 static const char *TAG = "app_display";
 
 static esp_ldo_channel_handle_t s_phy_pwr_chan;
+
+// Reboot kills the DSI clock immediately, but the EK79007 keeps the
+// backlight rail driven for the brief window before the bootloader
+// reconfigures it. With no DSI signal the panel falls back to its
+// "no input" test pattern -- a bright pale-blue band -- and the user
+// sees that flash on every reboot. esp_register_shutdown_handler runs
+// synchronously on esp_restart() AND on panic, so we use it to drive
+// the backlight pin LOW before the controller loses signal.
+//
+// ledc_stop with idle-level 0 pins the GPIO low and stops the PWM. The
+// pin stays low through bootloader (until init_backlight reconfigures
+// it on the next app boot, where it starts at 0% per W6.4 above).
+static void on_app_shutdown(void)
+{
+    ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    gpio_set_direction(LCD_BL_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LCD_BL_GPIO, 0);
+}
 
 static esp_err_t init_backlight(void)
 {
@@ -202,6 +222,10 @@ bool app_display_init(void)
         ESP_LOGE(TAG, "backlight init failed");
         return false;
     }
+    // Kill the backlight on esp_restart / panic so the user doesn't see the
+    // panel's no-DSI-signal test pattern (bright blue) during the reboot
+    // window. See on_app_shutdown.
+    esp_register_shutdown_handler(on_app_shutdown);
 
     ESP_LOGI(TAG, "init: i2c bus");
     i2c_master_bus_handle_t i2c_bus = NULL;
