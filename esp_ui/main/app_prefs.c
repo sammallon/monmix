@@ -57,9 +57,11 @@ static const char *TAG = "app_prefs";
 #define NVS_K_TZ_MT          "tz_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
 
-// Default POSIX TZ -- US Pacific. User overrides via the settings overlay.
+// Default IANA timezone name -- the dropdown in settings is populated from
+// app_time.c's table, which translates IANA->POSIX at apply time. Backward-
+// compat: a stored POSIX string still works (passes through tzset).
 #define DEFAULT_NTP_SERVER  "pool.ntp.org"
-#define DEFAULT_DISPLAY_TZ  "PST8PDT,M3.2.0,M11.1.0"
+#define DEFAULT_DISPLAY_TZ  "America/Los_Angeles"
 
 // Backlight floor — a 0% mis-tap renders the panel unreadable with no
 // non-touch recovery path. 5% is dim but legible in a darkened venue.

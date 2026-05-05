@@ -3,6 +3,7 @@
 #include "app_logd.h"
 #include "app_prefs.h"
 #include "app_state.h"
+#include "app_time.h"
 #include "app_wifi.h"
 
 #include <stdio.h>
@@ -156,8 +157,7 @@ static lv_obj_t *s_theme_buttons[2]; // dark / light
 static lv_obj_t *s_rot_buttons[2];   // 0 deg / 180 deg
 static lv_obj_t *s_bright_slider;
 static lv_obj_t *s_bright_value_label;
-static lv_obj_t *s_tz_ta;
-static lv_obj_t *s_tz_keyboard;
+static lv_obj_t *s_tz_dropdown;
 
 // Auto-revert dialog state. After a rotation change the user has 10 s to
 // confirm (Keep) or revert (Cancel); ignoring the dialog reverts. Without
@@ -1733,35 +1733,16 @@ static void on_bright_released(lv_event_t *e)
     app_prefs_set_brightness_pct((uint8_t) v);
 }
 
-// TZ textarea -- freeform POSIX TZ. Persist on defocus (= keyboard close)
-// and re-apply via setenv+tzset so the status-bar clock picks it up live.
-static void on_tz_focused(lv_event_t *e)
+// TZ dropdown -- pick from the IANA name list curated in app_time.c. Stored
+// pref is the IANA name; app_time_apply_tz translates to POSIX at apply time.
+static void on_tz_dropdown_changed(lv_event_t *e)
 {
     (void) e;
-    if (s_tz_keyboard) {
-        lv_keyboard_set_textarea(s_tz_keyboard, s_tz_ta);
-        lv_keyboard_set_mode(s_tz_keyboard, LV_KEYBOARD_MODE_TEXT_UPPER);
-        lv_obj_remove_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-static void on_tz_changed(lv_event_t *e)
-{
-    (void) e;
-    if (!s_tz_ta) return;
-    const char *txt = lv_textarea_get_text(s_tz_ta);
-    app_prefs_set_display_tz(txt);
-    setenv("TZ", txt, 1);
-    tzset();
-}
-
-static void on_tz_kb_event(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        if (s_tz_keyboard) lv_obj_add_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
-        on_tz_changed(NULL);
-    }
+    if (!s_tz_dropdown) return;
+    char buf[APP_PREFS_STR_MAX];
+    lv_dropdown_get_selected_str(s_tz_dropdown, buf, sizeof(buf));
+    app_prefs_set_display_tz(buf);
+    app_time_apply_tz();
 }
 
 // Tap a swatch → open the color-picker popup for that channel. The popup
@@ -1935,25 +1916,33 @@ static void build_settings_overlay(void)
     lv_label_set_text(s_bright_value_label, "");
     lv_obj_align(s_bright_value_label, LV_ALIGN_TOP_LEFT, 800, 176);
 
-    // Section: Time Zone -- POSIX TZ string (e.g. PST8PDT,M3.2.0,M11.1.0).
-    // Freeform textarea; no validation. Logs format from monotonic uptime so
-    // they stay TZ-independent regardless of this setting.
+    // Section: Time Zone -- IANA name dropdown. List comes from app_time.c's
+    // curated table; selection persists as the IANA name and translates to
+    // POSIX at apply time. Logs format from monotonic uptime so they stay
+    // TZ-independent regardless of this setting.
     lv_obj_t *tz_label = lv_label_create(ov);
     lv_label_set_text(tz_label, "Time Zone");
     lv_obj_align(tz_label, LV_ALIGN_TOP_LEFT, 0, 224);
-    s_tz_ta = lv_textarea_create(ov);
-    lv_obj_set_size(s_tz_ta, 600, 36);
-    lv_obj_align(s_tz_ta, LV_ALIGN_TOP_LEFT, 180, 220);
-    lv_textarea_set_one_line(s_tz_ta, true);
-    lv_textarea_set_max_length(s_tz_ta, APP_PREFS_STR_MAX - 1);
-    lv_obj_add_event_cb(s_tz_ta, on_tz_focused, LV_EVENT_FOCUSED, NULL);
-    lv_obj_add_event_cb(s_tz_ta, on_tz_changed, LV_EVENT_DEFOCUSED, NULL);
-    s_tz_keyboard = lv_keyboard_create(ov);
-    lv_obj_set_size(s_tz_keyboard, SCREEN_W - 32, SCREEN_H / 2);
-    lv_obj_align(s_tz_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_keyboard_set_textarea(s_tz_keyboard, s_tz_ta);
-    lv_obj_add_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(s_tz_keyboard, on_tz_kb_event, LV_EVENT_ALL, NULL);
+    s_tz_dropdown = lv_dropdown_create(ov);
+    lv_obj_set_size(s_tz_dropdown, 360, 36);
+    lv_obj_align(s_tz_dropdown, LV_ALIGN_TOP_LEFT, 180, 220);
+    {
+        // Build the option string -- LVGL takes a single \n-separated buffer.
+        // Sized for ~30 zones * ~28 chars = ~900 bytes. Stack-local; LVGL
+        // copies internally.
+        char opts[1024];
+        size_t off = 0;
+        for (size_t i = 0; i < app_time_zone_count(); ++i) {
+            const char *name = app_time_zone_iana(i);
+            int n = snprintf(opts + off, sizeof(opts) - off,
+                             "%s%s", i == 0 ? "" : "\n", name ? name : "");
+            if (n < 0 || (size_t) n >= sizeof(opts) - off) break;
+            off += (size_t) n;
+        }
+        lv_dropdown_set_options(s_tz_dropdown, opts);
+    }
+    lv_obj_add_event_cb(s_tz_dropdown, on_tz_dropdown_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
 
     // Section: Channels — 3 columns × N rows in a scrollable container so
     // the same layout works at 12 channels (default) and at the Si Expression
@@ -2078,10 +2067,32 @@ static void settings_refresh_state(void)
         }
     }
 
-    if (s_tz_ta) {
+    if (s_tz_dropdown) {
         char tz[APP_PREFS_STR_MAX];
         app_prefs_get_display_tz(tz, sizeof(tz));
-        lv_textarea_set_text(s_tz_ta, tz);
+        // Map the saved IANA name to a dropdown index. If the saved value
+        // isn't in the list (legacy POSIX string from a prior version, or an
+        // entry that's been removed), default to America/Los_Angeles.
+        uint16_t found = 0;
+        bool matched = false;
+        for (size_t i = 0; i < app_time_zone_count(); ++i) {
+            const char *iana = app_time_zone_iana(i);
+            if (iana && strcmp(iana, tz) == 0) {
+                found = (uint16_t) i;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            for (size_t i = 0; i < app_time_zone_count(); ++i) {
+                const char *iana = app_time_zone_iana(i);
+                if (iana && strcmp(iana, "America/Los_Angeles") == 0) {
+                    found = (uint16_t) i;
+                    break;
+                }
+            }
+        }
+        lv_dropdown_set_selected(s_tz_dropdown, found);
     }
 
     // Refresh row names from app_state — they may have changed via MS
