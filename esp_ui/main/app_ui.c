@@ -4266,22 +4266,28 @@ static void start_clock_once(void)
         // App_time_init handles plain init; nothing to do.
     } else {
         bool use_dhcp = app_prefs_get_ntp_use_dhcp();
-        // Tried moving back to esp_netif_sntp_init with the same static
-        // buffer -- still didn't sync (poll timer never fires on this BSP).
-        // The bare lwIP path syncs in ~5 s reliably, so we stay on it.
-        esp_sntp_stop();
-        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-        esp_sntp_setservername(0, s_ntp_server_static);
+        esp_netif_sntp_deinit();   // safe if never initialised
         if (use_dhcp) {
-            // Slot 1 = manual fallback. If DHCP option-42 arrives, lwIP
-            // overwrites slot 0; otherwise slot 1 stays as the manual
-            // server and the clock still syncs.
-            esp_sntp_setservername(1, s_ntp_server_static);
-            esp_sntp_servermode_dhcp(true);
+            // 2 slots, both pre-filled with the manual server. With
+            // server_from_dhcp=true and index_of_first_server=1, lwIP
+            // overwrites slot 0 when DHCP option-42 arrives. If the
+            // network never provides one, slot 0 keeps its initial
+            // value and the SNTP poll still has live targets, so the
+            // clock syncs from the manual server.
+            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+                2, ESP_SNTP_SERVER_LIST(s_ntp_server_static,
+                                        s_ntp_server_static));
+            cfg.server_from_dhcp           = true;
+            cfg.renew_servers_after_new_IP = true;
+            cfg.index_of_first_server      = 1;
+            cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
+            esp_netif_sntp_init(&cfg);
         } else {
-            esp_sntp_servermode_dhcp(false);
+            // Manual-only -- single-server config, no DHCP integration.
+            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(
+                s_ntp_server_static);
+            esp_netif_sntp_init(&cfg);
         }
-        esp_sntp_init();
         ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d",
                  s_ntp_server_static, use_dhcp);
     }
