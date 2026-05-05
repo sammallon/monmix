@@ -2897,12 +2897,46 @@ static void on_wcfg_save_yes(lv_event_t *e)
         app_prefs_set_ntp_use_dhcp(lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED));
     }
 
-    // Reboot path -- the safe fallback. The live path below tries first;
-    // the user explicitly accepted "may reboot" via the confirm dialog.
-    lv_label_set_text(s_wcfg_status_label, "#40C060 Saved. Rebooting...#");
+    // P7b: try the live reconfigure first (no reboot). app_wifi_reconfigure
+    // does esp_wifi_disconnect -> esp_wifi_set_config -> esp_wifi_connect
+    // (the known-working sequence per reference_c6_wedge_workaround), and
+    // app_wifi_apply_ip_config pushes the DHCP/static choice to the netif.
+    // If the live dispatch fails outright, fall back to esp_restart -- the
+    // user already accepted "may reboot" by tapping the confirm dialog.
+    lv_label_set_text(s_wcfg_status_label, "#40C060 Saved. Reconfiguring WiFi...#");
     lv_refr_now(NULL);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    app_wifi_apply_ip_config();
+    if (!app_wifi_reconfigure()) {
+        lv_label_set_text(s_wcfg_status_label,
+                          "#FF6060 Live reconfig failed. Rebooting...#");
+        lv_refr_now(NULL);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+        return;   // unreached
+    }
+    // Live path dispatched. Close the overlay so the user can see the
+    // wifi-icon and clock recover; the WS reconnect watchdog handles the
+    // MS client when the IP comes back. NTP server / DHCP-NTP changes need
+    // a re-init of SNTP though -- the existing path runs once-per-boot, so
+    // those particular changes still want a reboot until we wire SNTP-on-
+    // pref-change. For now, always reboot when ntp_server / ntp_use_dhcp
+    // changed.
+    bool ntp_changed = strcmp(s_wcfg_orig_ntp,
+                              lv_textarea_get_text(s_wcfg_ntp_ta)) != 0;
+    if (s_wcfg_ntp_dhcp_cb) {
+        bool now_use_dhcp = lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
+        if (now_use_dhcp != s_wcfg_orig_ntp_use_dhcp) ntp_changed = true;
+    }
+    if (ntp_changed) {
+        lv_label_set_text(s_wcfg_status_label,
+                          "#40C060 Saved. Rebooting (NTP changed)...#");
+        lv_refr_now(NULL);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(600));
+    if (s_wcfg_overlay) lv_obj_add_flag(s_wcfg_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_wcfg_save_confirm(void)
