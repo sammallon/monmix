@@ -27,10 +27,11 @@ void app_ui_set_mix_count(int count);
 void app_ui_set_channel_total(int count);
 
 // User-facing maximum number of channels that can be tracked at once.
-// Currently 16 (per #33: typical monitor mix size + LVGL build-time bound
-// at boot). Storage cap APP_CONFIG_MAX_CHANNELS is higher; this is the
-// editable-UI cap.
-#define APP_UI_MAX_TRACKED_CHANNELS 16
+// 22 = 2 pages * 11 input strips per page (the master strip is pinned
+// outside the tileview and counts separately, so 11 inputs + master =
+// 12 visible at once). Storage cap APP_CONFIG_MAX_CHANNELS is higher;
+// this is the editable-UI cap.
+#define APP_UI_MAX_TRACKED_CHANNELS 22
 
 // Maximum number of channel rows the picker can render. The picker shows
 // every channel id reported by the connected console (any type), so this

@@ -46,7 +46,13 @@ static lv_obj_t *s_splash_logo_img;
 //   the default 12-channel config sits on a single page so a musician sees
 //   their full mix at a glance. Reconfiguring to >12 channels overflows
 //   into a 2nd page and the indicator dots show up automatically.
-#define FADERS_PER_PAGE     12
+// 11 input strips per page + the master strip pinned outside the tileview =
+// 12 total strips visible at once. The picker cap (22) is 2 pages worth so
+// both pages can be filled.
+//
+// (Earlier 16-per-page trial fit but 2-character channel names wrapped to
+// two lines and read poorly during a show.)
+#define FADERS_PER_PAGE     11
 #define MAX_PAGES           ((APP_CONFIG_MAX_CHANNELS + FADERS_PER_PAGE - 1) / FADERS_PER_PAGE)
 
 #define SCREEN_W            1024
@@ -57,11 +63,10 @@ static lv_obj_t *s_splash_logo_img;
 #define TILEVIEW_H          (SCREEN_H - STATUS_H - INDICATOR_H)
 // Master strip — pinned to the right edge outside the tileview so the mix-
 // bus output is always reachable regardless of which input page is showing.
-// Width matches the input slots; tileview shrinks by exactly this amount
-// so the 12-input layout still fits on a single page (12 * 78 = 936).
 #define MASTER_STRIP_W      88
 #define TILEVIEW_W          (SCREEN_W - MASTER_STRIP_W)
-#define FADER_BOX_W         72
+// 11 slots in 936 px = 85 px each; box width 78 leaves a 7 px gap.
+#define FADER_BOX_W         78
 #define FADER_BOX_H         500
 #define FADER_BOX_PAD       8
 #define SLIDER_W            28
