@@ -188,15 +188,20 @@ static esp_err_t init_panel(esp_lcd_panel_io_handle_t *io_out,
     // Note: EK79007's init sequence already enables display output; the
     // explicit disp_on_off command isn't supported (returns ESP_ERR_NOT_SUPPORTED).
 
-    // Enable DMA2D for the DPI panel (cache-coherent fast path on P4).
-    // IDF v5 had use_dma2d as a flag in dpi_config; IDF v6 dropped that
-    // field and made it an explicit post-init opt-in. Without DMA2D every
-    // flush goes through CPU memcpy + esp_cache_msync, which the user
-    // observes as choppy on-screen updates -- enabling this is what makes
-    // the panel "look beautiful and smooth". Elecrow's factory firmware
-    // sets use_dma2d=true in the legacy IDF v5 form; this is the
-    // equivalent on v6.
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_enable_dma2d(panel), TAG, "dma2d enable");
+    // DMA2D is NOT enabled here. esp_lcd_dpi_panel_enable_dma2d(panel)
+    // visibly improves smoothness (cache-coherent fast path on P4 vs CPU
+    // memcpy + esp_cache_msync), but the IDF dpi_panel hook
+    // (esp_lcd_panel_dpi.c:467 dpi_panel_draw_bitmap_dma2d_hook) takes
+    // its draw_sem with timeout=0 and returns ESP_ERR_INVALID_STATE if the
+    // previous DMA2D copy is still in flight. esp_lvgl_port's
+    // flush_callback ignores that error, so flushes silently get dropped
+    // when LVGL queues them faster than DMA2D can drain -- which happens
+    // during fast touch-driven fader drags (each value-change event fires
+    // a flush). LVGL waits for an on_color_trans_done that never fires for
+    // the dropped flush, and the LVGL task wedges. WS broadcasts don't
+    // trigger this because apply_pending coalesces them. Re-enable when
+    // either esp_lvgl_port handles the busy return or the hook gets a
+    // blocking-with-timeout option.
 
     // Note on rotation: esp_lcd_panel_mirror is empirically a no-op on this
     // CrowPanel SKU. Verified 2026-05-05: every MADCTL value (0x00, 0x01,
