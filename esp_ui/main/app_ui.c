@@ -148,6 +148,7 @@ static const ms_client_iface_t *s_ms;
 // Settings overlay — declared up here so the gear button's event handler
 // can reach it. Overlay is created lazily on first open.
 static lv_obj_t *s_settings_overlay;
+static lv_obj_t *s_gear_label;  // gear icon — text color flipped on theme change
 EXT_RAM_BSS_ATTR static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
 EXT_RAM_BSS_ATTR static lv_obj_t *s_row_name_labels[APP_CONFIG_MAX_CHANNELS];
 static lv_obj_t *s_lvl_norm_btn;
@@ -760,6 +761,14 @@ static void on_prefs_change(void *ctx)
 {
     (void)ctx;
     app_display_apply_theme(app_prefs_get_theme());
+    // Top-bar icons that aren't styled by the theme: the gear label is on a
+    // transparent/borderless button so theme button-text rules don't apply.
+    // Drive its colour explicitly so it contrasts against the theme bg.
+    if (s_gear_label) {
+        bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
+        lv_obj_set_style_text_color(s_gear_label,
+                                    dark ? lv_color_white() : lv_color_black(), 0);
+    }
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
     s_master_dirty = true;
@@ -1336,9 +1345,14 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_set_style_radius(gear, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(gear, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(gear, 0, 0);
-    lv_obj_t *gear_label = lv_label_create(gear);
-    lv_label_set_text(gear_label, LV_SYMBOL_SETTINGS);
-    lv_obj_center(gear_label);
+    s_gear_label = lv_label_create(gear);
+    lv_label_set_text(s_gear_label, LV_SYMBOL_SETTINGS);
+    lv_obj_center(s_gear_label);
+    {
+        bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
+        lv_obj_set_style_text_color(s_gear_label,
+                                    dark ? lv_color_white() : lv_color_black(), 0);
+    }
     lv_obj_add_event_cb(gear, on_gear_clicked, LV_EVENT_CLICKED, NULL);
 
     // WiFi status icon — left of gear. Color reflects connection state and
@@ -4172,10 +4186,20 @@ static void clock_tick(lv_timer_t *t)
     lv_label_set_text(s_status_label, p);
 }
 
+static void on_sntp_synced(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "sntp synced: epoch=%lld", (long long) tv->tv_sec);
+}
+
 static void start_clock_once(void)
 {
     if (s_sntp_started) return;
     s_sntp_started = true;
+
+    // Visibility: a stuck "--:-- --" status-bar clock = SNTP never synced.
+    // This callback fires once per successful sync (initial sync + later
+    // re-syncs). The log line correlates against the user-visible clock.
+    sntp_set_time_sync_notification_cb(on_sntp_synced);
 
     // TZ + SNTP server come from prefs (set in main via app_time_apply_tz +
     // app_time_init). When ntp_use_dhcp is true (default), DHCP option 42
@@ -4189,13 +4213,30 @@ static void start_clock_once(void)
     } else {
         bool use_dhcp = app_prefs_get_ntp_use_dhcp();
         esp_netif_sntp_deinit();   // drop any prior init from app_time_init
-        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
-            2, ESP_SNTP_SERVER_LIST(user_ntp, user_ntp));
-        cfg.server_from_dhcp           = use_dhcp;
-        cfg.renew_servers_after_new_IP = use_dhcp;
-        cfg.index_of_first_server      = use_dhcp ? 1 : 0;
-        cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
-        esp_netif_sntp_init(&cfg);
+        if (use_dhcp) {
+            // 2 slots, both pre-filled with user_ntp. With server_from_dhcp =
+            // true and index_of_first_server = 1, the DHCP option-42 server
+            // overwrites slot 0 when received. If no DHCP option-42 ever
+            // arrives, slot 0 keeps its initial user_ntp value and the SNTP
+            // poll loop still has live targets to query -- so the clock
+            // syncs from the manual server even on networks without
+            // option-42 support.
+            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+                2, ESP_SNTP_SERVER_LIST(user_ntp, user_ntp));
+            cfg.server_from_dhcp           = true;
+            cfg.renew_servers_after_new_IP = true;
+            cfg.index_of_first_server      = 1;
+            cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
+            esp_netif_sntp_init(&cfg);
+        } else {
+            // No DHCP integration. Single-server config kicks SNTP
+            // immediately on init; the renew hooks above made the service
+            // wait for a DHCP option-42 that never arrived, so the clock
+            // never synced.
+            esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(user_ntp);
+            esp_netif_sntp_init(&cfg);
+        }
+        ESP_LOGI(TAG, "sntp: server='%s' use_dhcp=%d", user_ntp, use_dhcp);
     }
 
     if (!s_clock_timer) {

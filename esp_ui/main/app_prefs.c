@@ -62,7 +62,7 @@ static const char *TAG = "app_prefs";
 // Default IANA timezone name -- the dropdown in settings is populated from
 // app_time.c's table, which translates IANA->POSIX at apply time. Backward-
 // compat: a stored POSIX string still works (passes through tzset).
-#define DEFAULT_NTP_SERVER  "pool.ntp.org"
+#define DEFAULT_NTP_SERVER  "time.google.com"
 #define DEFAULT_DISPLAY_TZ  "America/Los_Angeles"
 
 // Backlight floor — a 0% mis-tap renders the panel unreadable with no
