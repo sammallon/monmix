@@ -802,21 +802,43 @@ static void on_master_state_change(void *ctx)
 // single sweep — same plumbing as the per-channel state changes. Theme is
 // re-applied here too; lv_theme_default_init is idempotent for an unchanged
 // theme so we don't need to track the old value.
-static void on_prefs_change(void *ctx)
+//
+// Theme apply is heavy: lv_theme_default_init walks the widget tree
+// reassigning styles, which then cascades into invalidations across every
+// child. From the LVGL task that's fine (it's already where the work
+// belongs), but from the console REPL or any other non-LVGL task, doing
+// it synchronously holds lvgl_port_lock for 100s of ms while CPU-bound
+// on the caller's core -- IDLE on that core starves and task_wdt fires
+// (caught in soak under console-driven `level-format` toggles). Defer
+// via lv_async_call so the work lands on the LVGL task regardless of
+// where the pref-change observer fires.
+static void apply_theme_async(void *unused)
 {
-    (void)ctx;
+    (void)unused;
     app_display_apply_theme(app_prefs_get_theme());
-    // Top-bar icons that aren't styled by the theme: the gear label is on a
-    // transparent/borderless button so theme button-text rules don't apply.
-    // Drive its colour explicitly so it contrasts against the theme bg.
     if (s_gear_label) {
         bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
         lv_obj_set_style_text_color(s_gear_label,
                                     dark ? lv_color_white() : lv_color_black(), 0);
     }
+}
+
+static void on_prefs_change(void *ctx)
+{
+    (void)ctx;
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) s_dirty[i] = true;
     s_master_dirty = true;
+
+    // Defer theme repaint -- it walks the widget tree assigning styles
+    // and cascades into invalidations everywhere, which is heavy enough
+    // (>5s on a busy core) to starve IDLE if it runs synchronously on
+    // a non-LVGL caller. Queueing on the LVGL task keeps the caller's
+    // core free to yield.
+    if (lvgl_port_lock(100)) {
+        lv_async_call(apply_theme_async, NULL);
+        lvgl_port_unlock();
+    }
 
     // #30: chase the signal indicator pref. Subscribe meter feed only when
     // the user opts in; unsubscribe when they switch back. Idempotent on
