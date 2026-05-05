@@ -3,10 +3,14 @@ dependencies:
     version: ">=6.0.1"
 
   # LVGL + Espressif port (handles display flush, touch input, PPA acceleration).
-  # LVGL pinned directly so we get the latest 9.x line; esp_lvgl_port's
-  # constraint is "8 <= x < 10" so any 9.x works under it.
+  # LVGL is pinned directly because esp_lvgl_port's constraint is
+  # "8 <= x < 10" -- without an explicit pin the manager picks the latest
+  # 9.x available. Currently held at ~9.4.0: 9.5.0 was tried 2026-05-05 and
+  # introduced a hard LVGL-task deadlock reproducible by closing the
+  # settings overlay and immediately touching a fader. Revisit when 9.6
+  # ships or when an LVGL 9.5 patch addresses it.
   lvgl/lvgl:
-    version: "~9.5.0"
+    version: "~9.4.0"
   espressif/esp_lvgl_port:
     version: "^2.0.0"
 
