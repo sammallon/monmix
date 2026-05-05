@@ -156,6 +156,8 @@ static lv_obj_t *s_theme_buttons[2]; // dark / light
 static lv_obj_t *s_rot_buttons[2];   // 0 deg / 180 deg
 static lv_obj_t *s_bright_slider;
 static lv_obj_t *s_bright_value_label;
+static lv_obj_t *s_tz_ta;
+static lv_obj_t *s_tz_keyboard;
 
 // Auto-revert dialog state. After a rotation change the user has 10 s to
 // confirm (Keep) or revert (Cancel); ignoring the dialog reverts. Without
@@ -240,12 +242,14 @@ static lv_obj_t *s_wcfg_ip_ta;
 static lv_obj_t *s_wcfg_nm_ta;
 static lv_obj_t *s_wcfg_gw_ta;
 static lv_obj_t *s_wcfg_dns_ta;
+static lv_obj_t *s_wcfg_ntp_ta;
 static bool     s_wcfg_use_static;       // working state of the radio
 static bool     s_wcfg_orig_use_static;
 static char     s_wcfg_orig_ip [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_nm [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_gw [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_dns[APP_PREFS_IP_STR_MAX];
+static char     s_wcfg_orig_ntp[APP_PREFS_STR_MAX];
 
 // MS connection settings panel (entry: MS icon). Save = ws_reconnect()
 // (live), no reboot -- just kicks the WS client to use the new host:port.
@@ -1729,6 +1733,37 @@ static void on_bright_released(lv_event_t *e)
     app_prefs_set_brightness_pct((uint8_t) v);
 }
 
+// TZ textarea -- freeform POSIX TZ. Persist on defocus (= keyboard close)
+// and re-apply via setenv+tzset so the status-bar clock picks it up live.
+static void on_tz_focused(lv_event_t *e)
+{
+    (void) e;
+    if (s_tz_keyboard) {
+        lv_keyboard_set_textarea(s_tz_keyboard, s_tz_ta);
+        lv_keyboard_set_mode(s_tz_keyboard, LV_KEYBOARD_MODE_TEXT_UPPER);
+        lv_obj_remove_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void on_tz_changed(lv_event_t *e)
+{
+    (void) e;
+    if (!s_tz_ta) return;
+    const char *txt = lv_textarea_get_text(s_tz_ta);
+    app_prefs_set_display_tz(txt);
+    setenv("TZ", txt, 1);
+    tzset();
+}
+
+static void on_tz_kb_event(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (s_tz_keyboard) lv_obj_add_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
+        on_tz_changed(NULL);
+    }
+}
+
 // Tap a swatch → open the color-picker popup for that channel. The popup
 // applies the choice via app_prefs (which fires the dirty sweep, recolouring
 // the slider in real time) and refreshes the swatch visual on close.
@@ -1900,13 +1935,33 @@ static void build_settings_overlay(void)
     lv_label_set_text(s_bright_value_label, "");
     lv_obj_align(s_bright_value_label, LV_ALIGN_TOP_LEFT, 800, 176);
 
+    // Section: Time Zone -- POSIX TZ string (e.g. PST8PDT,M3.2.0,M11.1.0).
+    // Freeform textarea; no validation. Logs format from monotonic uptime so
+    // they stay TZ-independent regardless of this setting.
+    lv_obj_t *tz_label = lv_label_create(ov);
+    lv_label_set_text(tz_label, "Time Zone");
+    lv_obj_align(tz_label, LV_ALIGN_TOP_LEFT, 0, 224);
+    s_tz_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_tz_ta, 600, 36);
+    lv_obj_align(s_tz_ta, LV_ALIGN_TOP_LEFT, 180, 220);
+    lv_textarea_set_one_line(s_tz_ta, true);
+    lv_textarea_set_max_length(s_tz_ta, APP_PREFS_STR_MAX - 1);
+    lv_obj_add_event_cb(s_tz_ta, on_tz_focused, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(s_tz_ta, on_tz_changed, LV_EVENT_DEFOCUSED, NULL);
+    s_tz_keyboard = lv_keyboard_create(ov);
+    lv_obj_set_size(s_tz_keyboard, SCREEN_W - 32, SCREEN_H / 2);
+    lv_obj_align(s_tz_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(s_tz_keyboard, s_tz_ta);
+    lv_obj_add_flag(s_tz_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_tz_keyboard, on_tz_kb_event, LV_EVENT_ALL, NULL);
+
     // Section: Channels — 3 columns × N rows in a scrollable container so
     // the same layout works at 12 channels (default) and at the Si Expression
     // 2's full 60-channel count. Row is just [name] + [swatch] for now;
     // selection checkbox will be added with the channel-selection feature.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
-    lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 224);
+    lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 272);
 
     // Edit-channels entry — opens the picker overlay (#33). Button sits to
     // the right of the section label so it doesn't push the existing list
@@ -1917,7 +1972,7 @@ static void build_settings_overlay(void)
     // empty and tapping it would be confusing.
     s_edit_channels_btn = lv_button_create(ov);
     lv_obj_set_size(s_edit_channels_btn, 180, 36);
-    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 216);
+    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 264);
     lv_obj_t *edit_lbl = lv_label_create(s_edit_channels_btn);
     lv_label_set_text(edit_lbl, LV_SYMBOL_LIST " Edit Channels...");
     lv_obj_center(edit_lbl);
@@ -1928,8 +1983,8 @@ static void build_settings_overlay(void)
     }
 
     lv_obj_t *list = lv_obj_create(ov);
-    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 268);
-    lv_obj_set_pos(list, 0, 248);
+    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 316);
+    lv_obj_set_pos(list, 0, 296);
     lv_obj_set_style_pad_all(list, 6, 0);
     lv_obj_set_style_pad_row(list, 4, 0);
 
@@ -2021,6 +2076,12 @@ static void settings_refresh_state(void)
             snprintf(buf, sizeof(buf), "%u%%", (unsigned) pct);
             lv_label_set_text(s_bright_value_label, buf);
         }
+    }
+
+    if (s_tz_ta) {
+        char tz[APP_PREFS_STR_MAX];
+        app_prefs_get_display_tz(tz, sizeof(tz));
+        lv_textarea_set_text(s_tz_ta, tz);
     }
 
     // Refresh row names from app_state — they may have changed via MS
@@ -2592,6 +2653,7 @@ static bool wcfg_has_unsaved_changes(void)
     if (s_wcfg_nm_ta && strcmp(lv_textarea_get_text(s_wcfg_nm_ta),  s_wcfg_orig_nm)  != 0) return true;
     if (s_wcfg_gw_ta && strcmp(lv_textarea_get_text(s_wcfg_gw_ta),  s_wcfg_orig_gw)  != 0) return true;
     if (s_wcfg_dns_ta && strcmp(lv_textarea_get_text(s_wcfg_dns_ta), s_wcfg_orig_dns) != 0) return true;
+    if (s_wcfg_ntp_ta && strcmp(lv_textarea_get_text(s_wcfg_ntp_ta), s_wcfg_orig_ntp) != 0) return true;
     return false;
 }
 
@@ -2767,6 +2829,9 @@ static void on_wcfg_save_yes(lv_event_t *e)
         app_prefs_set_wifi_static_netmask(lv_textarea_get_text(s_wcfg_nm_ta));
         app_prefs_set_wifi_static_gateway(lv_textarea_get_text(s_wcfg_gw_ta));
         app_prefs_set_wifi_static_dns    (lv_textarea_get_text(s_wcfg_dns_ta));
+    }
+    if (s_wcfg_ntp_ta) {
+        app_prefs_set_ntp_server(lv_textarea_get_text(s_wcfg_ntp_ta));
     }
 
     // Reboot path -- the safe fallback. The live path below tries first;
@@ -3166,6 +3231,23 @@ static void build_wcfg_overlay(void)
 
     y += row_dy * 2 + 8;
 
+    // NTP server row -- hostname or dotted IPv4. Lives outside the static
+    // group so it's visible regardless of DHCP/Static. Keyboard defaults to
+    // TEXT_LOWER (the focus handler skips the numeric flip when it isn't an
+    // IP-form field), which is right for hostnames; a numeric IP server
+    // string is also typeable that way.
+    lv_obj_t *ntp_lbl = lv_label_create(ov);
+    lv_label_set_text(ntp_lbl, "NTP");
+    lv_obj_align(ntp_lbl, LV_ALIGN_TOP_LEFT, 0, y + 4);
+    s_wcfg_ntp_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_wcfg_ntp_ta, form_w - 80, field_h);
+    lv_obj_align(s_wcfg_ntp_ta, LV_ALIGN_TOP_LEFT, 80, y);
+    lv_textarea_set_one_line(s_wcfg_ntp_ta, true);
+    lv_textarea_set_max_length(s_wcfg_ntp_ta, APP_PREFS_STR_MAX - 1);
+    lv_obj_add_event_cb(s_wcfg_ntp_ta, on_wcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+    y += row_dy;
+
     s_wcfg_status_label = lv_label_create(ov);
     lv_label_set_text(s_wcfg_status_label, "");
     lv_label_set_recolor(s_wcfg_status_label, true);
@@ -3203,6 +3285,8 @@ static void wcfg_open(void)
     lv_textarea_set_text(s_wcfg_nm_ta,  s_wcfg_orig_nm);
     lv_textarea_set_text(s_wcfg_gw_ta,  s_wcfg_orig_gw);
     lv_textarea_set_text(s_wcfg_dns_ta, s_wcfg_orig_dns);
+    app_prefs_get_ntp_server(s_wcfg_orig_ntp, sizeof(s_wcfg_orig_ntp));
+    if (s_wcfg_ntp_ta) lv_textarea_set_text(s_wcfg_ntp_ta, s_wcfg_orig_ntp);
     wcfg_apply_static_visibility();
 
     lv_label_set_text(s_wcfg_status_label, "");
@@ -4060,24 +4144,23 @@ static void start_clock_once(void)
     if (s_sntp_started) return;
     s_sntp_started = true;
 
-    // POSIX TZ for America/Los_Angeles with US DST rules. Stored statically
-    // so setenv's reference outlives the call.
-    setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
-    tzset();
-
-    // Two-server SNTP setup: slot 0 is reserved for the DHCP-supplied NTP
-    // server (option 42, gated by CONFIG_LWIP_DHCP_GET_NTP_SRV); slot 1 is
-    // a US-pool static fallback for networks that don't advertise an NTP
-    // server in DHCP. The static slot is also used when a static IP is
-    // configured (no DHCP, no option 42). Renew on every new IP so a lease
-    // change picks up a fresh DHCP-supplied server.
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
-        2, ESP_SNTP_SERVER_LIST("0.us.pool.ntp.org", "0.us.pool.ntp.org"));
-    cfg.server_from_dhcp           = true;
-    cfg.renew_servers_after_new_IP = true;
-    cfg.index_of_first_server      = 1;
-    cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
-    esp_netif_sntp_init(&cfg);
+    // TZ + SNTP server come from prefs (set in main via app_time_apply_tz +
+    // app_time_init). DHCP-supplied NTP (option 42) layered on top: slot 0
+    // is reserved for DHCP, the user's pref is the static fallback in slot 1.
+    char user_ntp[APP_PREFS_STR_MAX];
+    app_prefs_get_ntp_server(user_ntp, sizeof(user_ntp));
+    if (user_ntp[0] == '\0') {
+        // App_time_init handles plain init; nothing to do.
+    } else {
+        esp_netif_sntp_deinit();   // drop any prior init from app_time_init
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+            2, ESP_SNTP_SERVER_LIST(user_ntp, user_ntp));
+        cfg.server_from_dhcp           = true;
+        cfg.renew_servers_after_new_IP = true;
+        cfg.index_of_first_server      = 1;
+        cfg.ip_event_to_renew          = IP_EVENT_STA_GOT_IP;
+        esp_netif_sntp_init(&cfg);
+    }
 
     if (!s_clock_timer) {
         s_clock_timer = lv_timer_create(clock_tick, 1000, NULL);

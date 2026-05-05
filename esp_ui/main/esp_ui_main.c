@@ -12,6 +12,7 @@
 #include "app_config.h"
 #include "app_state.h"
 #include "app_storage.h"
+#include "app_time.h"
 #include "app_touch_inject.h"
 #include "app_ui.h"
 #include "app_wifi.h"
@@ -67,6 +68,10 @@ void app_main(void)
     // Loads /sdcard/monmix-prefs.json or starts at defaults if SD missing.
     app_prefs_init();
 
+    // Apply the persisted display TZ to the C library before any UI clock
+    // formatter runs. SNTP comes up later, after WiFi associates.
+    app_time_apply_tz();
+
     // Display + UI come up next — the screen should light up before we
     // start waiting on WiFi association.
     if (!app_display_init()) {
@@ -98,6 +103,8 @@ void app_main(void)
         ESP_LOGW(TAG, "WiFi unavailable; UI will still render, MS client will retry");
         app_ui_set_status("WiFi unavailable — UI only");
     }
+    // SNTP comes up later from app_ui's on-IP-up path (start_clock_once),
+    // which uses the ntp_server pref via app_prefs_get_ntp_server.
 
     // Channel discovery — done HERE, BEFORE ms->start(), so the fader UI
     // builds exactly once with the final channel list and broadcasts arrive
