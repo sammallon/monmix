@@ -51,7 +51,15 @@ static const char *TAG = "app_prefs";
 #define NVS_K_WIFI_GW_MT     "wifi_gw_mt"
 #define NVS_K_WIFI_DNS       "wifi_dns"
 #define NVS_K_WIFI_DNS_MT    "wifi_dns_mt"
+#define NVS_K_NTP            "ntp"
+#define NVS_K_NTP_MT         "ntp_mt"
+#define NVS_K_TZ             "tz"
+#define NVS_K_TZ_MT          "tz_mt"
 #define NVS_K_MTIME_FLOOR   "mt_floor"
+
+// Default POSIX TZ -- US Pacific. User overrides via the settings overlay.
+#define DEFAULT_NTP_SERVER  "pool.ntp.org"
+#define DEFAULT_DISPLAY_TZ  "PST8PDT,M3.2.0,M11.1.0"
 
 // Backlight floor — a 0% mis-tap renders the panel unreadable with no
 // non-touch recovery path. 5% is dim but legible in a darkened venue.
@@ -80,6 +88,8 @@ typedef enum {
     K_WIFI_NM,
     K_WIFI_GW,
     K_WIFI_DNS,
+    K_NTP_SERVER,
+    K_TZ,
     K_COUNT,
 } prefs_key_t;
 
@@ -100,6 +110,8 @@ typedef struct {
     char                   wifi_nm [APP_PREFS_IP_STR_MAX];
     char                   wifi_gw [APP_PREFS_IP_STR_MAX];
     char                   wifi_dns[APP_PREFS_IP_STR_MAX];
+    char                   ntp_server[APP_PREFS_STR_MAX];
+    char                   display_tz[APP_PREFS_STR_MAX];
 } prefs_bag_t;
 
 static SemaphoreHandle_t s_mutex;
@@ -118,6 +130,8 @@ static char                    s_wifi_ip [APP_PREFS_IP_STR_MAX];
 static char                    s_wifi_nm [APP_PREFS_IP_STR_MAX];
 static char                    s_wifi_gw [APP_PREFS_IP_STR_MAX];
 static char                    s_wifi_dns[APP_PREFS_IP_STR_MAX];
+static char                    s_ntp_server[APP_PREFS_STR_MAX] = DEFAULT_NTP_SERVER;
+static char                    s_display_tz[APP_PREFS_STR_MAX] = DEFAULT_DISPLAY_TZ;
 static uint64_t                s_mtime[K_COUNT];   // mtime of effective value, per key
 static uint64_t                s_mtime_floor;      // monotonic counter base across reboots
 
@@ -202,8 +216,21 @@ static const char *key_name(prefs_key_t k)
         case K_WIFI_NM:    return "wifi_static_netmask";
         case K_WIFI_GW:    return "wifi_static_gateway";
         case K_WIFI_DNS:   return "wifi_static_dns";
+        case K_NTP_SERVER: return "ntp_server";
+        case K_TZ:         return "display_tz";
         default:           return "?";
     }
+}
+
+// Generic bounded string copy. Out is always NUL-terminated.
+static void copy_str_bounded(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t n = strlen(src);
+    if (n >= dst_len) n = dst_len - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
 }
 
 // Copy-with-cap helper for the new string-valued keys. Out is always
@@ -277,6 +304,8 @@ static void nvs_load(prefs_bag_t *bag)
     bag->disp_rot           = APP_DISPLAY_ROTATION_0;
     bag->brightness_pct     = BRIGHTNESS_DEFAULT_PCT;
     bag->selected_mix_index = 0;
+    copy_str_bounded(bag->ntp_server, sizeof(bag->ntp_server), DEFAULT_NTP_SERVER);
+    copy_str_bounded(bag->display_tz, sizeof(bag->display_tz), DEFAULT_DISPLAY_TZ);
 
     nvs_handle_t h;
     if (nvs_open_ro(&h) != ESP_OK) return;
@@ -350,6 +379,18 @@ static void nvs_load(prefs_bag_t *bag)
         }
     }
 
+    struct { const char *k; const char *mk; prefs_key_t pk; char *dst; } big_str_keys[] = {
+        { NVS_K_NTP, NVS_K_NTP_MT, K_NTP_SERVER, bag->ntp_server },
+        { NVS_K_TZ,  NVS_K_TZ_MT,  K_TZ,         bag->display_tz },
+    };
+    for (size_t i = 0; i < sizeof(big_str_keys) / sizeof(big_str_keys[0]); ++i) {
+        size_t need = APP_PREFS_STR_MAX;
+        if (nvs_get_str(h, big_str_keys[i].k, big_str_keys[i].dst, &need) == ESP_OK) {
+            bag->present[big_str_keys[i].pk] = true;
+            nvs_get_u64_opt(h, big_str_keys[i].mk, &bag->mtime[big_str_keys[i].pk]);
+        }
+    }
+
     uint64_t floor = 0;
     if (nvs_get_u64_opt(h, NVS_K_MTIME_FLOOR, &floor) && floor > s_mtime_floor) {
         s_mtime_floor = floor;
@@ -413,6 +454,14 @@ static bool nvs_write_key(prefs_key_t k, const void *value, size_t value_len, ui
             err = nvs_set_str(h, NVS_K_WIFI_DNS, (const char *)value);
             if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_WIFI_DNS_MT, mtime);
             break;
+        case K_NTP_SERVER:
+            err = nvs_set_str(h, NVS_K_NTP, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_NTP_MT, mtime);
+            break;
+        case K_TZ:
+            err = nvs_set_str(h, NVS_K_TZ, (const char *)value);
+            if (err == ESP_OK) err = nvs_set_u64(h, NVS_K_TZ_MT, mtime);
+            break;
         default:
             err = ESP_FAIL;
             break;
@@ -453,6 +502,8 @@ static bool sd_load(prefs_bag_t *bag)
     bag->disp_rot           = APP_DISPLAY_ROTATION_0;
     bag->brightness_pct     = BRIGHTNESS_DEFAULT_PCT;
     bag->selected_mix_index = 0;
+    copy_str_bounded(bag->ntp_server, sizeof(bag->ntp_server), DEFAULT_NTP_SERVER);
+    copy_str_bounded(bag->display_tz, sizeof(bag->display_tz), DEFAULT_DISPLAY_TZ);
 
     if (!app_storage_is_mounted()) return false;
     FILE *f = fopen(PREFS_PATH, "rb");
@@ -554,6 +605,19 @@ static bool sd_load(prefs_bag_t *bag)
         }
     }
 
+    struct { const char *jk; const char *mk; prefs_key_t pk; char *dst; } big_str[] = {
+        { "ntp_server",     "ntp_server_mt",     K_NTP_SERVER, bag->ntp_server },
+        { "display_timezone","display_timezone_mt", K_TZ,        bag->display_tz },
+    };
+    for (size_t i = 0; i < sizeof(big_str) / sizeof(big_str[0]); ++i) {
+        cJSON *j = cJSON_GetObjectItem(root, big_str[i].jk);
+        if (cJSON_IsString(j)) {
+            bag->present[big_str[i].pk] = true;
+            copy_str_bounded(big_str[i].dst, APP_PREFS_STR_MAX, j->valuestring);
+            bag->mtime[big_str[i].pk] = json_get_u64(root, big_str[i].mk);
+        }
+    }
+
     cJSON_Delete(root);
     return true;
 }
@@ -595,6 +659,10 @@ static bool sd_save_locked(void)
     cJSON_AddNumberToObject(root, "wifi_static_gateway_mt",(double) s_mtime[K_WIFI_GW]);
     cJSON_AddStringToObject(root, "wifi_static_dns",       s_wifi_dns);
     cJSON_AddNumberToObject(root, "wifi_static_dns_mt",    (double) s_mtime[K_WIFI_DNS]);
+    cJSON_AddStringToObject(root, "ntp_server",            s_ntp_server);
+    cJSON_AddNumberToObject(root, "ntp_server_mt",         (double) s_mtime[K_NTP_SERVER]);
+    cJSON_AddStringToObject(root, "display_timezone",      s_display_tz);
+    cJSON_AddNumberToObject(root, "display_timezone_mt",   (double) s_mtime[K_TZ]);
 
     char *buf = cJSON_Print(root);
     cJSON_Delete(root);
@@ -667,6 +735,10 @@ static bool prefs_write_nvs_locked(prefs_key_t k)
             return nvs_write_key(k, s_wifi_gw,  strlen(s_wifi_gw)  + 1, s_mtime[k], s_mtime_floor);
         case K_WIFI_DNS:
             return nvs_write_key(k, s_wifi_dns, strlen(s_wifi_dns) + 1, s_mtime[k], s_mtime_floor);
+        case K_NTP_SERVER:
+            return nvs_write_key(k, s_ntp_server, strlen(s_ntp_server) + 1, s_mtime[k], s_mtime_floor);
+        case K_TZ:
+            return nvs_write_key(k, s_display_tz, strlen(s_display_tz) + 1, s_mtime[k], s_mtime_floor);
         default:
             return false;
     }
@@ -753,6 +825,8 @@ static void merge_bags(const prefs_bag_t *nvs, const prefs_bag_t *sd, bool sd_lo
                 case K_WIFI_NM:    copy_ip_str(s_wifi_nm,  sizeof(s_wifi_nm),  winner->wifi_nm);  break;
                 case K_WIFI_GW:    copy_ip_str(s_wifi_gw,  sizeof(s_wifi_gw),  winner->wifi_gw);  break;
                 case K_WIFI_DNS:   copy_ip_str(s_wifi_dns, sizeof(s_wifi_dns), winner->wifi_dns); break;
+                case K_NTP_SERVER: copy_str_bounded(s_ntp_server, sizeof(s_ntp_server), winner->ntp_server); break;
+                case K_TZ:         copy_str_bounded(s_display_tz, sizeof(s_display_tz), winner->display_tz); break;
                 default:           break;
             }
             s_mtime[k] = winner->mtime[k];
@@ -811,7 +885,7 @@ void app_prefs_init(void)
 
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s rot=%u colors=%u bright=%u%% mix=%u sd=%s)",
+    ESP_LOGI(TAG, "prefs ready (level=%s indicator=%s theme=%s rot=%u colors=%u bright=%u%% mix=%u tz='%s' ntp='%s' sd=%s)",
              level_format_to_str(s_level_format),
              signal_indicator_to_str(s_signal_ind),
              theme_to_str(s_theme),
@@ -819,6 +893,7 @@ void app_prefs_init(void)
              (unsigned) s_color_count,
              (unsigned) s_brightness_pct,
              (unsigned) s_selected_mix_index,
+             s_display_tz, s_ntp_server,
              sd_loaded ? "loaded" : "absent");
 }
 
@@ -987,6 +1062,42 @@ void app_prefs_set_wifi_static_netmask (const char *s) { set_wifi_str(K_WIFI_NM,
 void app_prefs_set_wifi_static_gateway (const char *s) { set_wifi_str(K_WIFI_GW,  s_wifi_gw,  s); }
 void app_prefs_set_wifi_static_dns     (const char *s) { set_wifi_str(K_WIFI_DNS, s_wifi_dns, s); }
 
+// Bigger free-form strings (ntp server hostname, POSIX TZ). Same shape as
+// set_wifi_str but uses APP_PREFS_STR_MAX as the cap.
+static const char *get_big_str_locked(char *out, size_t out_len, const char *src)
+{
+    if (!out || out_len == 0) return out;
+    if (!s_mutex) { out[0] = '\0'; return out; }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    copy_str_bounded(out, out_len, src);
+    xSemaphoreGive(s_mutex);
+    return out;
+}
+
+static void set_big_str(prefs_key_t k, char *dst, const char *src)
+{
+    if (!s_mutex || !src) return;
+    if (strlen(src) >= APP_PREFS_STR_MAX) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (strcmp(dst, src) == 0) { xSemaphoreGive(s_mutex); return; }
+    copy_str_bounded(dst, APP_PREFS_STR_MAX, src);
+    prefs_commit_locked(k);
+    xSemaphoreGive(s_mutex);
+    notify_subscribers();
+}
+
+const char *app_prefs_get_ntp_server(char *out, size_t out_len)
+{ return get_big_str_locked(out, out_len, s_ntp_server); }
+
+void app_prefs_set_ntp_server(const char *s)
+{ set_big_str(K_NTP_SERVER, s_ntp_server, s); }
+
+const char *app_prefs_get_display_tz(char *out, size_t out_len)
+{ return get_big_str_locked(out, out_len, s_display_tz); }
+
+void app_prefs_set_display_tz(const char *s)
+{ set_big_str(K_TZ, s_display_tz, s); }
+
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -1073,6 +1184,15 @@ static void dump_bag(const char *label, const prefs_bag_t *bag, bool loaded)
         else
             printf("    %s  = <absent>\n", sk[i].label);
     }
+
+    if (bag->present[K_NTP_SERVER])
+        printf("    ntp_server       = '%s'   mt=%llu\n",
+               bag->ntp_server, (unsigned long long) bag->mtime[K_NTP_SERVER]);
+    else printf("    ntp_server       = <absent>\n");
+    if (bag->present[K_TZ])
+        printf("    display_tz       = '%s'   mt=%llu\n",
+               bag->display_tz, (unsigned long long) bag->mtime[K_TZ]);
+    else printf("    display_tz       = <absent>\n");
 }
 
 void app_prefs_debug_dump(void)
@@ -1117,6 +1237,10 @@ void app_prefs_debug_dump(void)
            s_wifi_gw,  (unsigned long long) s_mtime[K_WIFI_GW]);
     printf("  wifi_static_dns  = '%s'   mt=%llu\n",
            s_wifi_dns, (unsigned long long) s_mtime[K_WIFI_DNS]);
+    printf("  ntp_server       = '%s'   mt=%llu\n",
+           s_ntp_server, (unsigned long long) s_mtime[K_NTP_SERVER]);
+    printf("  display_tz       = '%s'   mt=%llu\n",
+           s_display_tz, (unsigned long long) s_mtime[K_TZ]);
     printf("  mtime_floor      = %llu\n", (unsigned long long) s_mtime_floor);
 
     dump_bag("nvs",  &nvs_bag, true);

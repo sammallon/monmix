@@ -101,6 +101,19 @@ void        app_prefs_set_wifi_static_netmask (const char *s);
 void        app_prefs_set_wifi_static_gateway (const char *s);
 void        app_prefs_set_wifi_static_dns     (const char *s);
 
+// NTP server hostname (or IP) and POSIX TZ string. Both freeform; the
+// caller is trusted (hand-typed via the on-device keyboard). Buffers
+// must be at least APP_PREFS_STR_MAX. Defaults are pool.ntp.org and a
+// US-Pacific TZ string -- the user is expected to override TZ at first
+// run if elsewhere. setenv("TZ",...) drives localtime_r; logs format
+// from monotonic uptime so they stay TZ-independent.
+#define APP_PREFS_STR_MAX 64
+
+const char *app_prefs_get_ntp_server     (char *out, size_t out_len);
+void        app_prefs_set_ntp_server     (const char *s);
+const char *app_prefs_get_display_tz     (char *out, size_t out_len);
+void        app_prefs_set_display_tz     (const char *s);
+
 // Subscribe to pref changes -- typically the UI registers once at init
 // time and re-reads whatever it cares about on each notification.
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx);
