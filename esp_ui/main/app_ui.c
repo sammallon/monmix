@@ -3833,6 +3833,42 @@ static void wcfg_close(void)
 
 // --- MS panel ------------------------------------------------------------
 
+// Custom TEXT_LOWER keymap for the MS-config keyboard. Default LVGL
+// alpha keymap requires the user to flip to a sub-screen ("1#") to
+// reach digits, and that sub-screen has no '.', so typing an IPv4 like
+// "192.168.1.1" needs four mode flips. This single-screen layout puts
+// digits, all 26 lowercase letters, '.' and '-' in front of the user
+// at once so neither hostnames nor dotted addresses need a flip.
+static const char *const mcfg_alphanum_map[] = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", LV_SYMBOL_BACKSPACE, "\n",
+    "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
+    "a", "s", "d", "f", "g", "h", "j", "k", "l", "\n",
+    "z", "x", "c", "v", "b", "n", "m", "-", ".", "\n",
+    LV_SYMBOL_CLOSE, " ", LV_SYMBOL_OK, ""
+};
+
+// LV_KB_BTN(w) expands to LV_BUTTONMATRIX_CTRL_POPOVER | w but the macro
+// is file-static inside lv_keyboard.c. Redefine locally so the keymap
+// sources cleanly.
+#define MCFG_KB_BTN(w) ((lv_buttonmatrix_ctrl_t)(LV_BUTTONMATRIX_CTRL_POPOVER | (w)))
+
+// Width units per cell: digits 1, backspace 2, space 8, close/ok 2 with
+// the keyboard's CTRL_BUTTON_FLAGS so the default event handler treats
+// them as cancel/submit.
+static const lv_buttonmatrix_ctrl_t mcfg_alphanum_ctrl[] = {
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(2),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1), MCFG_KB_BTN(1),
+    LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2, MCFG_KB_BTN(8), LV_KEYBOARD_CTRL_BUTTON_FLAGS | 2
+};
+
+
 static bool mcfg_has_unsaved_changes(void)
 {
     if (strcmp(lv_textarea_get_text(s_mcfg_host_ta), s_mcfg_orig_host) != 0) return true;
@@ -3911,14 +3947,17 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
 {
     lv_obj_t *ta = lv_event_get_target_obj(e);
     if (s_mcfg_keyboard) {
-        // Host is an IPv4 dotted literal -- 0-9 and '.' is exactly the
-        // existing NUMBER keymap, no custom map needed.
-        bool numeric = (ta == s_mcfg_port_ta || ta == s_mcfg_host_ta ||
-                        ta == s_mcfg_osc_port_ta);
+        // Host accepts a hostname OR a dotted IP, so it needs both alpha
+        // and digits. TEXT_LOWER on this keyboard is mapped to a custom
+        // single-screen layout (digits row + alpha rows + .) so the user
+        // never has to flip subscreens to type "192.168.1.1".
+        // Port fields stay on NUMBER mode (LVGL's default 4x4 keypad,
+        // which already includes '.').
+        bool port_only = (ta == s_mcfg_port_ta || ta == s_mcfg_osc_port_ta);
         lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
         lv_keyboard_set_mode(s_mcfg_keyboard,
-                             numeric ? LV_KEYBOARD_MODE_NUMBER
-                                     : LV_KEYBOARD_MODE_TEXT_LOWER);
+                             port_only ? LV_KEYBOARD_MODE_NUMBER
+                                       : LV_KEYBOARD_MODE_TEXT_LOWER);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
         // Keyboard is a sibling of the overlay; promote to foreground so it
         // isn't drawn behind the overlay.
@@ -4191,6 +4230,10 @@ static void build_mcfg_overlay(void)
     lv_obj_align(s_mcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_mcfg_keyboard, on_mcfg_keyboard_event, LV_EVENT_ALL, NULL);
+    // Override TEXT_LOWER with a single-screen alpha+digits+'.' layout for
+    // the host field. Other modes (NUMBER for ports) keep LVGL defaults.
+    lv_keyboard_set_map(s_mcfg_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER,
+                        mcfg_alphanum_map, mcfg_alphanum_ctrl);
 }
 
 static void mcfg_open(void)
