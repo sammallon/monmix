@@ -6,6 +6,7 @@ idf_component_register(
         "app_wifi.c"
         "app_ms_client_ws.c"
         "app_ms_client_osc.c"
+        "osc_expect.c"
         "app_ms_info.c"
         "app_display.c"
         "app_ui.c"

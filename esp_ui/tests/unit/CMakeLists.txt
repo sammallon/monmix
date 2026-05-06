@@ -28,3 +28,4 @@ function(add_unit_test name)
 endfunction()
 
 add_unit_test(test_db_taper)
+add_unit_test(test_osc_expect ${MAIN_DIR}/osc_expect.c)

@@ -24,6 +24,7 @@
 #include "app_ms_client.h"
 #include "app_prefs.h"
 #include "app_state.h"
+#include "osc_expect.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,7 @@
 
 #include "lwip/err.h"
 #include "lwip/ip_addr.h"
+#include "lwip/netdb.h"
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
 #include "lwip/udp.h"
@@ -62,27 +64,13 @@ static const char *TAG = "ms_osc";
 // drains, while staying small enough that pbuf-pool pressure is bounded.
 #define OSC_RX_QUEUE_DEPTH   32
 
-// Per-path expectation tracker. Both prime resilience (UDP loss on
-// initial GETs) and MS-down detection (watchdog) ride this same
-// mechanism: register on send, clear on matching reply, tick for
-// timeouts. Watchdog-flagged entries flip state to DISCONNECTED on
-// full fail; plain entries just abandon. Sized for ~30 prime paths +
-// the watchdog probe with headroom; each slot ~56 bytes -> ~3.5 KB.
+// Per-path expectation tracker. Both prime resilience and MS-down
+// detection (watchdog) ride osc_expect.{h,c}; this header just sizes
+// the slot array and the timing constants.
 #define OSC_EXPECT_SIZE          64
 #define OSC_EXPECT_TIMEOUT_MS    1500
-#define OSC_EXPECT_PATH_MAX      48
-#define OSC_EXPECT_FLAG_WATCHDOG 0x01
-
 #define OSC_WATCHDOG_INTERVAL_MS 10000   // probe every 10 s when otherwise quiet
 #define OSC_WATCHDOG_RETRIES     2       // 3 sends total over 4.5 s
-
-typedef struct {
-    char     path[OSC_EXPECT_PATH_MAX];   // empty (path[0]==0) when slot is free
-    uint32_t sent_ms;
-    uint8_t  retries_left;
-    uint8_t  flags;
-    char     fmt;                          // 'n' or 'v', preserved for retry
-} osc_expect_t;
 
 // Largest OSC packet we accept inbound. Real MS frames are typically
 // 30-60 bytes (/con/n/<dotted> ,f <float>); 192 covers any reasonable
@@ -243,7 +231,8 @@ static struct {
 
     // Expectation table -- worker-only access (handle_inbound runs on the
     // worker via drain_rx, so no mutex needed).
-    osc_expect_t            expect[OSC_EXPECT_SIZE];
+    osc_expect_t            expect;
+    osc_expect_slot_t       expect_slots[OSC_EXPECT_SIZE];
     uint32_t                last_watchdog_ms;
     uint32_t                last_expect_tick_ms;
 
@@ -289,74 +278,37 @@ static inline void filter_set(int id) {
     g.filter.bits[id >> 5] |= (1u << (id & 31));
 }
 
-// Forward decl: expect_tick reissues stale GETs via udp_send_bytes,
-// which is defined further down the file with the rest of the LwIP-raw
-// send path.
+// Forward decl: expect retry callback emits via udp_send_bytes, which
+// is defined further down the file with the rest of the LwIP-raw send
+// path.
 static err_t udp_send_bytes(const uint8_t *bytes, size_t len);
 
-// ────────────────────────────────────────────────────────────────────────────
-// Expectation table (per-path in-flight tracker)
-// Register on send, clear on matching reply, tick for retries. Single-
-// threaded -- only the worker writes (registers, retries, sweeps) and
-// reads (matches in handle_inbound, which is called from drain_rx).
-// ────────────────────────────────────────────────────────────────────────────
-
-static bool expect_register(const char *path, char fmt, uint8_t retries, uint8_t flags) {
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g.expect[i].path[0]) continue;
-        strncpy(g.expect[i].path, path, sizeof(g.expect[i].path) - 1);
-        g.expect[i].path[sizeof(g.expect[i].path) - 1] = 0;
-        g.expect[i].sent_ms      = now;
-        g.expect[i].retries_left = retries;
-        g.expect[i].flags        = flags;
-        g.expect[i].fmt          = fmt;
-        return true;
-    }
-    return false;  // table full -- drop the expectation, request still went out
+// Retry callback -- osc_expect_tick invokes this for any slot whose
+// timeout fires while retries_left > 0. We rebuild the OSC packet from
+// the slot's path + fmt and emit it via the same direct path the
+// initial GET used.
+static void osc_expect_retry_send(const char *path, char fmt, void *user) {
+    (void)user;
+    char addr[80];
+    snprintf(addr, sizeof(addr), "/con/%c/%s", fmt, path);
+    uint8_t pkt[128];
+    size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
+    if (n) udp_send_bytes(pkt, n);
 }
 
-// Clear any expectation matching this dotted path. Called on every
-// inbound /con/[nv]/<path> -- if it matches, the expectation is
-// fulfilled. Coincidental broadcasts (e.g. another client moves a
-// fader) ALSO count as evidence of liveness, so we treat them as
-// fulfillment of any matching expectation: a watchdog probe for
-// ch.0.cfg.name happily clears on any inbound for that path.
-static void expect_match(const char *dotted) {
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g.expect[i].path[0] == 0) continue;
-        if (strcmp(g.expect[i].path, dotted) == 0) {
-            g.expect[i].path[0] = 0;
-            return;
-        }
-    }
+// Worker-side helpers that wrap the module API with our esp_timer clock,
+// kept thin so the OSC client reads top-to-bottom in one mental model.
+static inline uint32_t now_ms(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
-
-// Periodic sweep. Returns the count of WATCHDOG entries that fully
-// failed this tick (caller acts on >0 to flip state DISCONNECTED).
-// Plain entries just retry up to retries_left, then drop silently.
-static int expect_tick(void) {
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    int watchdog_failed = 0;
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g.expect[i].path[0] == 0) continue;
-        if (now - g.expect[i].sent_ms < OSC_EXPECT_TIMEOUT_MS) continue;
-        if (g.expect[i].retries_left == 0) {
-            if (g.expect[i].flags & OSC_EXPECT_FLAG_WATCHDOG) ++watchdog_failed;
-            g.expect[i].path[0] = 0;
-            continue;
-        }
-        // Retry. Bypass the outq -- direct send keeps the slot's clock
-        // honest and avoids racing with another path's retry.
-        char addr[80];
-        snprintf(addr, sizeof(addr), "/con/%c/%s", g.expect[i].fmt, g.expect[i].path);
-        uint8_t pkt[128];
-        size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
-        if (n) udp_send_bytes(pkt, n);
-        g.expect[i].retries_left--;
-        g.expect[i].sent_ms = now;
-    }
-    return watchdog_failed;
+static inline bool expect_register(const char *path, char fmt, uint8_t retries, uint8_t flags) {
+    return osc_expect_register(&g.expect, path, fmt, retries, flags, now_ms());
+}
+static inline void expect_match(const char *dotted) {
+    osc_expect_match(&g.expect, dotted);
+}
+static inline int expect_tick(void) {
+    return osc_expect_tick(&g.expect, now_ms());
 }
 
 // Recompute the bitmap from app_state's tracked channels + master + mix
@@ -760,15 +712,33 @@ static void send_heartbeat(void) {
     }
 }
 
-// Bring up the raw UDP PCB. Resolves the host (dotted-IP only for now;
-// DNS would need a synchronous resolver and a DNS server config) then
-// binds an ephemeral local port and connects to MS. Returns true on
-// success; the connection state is reflected in g.pcb_open.
+// Bring up the raw UDP PCB. Resolves the host (dotted-IP first; falls back
+// to getaddrinfo so hostnames like "mixingstation.local" work). Then binds
+// an ephemeral local port and registers the recv callback. Returns true
+// on success; the connection state is reflected in g.pcb_open.
 static bool udp_pcb_up(void) {
     if (g.pcb) return g.pcb_open;
     if (!ipaddr_aton(g.udp_host, &g.remote_ip)) {
-        ESP_LOGW(TAG, "udp: '%s' is not a dotted IP -- DNS not implemented yet", g.udp_host);
-        return false;
+        // Hostname -- resolve via lwIP's getaddrinfo. Synchronous; uses
+        // the DHCP-supplied DNS server configured at WiFi association.
+        // Block here is acceptable -- this only runs on connect/reconnect,
+        // not on the hot path.
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_DGRAM };
+        struct addrinfo *res = NULL;
+        int rc = getaddrinfo(g.udp_host, NULL, &hints, &res);
+        if (rc != 0 || !res) {
+            ESP_LOGW(TAG, "udp: DNS lookup '%s' failed (rc=%d)", g.udp_host, rc);
+            if (res) freeaddrinfo(res);
+            return false;
+        }
+        struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+        ip_addr_set_ip4_u32(&g.remote_ip, sin->sin_addr.s_addr);
+        uint32_t a = ntohl(sin->sin_addr.s_addr);
+        ESP_LOGI(TAG, "udp: '%s' -> %u.%u.%u.%u",
+                 g.udp_host,
+                 (unsigned)((a >> 24) & 0xff), (unsigned)((a >> 16) & 0xff),
+                 (unsigned)((a >> 8)  & 0xff), (unsigned)(a & 0xff));
+        freeaddrinfo(res);
     }
     g.remote_port = (uint16_t)g.udp_port;
 
@@ -805,10 +775,7 @@ static void udp_pcb_down(void) {
     g.pcb_remote_ok = false;
     g.primed        = false;
     g.prime_idx     = 0;
-    // Clear the expectation table -- nothing we sent before the close is
-    // going to get a reply now, and stale entries would skew the watchdog
-    // counter post-reconnect.
-    memset(g.expect, 0, sizeof(g.expect));
+    osc_expect_clear(&g.expect);
     set_state(APP_MS_STATE_DISCONNECTED);
 }
 
@@ -1039,6 +1006,8 @@ static bool osc_start(void) {
         ESP_LOGE(TAG, "rx queue create failed");
         return false;
     }
+    osc_expect_init(&g.expect, g.expect_slots, OSC_EXPECT_SIZE,
+                    OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
     g.running  = true;
     g.state    = APP_MS_STATE_BOOT;
     g.level_format = app_prefs_get_level_format();

@@ -26,6 +26,7 @@
 #include "app_state.h"
 #include "app_prefs.h"
 #include "app_ui.h"
+#include "osc_expect.h"
 
 #include <SDL.h>
 #include "mongoose.h"
@@ -39,24 +40,12 @@
 #define MAX_OBSERVERS 4
 #define MAX_MIX_BUSES 24
 
-// Expectation table parameters mirror app_ms_client_osc.c so the sim
-// exercises the same retry/watchdog logic. PC kernel UDP buffers make
-// loss rare, but logical parity matters: any bug in the table that
-// trips on the sim probably trips on hardware too.
+// Same expectation params as the firmware. The slot/table types come
+// from osc_expect.h (shared with main/).
 #define OSC_EXPECT_SIZE          64
 #define OSC_EXPECT_TIMEOUT_MS    1500
-#define OSC_EXPECT_PATH_MAX      48
-#define OSC_EXPECT_FLAG_WATCHDOG 0x01
 #define OSC_WATCHDOG_INTERVAL_MS 10000
 #define OSC_WATCHDOG_RETRIES     2
-
-typedef struct {
-    char     path[OSC_EXPECT_PATH_MAX];
-    uint32_t sent_ms;
-    uint8_t  retries_left;
-    uint8_t  flags;
-    char     fmt;
-} osc_expect_t;
 
 typedef struct outq_entry {
     uint8_t            *pkt;
@@ -102,9 +91,10 @@ typedef struct {
     } observers[MAX_OBSERVERS];
     size_t observer_count;
 
-    osc_expect_t expect[OSC_EXPECT_SIZE];
-    uint32_t     last_watchdog_ms;
-    uint32_t     last_expect_tick_ms;
+    osc_expect_t      expect;
+    osc_expect_slot_t expect_slots[OSC_EXPECT_SIZE];
+    uint32_t          last_watchdog_ms;
+    uint32_t          last_expect_tick_ms;
 } osc_real_t;
 
 static osc_real_t g_osc;
@@ -190,60 +180,29 @@ static bool osc_first_scalar(const char *types, const uint8_t *args, size_t args
     return false;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Expectation table -- mirrors app_ms_client_osc.c so the same retry +
-// watchdog logic exercises in the sim. Worker-thread-only access (the
-// sim's mongoose UDP read fires the worker via MG_EV_READ -> handle_inbound,
-// so all writes/reads happen on one thread, no mutex needed).
-// ────────────────────────────────────────────────────────────────────────────
+// Forward decl -- defined further down with the rest of the mongoose
+// send path.
+static int osc_send_pkt(const uint8_t *bytes, size_t len);
 
-static int osc_send_pkt(const uint8_t *bytes, size_t len);  // forward
-
-static bool expect_register(const char *path, char fmt, uint8_t retries, uint8_t flags) {
-    uint32_t now = SDL_GetTicks();
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g_osc.expect[i].path[0]) continue;
-        strncpy(g_osc.expect[i].path, path, sizeof(g_osc.expect[i].path) - 1);
-        g_osc.expect[i].path[sizeof(g_osc.expect[i].path) - 1] = 0;
-        g_osc.expect[i].sent_ms      = now;
-        g_osc.expect[i].retries_left = retries;
-        g_osc.expect[i].flags        = flags;
-        g_osc.expect[i].fmt          = fmt;
-        return true;
-    }
-    return false;
+// Retry callback for the shared osc_expect table. Same shape as
+// firmware's osc_expect_retry_send, just routes through mongoose.
+static void osc_expect_retry_send(const char *path, char fmt, void *user) {
+    (void)user;
+    char addr[80];
+    snprintf(addr, sizeof(addr), "/con/%c/%s", fmt, path);
+    uint8_t pkt[128];
+    size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
+    if (n) osc_send_pkt(pkt, n);
 }
 
-static void expect_match(const char *dotted) {
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g_osc.expect[i].path[0] == 0) continue;
-        if (strcmp(g_osc.expect[i].path, dotted) == 0) {
-            g_osc.expect[i].path[0] = 0;
-            return;
-        }
-    }
+static inline bool expect_register(const char *path, char fmt, uint8_t retries, uint8_t flags) {
+    return osc_expect_register(&g_osc.expect, path, fmt, retries, flags, SDL_GetTicks());
 }
-
-static int expect_tick(void) {
-    uint32_t now = SDL_GetTicks();
-    int watchdog_failed = 0;
-    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
-        if (g_osc.expect[i].path[0] == 0) continue;
-        if (now - g_osc.expect[i].sent_ms < OSC_EXPECT_TIMEOUT_MS) continue;
-        if (g_osc.expect[i].retries_left == 0) {
-            if (g_osc.expect[i].flags & OSC_EXPECT_FLAG_WATCHDOG) ++watchdog_failed;
-            g_osc.expect[i].path[0] = 0;
-            continue;
-        }
-        char addr[80];
-        snprintf(addr, sizeof(addr), "/con/%c/%s", g_osc.expect[i].fmt, g_osc.expect[i].path);
-        uint8_t pkt[128];
-        size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
-        if (n) osc_send_pkt(pkt, n);
-        g_osc.expect[i].retries_left--;
-        g_osc.expect[i].sent_ms = now;
-    }
-    return watchdog_failed;
+static inline void expect_match(const char *dotted) {
+    osc_expect_match(&g_osc.expect, dotted);
+}
+static inline int expect_tick(void) {
+    return osc_expect_tick(&g_osc.expect, SDL_GetTicks());
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -501,7 +460,7 @@ static void udp_evt(struct mg_connection *c, int ev, void *ev_data) {
         g_osc.udp_conn = NULL;
         g_osc.primed   = false;
         g_osc.prime_idx = 0;
-        memset(g_osc.expect, 0, sizeof(g_osc.expect));
+        osc_expect_clear(&g_osc.expect);
         notify_state_change(APP_MS_STATE_DISCONNECTED);
     }
 }
@@ -807,6 +766,8 @@ const ms_client_iface_t *ms_client_real_osc_create(const char *host, int http_po
     snprintf(g_osc.http_base, sizeof(g_osc.http_base), "http://%s:%d", host, http_port);
 
     g_osc.outq_mtx  = SDL_CreateMutex();
+    osc_expect_init(&g_osc.expect, g_osc.expect_slots, OSC_EXPECT_SIZE,
+                    OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
     g_osc.running   = true;
     g_osc.state     = APP_MS_STATE_BOOT;
     g_osc.level_fmt = app_prefs_get_level_format();
