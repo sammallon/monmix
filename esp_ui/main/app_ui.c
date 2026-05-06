@@ -269,11 +269,18 @@ static bool     s_wcfg_orig_ntp_use_dhcp;
 static lv_obj_t *s_mcfg_overlay;
 static lv_obj_t *s_mcfg_host_ta;
 static lv_obj_t *s_mcfg_port_ta;
+static lv_obj_t *s_mcfg_osc_port_ta;
+static lv_obj_t *s_mcfg_proto_ws_btn;
+static lv_obj_t *s_mcfg_proto_osc_btn;
+static int       s_mcfg_proto_staged;  // staged selection until Save
 static lv_obj_t *s_mcfg_keyboard;
 static lv_obj_t *s_mcfg_status_label;
 static lv_obj_t *s_mcfg_discard_confirm;
+static lv_obj_t *s_mcfg_reboot_confirm;
 static char     s_mcfg_orig_host[APP_CONFIG_HOST_MAX];
 static char     s_mcfg_orig_port[8];
+static char     s_mcfg_orig_osc_port[8];
+static int      s_mcfg_orig_proto;     // app_ms_protocol_t snapshot at open
 
 // SSID scan results popup. Used only by the WiFi panel.
 static lv_obj_t *s_ssid_list_popup;
@@ -3828,8 +3835,12 @@ static void wcfg_close(void)
 
 static bool mcfg_has_unsaved_changes(void)
 {
-    return strcmp(lv_textarea_get_text(s_mcfg_host_ta), s_mcfg_orig_host) != 0 ||
-           strcmp(lv_textarea_get_text(s_mcfg_port_ta), s_mcfg_orig_port) != 0;
+    if (strcmp(lv_textarea_get_text(s_mcfg_host_ta), s_mcfg_orig_host) != 0) return true;
+    if (strcmp(lv_textarea_get_text(s_mcfg_port_ta), s_mcfg_orig_port) != 0) return true;
+    if (s_mcfg_osc_port_ta &&
+        strcmp(lv_textarea_get_text(s_mcfg_osc_port_ta), s_mcfg_orig_osc_port) != 0) return true;
+    if (s_mcfg_proto_staged != s_mcfg_orig_proto) return true;
+    return false;
 }
 
 static void build_mcfg_discard_confirm(void);
@@ -3902,7 +3913,8 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
     if (s_mcfg_keyboard) {
         // Host is an IPv4 dotted literal -- 0-9 and '.' is exactly the
         // existing NUMBER keymap, no custom map needed.
-        bool numeric = (ta == s_mcfg_port_ta || ta == s_mcfg_host_ta);
+        bool numeric = (ta == s_mcfg_port_ta || ta == s_mcfg_host_ta ||
+                        ta == s_mcfg_osc_port_ta);
         lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
         lv_keyboard_set_mode(s_mcfg_keyboard,
                              numeric ? LV_KEYBOARD_MODE_NUMBER
@@ -3927,13 +3939,18 @@ static void on_mcfg_keyboard_event(lv_event_t *e)
     }
 }
 
+static void build_mcfg_reboot_confirm(void);
+
 static void on_mcfg_save(lv_event_t *e)
 {
     (void)e;
     mcfg_hide_keyboard();
-    const char *host   = lv_textarea_get_text(s_mcfg_host_ta);
-    const char *port_s = lv_textarea_get_text(s_mcfg_port_ta);
-    long port = strtol(port_s, NULL, 10);
+    const char *host       = lv_textarea_get_text(s_mcfg_host_ta);
+    const char *port_s     = lv_textarea_get_text(s_mcfg_port_ta);
+    const char *osc_port_s = s_mcfg_osc_port_ta
+                                 ? lv_textarea_get_text(s_mcfg_osc_port_ta) : "";
+    long port     = strtol(port_s, NULL, 10);
+    long osc_port = osc_port_s[0] ? strtol(osc_port_s, NULL, 10) : 0;
     if (strlen(host) == 0) {
         lv_label_set_text(s_mcfg_status_label,
                           "#FF6060 Host cannot be empty.#");
@@ -3944,12 +3961,31 @@ static void on_mcfg_save(lv_event_t *e)
                           "#FF6060 Invalid port (1-65535)#");
         return;
     }
+    if (osc_port_s[0] && (osc_port <= 0 || osc_port > 65535)) {
+        lv_label_set_text(s_mcfg_status_label,
+                          "#FF6060 Invalid OSC port (1-65535)#");
+        return;
+    }
     bool ok = app_config_set_ms_host(host) &&
               app_config_set_ms_port((uint16_t) port);
+    if (ok && osc_port > 0) ok = app_config_set_ms_osc_port((uint16_t) osc_port);
     if (!ok) {
         lv_label_set_text(s_mcfg_status_label,
                           "#FF6060 Save failed (NVS error).#");
         return;
+    }
+
+    bool proto_changed = (s_mcfg_proto_staged != s_mcfg_orig_proto);
+    if (proto_changed) {
+        // Persist the new protocol but don't apply it live -- the active
+        // backend is chosen at startup. Show a reboot confirm; cancel
+        // reverts the persisted value so a "save then back out" leaves
+        // the device in its prior state.
+        if (!app_config_set_ms_protocol((app_ms_protocol_t) s_mcfg_proto_staged)) {
+            lv_label_set_text(s_mcfg_status_label,
+                              "#FF6060 Save failed (NVS error).#");
+            return;
+        }
     }
 
     // Re-snapshot originals so the X close path doesn't think we still
@@ -3958,15 +3994,97 @@ static void on_mcfg_save(lv_event_t *e)
     s_mcfg_orig_host[sizeof(s_mcfg_orig_host) - 1] = '\0';
     strncpy(s_mcfg_orig_port, port_s, sizeof(s_mcfg_orig_port) - 1);
     s_mcfg_orig_port[sizeof(s_mcfg_orig_port) - 1] = '\0';
+    if (s_mcfg_osc_port_ta) {
+        strncpy(s_mcfg_orig_osc_port, osc_port_s, sizeof(s_mcfg_orig_osc_port) - 1);
+        s_mcfg_orig_osc_port[sizeof(s_mcfg_orig_osc_port) - 1] = '\0';
+    }
 
+    if (proto_changed) {
+        lv_label_set_text(s_mcfg_status_label,
+                          "#40C060 Saved. Reboot to switch protocol.#");
+        if (!s_mcfg_reboot_confirm) build_mcfg_reboot_confirm();
+        lv_obj_remove_flag(s_mcfg_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_mcfg_reboot_confirm);
+        return;
+    }
+
+    s_mcfg_orig_proto = s_mcfg_proto_staged;
     lv_label_set_text(s_mcfg_status_label,
                       "#40C060 Saved. Reconnecting to MS...#");
 
-    // Live-apply by kicking the WS client to recreate against the new
-    // host:port. No reboot needed -- the WS task tears down + spins up
-    // with whatever app_config now returns. Status icon will flip to
-    // CONNECTING then back to CONNECTED via the existing event path.
+    // Live-apply for host/port/osc-port within the same protocol. The
+    // active client recomposes URLs from app_config_* on its next
+    // reconnect cycle -- the iface's reconnect() closes the current
+    // connection and the worker re-opens with whatever NVS now returns.
     if (s_ms && s_ms->reconnect) s_ms->reconnect();
+}
+
+static void on_mcfg_reboot_yes(lv_event_t *e)
+{
+    (void)e;
+    if (s_mcfg_reboot_confirm) lv_obj_add_flag(s_mcfg_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
+    esp_restart();
+}
+
+static void on_mcfg_reboot_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_mcfg_reboot_confirm) lv_obj_add_flag(s_mcfg_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
+    // Roll back the persisted protocol so dismissing the dialog is
+    // truly idempotent -- otherwise the user would unknowingly switch
+    // on the next reboot.
+    app_config_set_ms_protocol((app_ms_protocol_t) s_mcfg_orig_proto);
+    s_mcfg_proto_staged = s_mcfg_orig_proto;
+    if (s_mcfg_proto_ws_btn && s_mcfg_proto_osc_btn) {
+        lv_obj_t *btns[2] = { s_mcfg_proto_ws_btn, s_mcfg_proto_osc_btn };
+        update_radio_visuals(btns, 2, (size_t) s_mcfg_orig_proto);
+    }
+    lv_label_set_text(s_mcfg_status_label,
+                      "#FFB040 Reboot cancelled — protocol unchanged.#");
+}
+
+static void build_mcfg_reboot_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_mcfg_reboot_confirm = p;
+
+    lv_obj_t *msg = lv_label_create(p);
+    lv_label_set_text(msg, "Switching MS protocol requires a reboot.\nReboot now?");
+    lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Not now");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_mcfg_reboot_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 160, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes);
+    lv_label_set_text(yes_lbl, "Reboot");
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes, on_mcfg_reboot_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void on_mcfg_proto_clicked(lv_event_t *e)
+{
+    int which = (int)(uintptr_t) lv_event_get_user_data(e);
+    s_mcfg_proto_staged = which;
+    lv_obj_t *btns[2] = { s_mcfg_proto_ws_btn, s_mcfg_proto_osc_btn };
+    update_radio_visuals(btns, 2, (size_t) which);
 }
 
 static void build_mcfg_overlay(void)
@@ -4033,10 +4151,40 @@ static void build_mcfg_overlay(void)
     lv_obj_add_event_cb(s_mcfg_port_ta, on_mcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
+    // Protocol toggle. Two-button radio mirrors the level-format pattern
+    // elsewhere in the panel; staged in s_mcfg_proto_staged and only
+    // persisted on Save.
+    lv_obj_t *proto_lbl = lv_label_create(ov);
+    lv_label_set_text(proto_lbl, "Protocol");
+    lv_obj_align(proto_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 2 + 4);
+
+    s_mcfg_proto_ws_btn = make_radio_button(ov, "WS");
+    lv_obj_set_size(s_mcfg_proto_ws_btn, 80, field_h);
+    lv_obj_align(s_mcfg_proto_ws_btn, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 2);
+    lv_obj_add_event_cb(s_mcfg_proto_ws_btn, on_mcfg_proto_clicked,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t) APP_MS_PROTOCOL_WS);
+
+    s_mcfg_proto_osc_btn = make_radio_button(ov, "OSC");
+    lv_obj_set_size(s_mcfg_proto_osc_btn, 80, field_h);
+    lv_obj_align(s_mcfg_proto_osc_btn, LV_ALIGN_TOP_LEFT, 168, 56 + row_dy * 2);
+    lv_obj_add_event_cb(s_mcfg_proto_osc_btn, on_mcfg_proto_clicked,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t) APP_MS_PROTOCOL_OSC);
+
+    lv_obj_t *osc_port_lbl = lv_label_create(ov);
+    lv_label_set_text(osc_port_lbl, "OSC Port");
+    lv_obj_align(osc_port_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 3 + 4);
+    s_mcfg_osc_port_ta = lv_textarea_create(ov);
+    lv_obj_set_size(s_mcfg_osc_port_ta, 140, field_h);
+    lv_obj_align(s_mcfg_osc_port_ta, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 3);
+    lv_textarea_set_one_line(s_mcfg_osc_port_ta, true);
+    lv_textarea_set_max_length(s_mcfg_osc_port_ta, 5);
+    lv_obj_add_event_cb(s_mcfg_osc_port_ta, on_mcfg_textarea_focused,
+                        LV_EVENT_FOCUSED, NULL);
+
     s_mcfg_status_label = lv_label_create(ov);
     lv_label_set_text(s_mcfg_status_label, "");
     lv_label_set_recolor(s_mcfg_status_label, true);
-    lv_obj_align(s_mcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 2 + 4);
+    lv_obj_align(s_mcfg_status_label, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 4 + 4);
 
     s_mcfg_keyboard = lv_keyboard_create(scr);
     lv_obj_set_size(s_mcfg_keyboard, SCREEN_W - 32, SCREEN_H / 2);
@@ -4050,13 +4198,26 @@ static void mcfg_open(void)
     if (!s_mcfg_overlay) build_mcfg_overlay();
     const char *host = app_config_ms_host();
     char port_s[8];
-    snprintf(port_s, sizeof(port_s), "%u", (unsigned) app_config_ms_port());
+    char osc_port_s[8];
+    snprintf(port_s,     sizeof(port_s),     "%u", (unsigned) app_config_ms_port());
+    snprintf(osc_port_s, sizeof(osc_port_s), "%u", (unsigned) app_config_ms_osc_port());
     lv_textarea_set_text(s_mcfg_host_ta, host);
     lv_textarea_set_text(s_mcfg_port_ta, port_s);
+    if (s_mcfg_osc_port_ta) lv_textarea_set_text(s_mcfg_osc_port_ta, osc_port_s);
     strncpy(s_mcfg_orig_host, host, sizeof(s_mcfg_orig_host) - 1);
     s_mcfg_orig_host[sizeof(s_mcfg_orig_host) - 1] = '\0';
     strncpy(s_mcfg_orig_port, port_s, sizeof(s_mcfg_orig_port) - 1);
     s_mcfg_orig_port[sizeof(s_mcfg_orig_port) - 1] = '\0';
+    strncpy(s_mcfg_orig_osc_port, osc_port_s, sizeof(s_mcfg_orig_osc_port) - 1);
+    s_mcfg_orig_osc_port[sizeof(s_mcfg_orig_osc_port) - 1] = '\0';
+
+    s_mcfg_orig_proto   = (int) app_config_ms_protocol();
+    s_mcfg_proto_staged = s_mcfg_orig_proto;
+    if (s_mcfg_proto_ws_btn && s_mcfg_proto_osc_btn) {
+        lv_obj_t *btns[2] = { s_mcfg_proto_ws_btn, s_mcfg_proto_osc_btn };
+        update_radio_visuals(btns, 2, (size_t) s_mcfg_orig_proto);
+    }
+
     lv_label_set_text(s_mcfg_status_label, "");
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_mcfg_overlay, LV_OBJ_FLAG_HIDDEN);
