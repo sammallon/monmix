@@ -67,6 +67,15 @@ CONFIG_LWIP_TCP_RCV_BUF_DEFAULT=16384
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
 CONFIG_LWIP_TCP_WND_DEFAULT=16384
 
+# Per-UDP-socket recv mbox depth. Default 6 was the bottleneck behind
+# the OSC raw-PCB filter (mongoose's poll-based recv couldn't drain a
+# 12-burst before the mbox overflowed). 16 keeps headroom for any
+# socket-backed UDP path that still uses BSD recv (DNS replies, SNTP)
+# arriving during inbound bursts. Per-slot cost = pbuf pointer +
+# held-payload until drain, ~50-100 bytes; total ~1 KB more in the
+# worst case where every UDP socket sits full simultaneously.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+
 # Main task stack — UI init pulls in LVGL, sometimes deep.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
