@@ -39,6 +39,25 @@
 #define MAX_OBSERVERS 4
 #define MAX_MIX_BUSES 24
 
+// Expectation table parameters mirror app_ms_client_osc.c so the sim
+// exercises the same retry/watchdog logic. PC kernel UDP buffers make
+// loss rare, but logical parity matters: any bug in the table that
+// trips on the sim probably trips on hardware too.
+#define OSC_EXPECT_SIZE          64
+#define OSC_EXPECT_TIMEOUT_MS    1500
+#define OSC_EXPECT_PATH_MAX      48
+#define OSC_EXPECT_FLAG_WATCHDOG 0x01
+#define OSC_WATCHDOG_INTERVAL_MS 10000
+#define OSC_WATCHDOG_RETRIES     2
+
+typedef struct {
+    char     path[OSC_EXPECT_PATH_MAX];
+    uint32_t sent_ms;
+    uint8_t  retries_left;
+    uint8_t  flags;
+    char     fmt;
+} osc_expect_t;
+
 typedef struct outq_entry {
     uint8_t            *pkt;
     size_t              len;
@@ -82,6 +101,10 @@ typedef struct {
         void              *ctx;
     } observers[MAX_OBSERVERS];
     size_t observer_count;
+
+    osc_expect_t expect[OSC_EXPECT_SIZE];
+    uint32_t     last_watchdog_ms;
+    uint32_t     last_expect_tick_ms;
 } osc_real_t;
 
 static osc_real_t g_osc;
@@ -165,6 +188,62 @@ static bool osc_first_scalar(const char *types, const uint8_t *args, size_t args
         return true;
     }
     return false;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Expectation table -- mirrors app_ms_client_osc.c so the same retry +
+// watchdog logic exercises in the sim. Worker-thread-only access (the
+// sim's mongoose UDP read fires the worker via MG_EV_READ -> handle_inbound,
+// so all writes/reads happen on one thread, no mutex needed).
+// ────────────────────────────────────────────────────────────────────────────
+
+static int osc_send_pkt(const uint8_t *bytes, size_t len);  // forward
+
+static bool expect_register(const char *path, char fmt, uint8_t retries, uint8_t flags) {
+    uint32_t now = SDL_GetTicks();
+    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
+        if (g_osc.expect[i].path[0]) continue;
+        strncpy(g_osc.expect[i].path, path, sizeof(g_osc.expect[i].path) - 1);
+        g_osc.expect[i].path[sizeof(g_osc.expect[i].path) - 1] = 0;
+        g_osc.expect[i].sent_ms      = now;
+        g_osc.expect[i].retries_left = retries;
+        g_osc.expect[i].flags        = flags;
+        g_osc.expect[i].fmt          = fmt;
+        return true;
+    }
+    return false;
+}
+
+static void expect_match(const char *dotted) {
+    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
+        if (g_osc.expect[i].path[0] == 0) continue;
+        if (strcmp(g_osc.expect[i].path, dotted) == 0) {
+            g_osc.expect[i].path[0] = 0;
+            return;
+        }
+    }
+}
+
+static int expect_tick(void) {
+    uint32_t now = SDL_GetTicks();
+    int watchdog_failed = 0;
+    for (int i = 0; i < OSC_EXPECT_SIZE; ++i) {
+        if (g_osc.expect[i].path[0] == 0) continue;
+        if (now - g_osc.expect[i].sent_ms < OSC_EXPECT_TIMEOUT_MS) continue;
+        if (g_osc.expect[i].retries_left == 0) {
+            if (g_osc.expect[i].flags & OSC_EXPECT_FLAG_WATCHDOG) ++watchdog_failed;
+            g_osc.expect[i].path[0] = 0;
+            continue;
+        }
+        char addr[80];
+        snprintf(addr, sizeof(addr), "/con/%c/%s", g_osc.expect[i].fmt, g_osc.expect[i].path);
+        uint8_t pkt[128];
+        size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
+        if (n) osc_send_pkt(pkt, n);
+        g_osc.expect[i].retries_left--;
+        g_osc.expect[i].sent_ms = now;
+    }
+    return watchdog_failed;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -265,7 +344,16 @@ static void enqueue_get(const char *dotted, char fmt) {
     if (!pkt) return;
     size_t n = osc_build(pkt, 128, addr, NULL, NULL, 0);
     if (!n) { free(pkt); return; }
+    expect_register(dotted, fmt, 2, 0);
     outq_push(pkt, n);
+}
+
+// Send directly via mongoose (bypasses outq -- used by expect_tick for
+// retries so the slot's clock matches when the bytes actually leave).
+static int osc_send_pkt(const uint8_t *bytes, size_t len) {
+    if (!g_osc.udp_conn || !g_osc.udp_open) return -1;
+    mg_send(g_osc.udp_conn, bytes, len);
+    return 0;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -290,6 +378,8 @@ static void handle_inbound(const char *addr, const char *types,
     if (strncmp(addr, "/con/n/", 7) == 0) { fmt = 'n'; dotted = addr + 7; }
     else if (strncmp(addr, "/con/v/", 7) == 0) { fmt = 'v'; dotted = addr + 7; }
     else return;
+
+    expect_match(dotted);
 
     int id = -1;
     const char *suf = parse_ch_path(dotted, &id);
@@ -411,6 +501,7 @@ static void udp_evt(struct mg_connection *c, int ev, void *ev_data) {
         g_osc.udp_conn = NULL;
         g_osc.primed   = false;
         g_osc.prime_idx = 0;
+        memset(g_osc.expect, 0, sizeof(g_osc.expect));
         notify_state_change(APP_MS_STATE_DISCONNECTED);
     }
 }
@@ -528,6 +619,34 @@ static int worker_thread(void *unused) {
 
         if (g_osc.udp_open && !g_osc.primed && g_osc.mix_count > 0) {
             prime_step();
+        }
+
+        // Watchdog probe + expectation sweep mirror the firmware path
+        // exactly so any breakage in the retry/timeout logic surfaces in
+        // the sim too.
+        if (g_osc.udp_open && g_osc.primed &&
+            now - g_osc.last_watchdog_ms > OSC_WATCHDOG_INTERVAL_MS) {
+            g_osc.last_watchdog_ms = now;
+            int probe_id = (app_state_count() > 0) ? app_state_id_for_idx(0) : 0;
+            if (probe_id < 0) probe_id = 0;
+            char path[OSC_EXPECT_PATH_MAX];
+            snprintf(path, sizeof(path), "ch.%d.cfg.name", probe_id);
+            if (expect_register(path, 'n', OSC_WATCHDOG_RETRIES, OSC_EXPECT_FLAG_WATCHDOG)) {
+                char addr[80];
+                snprintf(addr, sizeof(addr), "/con/n/%s", path);
+                uint8_t pkt[128];
+                size_t n = osc_build(pkt, sizeof(pkt), addr, NULL, NULL, 0);
+                if (n) osc_send_pkt(pkt, n);
+            }
+        }
+        if (now - g_osc.last_expect_tick_ms > 250) {
+            g_osc.last_expect_tick_ms = now;
+            int wd_failed = expect_tick();
+            if (wd_failed > 0 && g_osc.udp_open) {
+                printf("ms_real_osc: watchdog %d fail(s) -- forcing reconnect\n", wd_failed);
+                fflush(stdout);
+                if (g_osc.udp_conn) g_osc.udp_conn->is_closing = 1;
+            }
         }
 
         if (!g_osc.udp_conn) {
