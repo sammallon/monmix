@@ -1136,8 +1136,16 @@ static void osc_set_meter_enabled(bool on)               { (void)on; /* TODO */ 
 static void osc_set_level_format(app_level_format_t f) {
     if (g.level_format == f) return;
     g.level_format = f;
-    // No re-subscribe needed: server pushes both /con/n and /con/v aliases
-    // for every change; handle_inbound filters to the active format.
+    // Heartbeat-subscribe only delivers values on CHANGE -- channels that
+    // haven't moved since boot never land a /con/v (or /con/n) broadcast.
+    // handle_inbound also filters by active format, so the inbound stream
+    // we DO have is now wrong-format and gets discarded. Re-prime so the
+    // worker fetches every tracked channel's lvl in the new format.
+    // Cheap (~30 paths, ~750 ms paced), and harmless if MS happens to
+    // also push the same values via change broadcasts in the meantime.
+    g.primed   = false;
+    g.prime_idx = 0;
+    osc_expect_clear(&g.expect);
 }
 
 static const ms_client_iface_t s_iface = {

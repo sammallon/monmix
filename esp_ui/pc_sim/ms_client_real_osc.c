@@ -726,7 +726,13 @@ static void m_set_meter_enabled(bool on)           { (void)on; }
 static void m_set_level_format(app_level_format_t f) {
     if (g_osc.level_fmt == f) return;
     g_osc.level_fmt = f;
-    // No re-subscribe needed -- handle_inbound filters by active format.
+    // Heartbeat-subscribe doesn't deliver values for unchanged channels
+    // in the new format. Re-prime so every tracked lvl gets fetched in
+    // /con/v (DB) or /con/n (NORM) per the new pref. Mirrors the
+    // firmware fix in app_ms_client_osc.c::osc_set_level_format.
+    g_osc.primed   = false;
+    g_osc.prime_idx = 0;
+    osc_expect_clear(&g_osc.expect);
 }
 
 static const ms_client_iface_t s_iface = {
