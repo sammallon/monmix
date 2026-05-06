@@ -135,6 +135,97 @@ otherwise b64-streaming a coredump takes 140s).
   `MINIZ_NO_MALLOC`, so the canned `tdefl_compress_mem_to_mem` path
   doesn't work).
 
+## PC simulator + test framework
+
+Two large additions landed in the 2026-05-05 session that change the
+shape of the dev loop. **Use them — they're the fastest path to a
+repro for any UI / protocol / state-management bug.**
+
+### `pc_sim/` — native build of the fader UI
+
+A standalone CMake project (NOT part of the IDF build; invisible to
+`idf.py`) that compiles `main/app_ui.c`, `main/app_state.c`, and
+`main/app_prefs.c` for native execution against LVGL+SDL2. The same
+code path the tablet runs, with mocks for the ESP-IDF surface and a
+real mongoose-based MS client for live-network testing.
+
+```powershell
+# Windows: builds with MSVC, runs in an SDL window.
+S:\playground\monmix\esp_ui\pc_sim\build.ps1
+# Linux/WSL: gcc + SDL2 dev pkg + WSLg.
+bash S:\playground\monmix\esp_ui\pc_sim\build.sh
+```
+
+Run modes:
+- default: SDL window, mouse acts as touch
+- `--ms-host H --ms-port P`: real MS connection (mongoose WS+HTTP)
+- `--script PATH`: scripted commands (tap/sleep/screenshot/quit)
+- `--headless`: hides the SDL window for CI runs
+- `--throttle`: single-core affinity + 33 ms frame cap to feel like
+  the tablet (catches timing-related races that don't show otherwise)
+
+When NOT to reach for the sim:
+- C6/SDIO bugs (no co-processor in sim)
+- Anything timing-sensitive at the SDIO layer
+- Display-driver-specific issues (PPA, DMA2D, EK79007 quirks)
+
+When the sim is the right call:
+- LVGL widget bugs, rendering glitches
+- App state transitions, dirty-flag sweep behaviour
+- MS protocol shape (subscribe/SET/broadcast routing)
+- Pref reconcile / NVS / SD-mirror logic
+- Anything tappable
+
+Detailed architecture in memory `reference_pc_sim`.
+
+### `tests/` — three lanes
+
+```
+tests/sim/    scripted .test.py files run against pc_sim/monmix_sim.exe
+tests/unit/   native C tests of pure-logic modules (dB taper, etc)
+tests/hw/     same .test.py files as sim/, translated to UART REPL
+              grammar and run against the tablet for sim/hw parity
+```
+
+Run the suite:
+```powershell
+# Sim (live-MS tests skip themselves if MONMIX_MS_HOST unset)
+$env:MONMIX_MS_HOST = '192.168.76.186'
+$env:MONMIX_MS_PORT = '8102'
+python tests/sim/run.py
+
+# Unit tests
+.\tests\unit\run.ps1
+
+# Hardware (needs IDF venv on PATH for pyserial)
+. 'C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1' *> $null
+$env:MONMIX_HW_PORT = 'COM3'
+python tests/hw/run.py
+```
+
+Adding a test: drop a `test_<name>.py` in `tests/sim/` with a `TEST`
+dict (`name`, `script`, `expect`, optional `phases`/`hw_compatible`/
+`hw_expect`/`skip_if`). The runner discovers it. See existing tests
+for the format. Detailed reference in memory `reference_test_framework`.
+
+### Soak testing
+
+`tools/soak.py` drives bidirectional traffic against the tablet for
+hours: HOST→MS REST writes, DEVICE→MS touch injections, periodic
+screenshots, console-driven pref toggles (level-format / signal-
+indicator / theme), settings overlay open/close cycles. Run with
+`python -u` so progress prints actually flush:
+
+```powershell
+. 'C:\Espressif\tools\Microsoft.v6.0.1.PowerShell_profile.ps1' *> $null
+python -u tools/soak.py COM3 192.168.76.186 --hours 0.5
+```
+
+Each scripted pref toggle exercises code paths a normal soak misses
+(observer chains, theme apply, resubscribe). The soak surfaced two
+pre-existing bugs in the 2026-05-05 session — see memory
+`project_soak_findings_2026_05_05`.
+
 ## Coding conventions
 
 - Tone of code comments mirrors the user's voice: terse, focused on
