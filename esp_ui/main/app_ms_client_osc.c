@@ -704,8 +704,13 @@ static err_t udp_send_bytes(const uint8_t *bytes, size_t len) {
 
 static void send_heartbeat(void) {
     if (!g.pcb_open) return;
+    // The trailing char selects the broadcast flavor MS will push at us:
+    // /hi/n -> /con/n broadcasts, /hi/v -> /con/v. handle_inbound filters
+    // by active level_format and would discard the wrong-flavor stream;
+    // the tablet must subscribe in the same flavor it expects to receive.
+    const char *path = (g.level_format == APP_LEVEL_FORMAT_DB) ? "/hi/v" : "/hi/n";
     uint8_t pkt[16];
-    size_t n = osc_build(pkt, sizeof(pkt), "/hi/n", NULL, NULL, 0);
+    size_t n = osc_build(pkt, sizeof(pkt), path, NULL, NULL, 0);
     if (n) {
         err_t e = udp_send_bytes(pkt, n);
         if (e != ERR_OK) ESP_LOGW(TAG, "heartbeat send err=%d", e);
@@ -1146,6 +1151,12 @@ static void osc_set_level_format(app_level_format_t f) {
     g.primed   = false;
     g.prime_idx = 0;
     osc_expect_clear(&g.expect);
+    // Force a fresh heartbeat in the new flavor on the next poll
+    // iteration so MS switches its broadcast format right away. Without
+    // this, we'd wait up to HEARTBEAT_MS for MS to flip to /con/v
+    // broadcasts, leaving the UI seeing nothing for a few seconds while
+    // discarding the stale-flavor stream.
+    g.last_heartbeat_ms = 0;
 }
 
 static const ms_client_iface_t s_iface = {

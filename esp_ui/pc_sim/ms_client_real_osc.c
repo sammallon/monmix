@@ -471,8 +471,12 @@ static void udp_evt(struct mg_connection *c, int ev, void *ev_data) {
 
 static void send_heartbeat(void) {
     if (!g_osc.udp_conn) return;
+    // Heartbeat flavor must match what the inbound dispatcher expects.
+    // /hi/n -> MS broadcasts /con/n, /hi/v -> /con/v. handle_inbound
+    // filters by active level_format and discards the wrong flavor.
+    const char *path = (g_osc.level_fmt == APP_LEVEL_FORMAT_DB) ? "/hi/v" : "/hi/n";
     uint8_t pkt[16];
-    size_t n = osc_build(pkt, sizeof(pkt), "/hi/n", NULL, NULL, 0);
+    size_t n = osc_build(pkt, sizeof(pkt), path, NULL, NULL, 0);
     if (n) mg_send(g_osc.udp_conn, pkt, n);
 }
 
@@ -733,6 +737,9 @@ static void m_set_level_format(app_level_format_t f) {
     g_osc.primed   = false;
     g_osc.prime_idx = 0;
     osc_expect_clear(&g_osc.expect);
+    // Force a fresh heartbeat in the new flavor next poll so MS flips
+    // its broadcast format immediately.
+    g_osc.last_heartbeat_ms = 0;
 }
 
 static const ms_client_iface_t s_iface = {
