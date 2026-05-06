@@ -16,6 +16,8 @@ static const char *TAG = "app_config";
 #define NVS_KEY_WIFI_PASS "wifi_pass"
 #define NVS_KEY_MS_HOST   "ms_host"
 #define NVS_KEY_MS_PORT   "ms_port"
+#define NVS_KEY_MS_PROTO  "ms_proto"
+#define NVS_KEY_MS_OSCP   "ms_oscp"
 #define NVS_KEY_WIFI_SAVED "wifi_saved"
 
 // 12 channels covers a typical stage spread (lead vox + 4 mics + drums + DIs)
@@ -27,10 +29,12 @@ static const int s_default_ids[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
 static int    s_ids[APP_CONFIG_MAX_CHANNELS];
 static size_t s_count;
 
-static char     s_wifi_ssid[APP_CONFIG_SSID_MAX];
-static char     s_wifi_pass[APP_CONFIG_PASS_MAX];
-static char     s_ms_host[APP_CONFIG_HOST_MAX];
-static uint16_t s_ms_port;
+static char              s_wifi_ssid[APP_CONFIG_SSID_MAX];
+static char              s_wifi_pass[APP_CONFIG_PASS_MAX];
+static char              s_ms_host[APP_CONFIG_HOST_MAX];
+static uint16_t          s_ms_port;
+static app_ms_protocol_t s_ms_proto;
+static uint16_t          s_ms_osc_port;
 
 // Saved-networks ring. Stored as a single blob in NVS: tightly packed
 // fixed-size records, count = blob_len / sizeof(record). Index 0 is the
@@ -194,10 +198,16 @@ void app_config_init(void)
         ESP_LOGI(TAG, "seeded NVS with %u default channels", (unsigned)s_count);
     }
 
-    load_str(NVS_KEY_WIFI_SSID, s_wifi_ssid, sizeof(s_wifi_ssid), APP_WIFI_SSID);
-    load_str(NVS_KEY_WIFI_PASS, s_wifi_pass, sizeof(s_wifi_pass), APP_WIFI_PASSWORD);
-    load_str(NVS_KEY_MS_HOST,   s_ms_host,   sizeof(s_ms_host),   APP_MS_HOST);
-    load_u16(NVS_KEY_MS_PORT,   &s_ms_port,  APP_MS_PORT);
+    load_str(NVS_KEY_WIFI_SSID, s_wifi_ssid,    sizeof(s_wifi_ssid), APP_WIFI_SSID);
+    load_str(NVS_KEY_WIFI_PASS, s_wifi_pass,    sizeof(s_wifi_pass), APP_WIFI_PASSWORD);
+    load_str(NVS_KEY_MS_HOST,   s_ms_host,      sizeof(s_ms_host),   APP_MS_HOST);
+    load_u16(NVS_KEY_MS_PORT,   &s_ms_port,     APP_MS_PORT);
+    load_u16(NVS_KEY_MS_OSCP,   &s_ms_osc_port, APP_MS_OSC_PORT);
+    uint16_t proto_raw = (uint16_t)APP_MS_PROTOCOL;
+    load_u16(NVS_KEY_MS_PROTO,  &proto_raw,     (uint16_t)APP_MS_PROTOCOL);
+    s_ms_proto = (proto_raw == (uint16_t)APP_MS_PROTOCOL_OSC)
+                     ? APP_MS_PROTOCOL_OSC
+                     : APP_MS_PROTOCOL_WS;
     load_saved_networks();
     // First-run seeding: if the saved-networks list is empty but we have a
     // current SSID, drop it in. Stops the user from having to "save once to
@@ -207,8 +217,10 @@ void app_config_init(void)
     }
     // Don't log the password. Don't log the SSID either -- not strictly
     // sensitive but unnecessary to leak to UART/SD on every boot.
-    ESP_LOGI(TAG, "wifi+ms config loaded (ms=%s:%u, %u saved net(s))",
-             s_ms_host, s_ms_port, (unsigned) s_saved_count);
+    ESP_LOGI(TAG, "wifi+ms config loaded (ms=%s:%u proto=%s osc_port=%u, %u saved net(s))",
+             s_ms_host, s_ms_port,
+             s_ms_proto == APP_MS_PROTOCOL_OSC ? "osc" : "ws",
+             s_ms_osc_port, (unsigned) s_saved_count);
 }
 
 const int *app_config_channel_ids(size_t *out_count)
@@ -234,10 +246,12 @@ bool app_config_set_channel_ids(const int *ids, size_t count)
     return true;
 }
 
-const char *app_config_wifi_ssid(void) { return s_wifi_ssid; }
-const char *app_config_wifi_pass(void) { return s_wifi_pass; }
-const char *app_config_ms_host(void)   { return s_ms_host; }
-uint16_t    app_config_ms_port(void)   { return s_ms_port; }
+const char        *app_config_wifi_ssid(void)   { return s_wifi_ssid; }
+const char        *app_config_wifi_pass(void)   { return s_wifi_pass; }
+const char        *app_config_ms_host(void)     { return s_ms_host; }
+uint16_t           app_config_ms_port(void)     { return s_ms_port; }
+app_ms_protocol_t  app_config_ms_protocol(void) { return s_ms_proto; }
+uint16_t           app_config_ms_osc_port(void) { return s_ms_osc_port; }
 
 bool app_config_set_wifi_ssid(const char *ssid)
 {
@@ -353,5 +367,21 @@ bool app_config_wifi_saved_lookup(const char *ssid,
     if (!pass_out || pass_size == 0) return false;
     strncpy(pass_out, s_saved[idx].pass, pass_size - 1);
     pass_out[pass_size - 1] = '\0';
+    return true;
+}
+
+bool app_config_set_ms_protocol(app_ms_protocol_t proto)
+{
+    if (proto != APP_MS_PROTOCOL_WS && proto != APP_MS_PROTOCOL_OSC) return false;
+    if (!save_u16(NVS_KEY_MS_PROTO, (uint16_t)proto)) return false;
+    s_ms_proto = proto;
+    return true;
+}
+
+bool app_config_set_ms_osc_port(uint16_t port)
+{
+    if (port == 0) return false;
+    if (!save_u16(NVS_KEY_MS_OSCP, port)) return false;
+    s_ms_osc_port = port;
     return true;
 }

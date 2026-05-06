@@ -15,6 +15,16 @@
 #define APP_CONFIG_PASS_MAX 65
 #define APP_CONFIG_HOST_MAX 64
 
+// Mixing Station backend protocol. WS speaks the JSON-over-WS pipe at
+// ms_port; OSC speaks UDP /con/[vn]/<path> at ms_osc_port and uses the
+// same ms_host:ms_port for boot-time REST fetches (info / offline-attach
+// / strip names). Switching protocols requires a reboot — the active
+// client is chosen statically at startup.
+typedef enum {
+    APP_MS_PROTOCOL_WS  = 0,
+    APP_MS_PROTOCOL_OSC = 1,
+} app_ms_protocol_t;
+
 // Load all persisted config (channel list + wifi/ms creds) from NVS, seeding
 // from secrets.h compile-time defaults on first boot. Always succeeds in
 // memory even if NVS itself fails (in-memory defaults).
@@ -37,15 +47,19 @@ bool app_config_set_channel_ids(const int *ids, size_t count);
 // for triggering reconnect or reboot. Returning false means the new value
 // was rejected (too long) or NVS write failed; the in-memory value is
 // unchanged in either case.
-const char *app_config_wifi_ssid(void);
-const char *app_config_wifi_pass(void);
-const char *app_config_ms_host(void);
-uint16_t    app_config_ms_port(void);
+const char        *app_config_wifi_ssid(void);
+const char        *app_config_wifi_pass(void);
+const char        *app_config_ms_host(void);
+uint16_t           app_config_ms_port(void);
+app_ms_protocol_t  app_config_ms_protocol(void);
+uint16_t           app_config_ms_osc_port(void);
 
 bool app_config_set_wifi_ssid(const char *ssid);
 bool app_config_set_wifi_pass(const char *pass);
 bool app_config_set_ms_host(const char *host);
 bool app_config_set_ms_port(uint16_t port);
+bool app_config_set_ms_protocol(app_ms_protocol_t proto);
+bool app_config_set_ms_osc_port(uint16_t port);
 
 // Saved-networks ring. Holds up to APP_CONFIG_SAVED_NETWORKS_MAX (SSID,
 // password) pairs in NVS so a venue change doesn't force the user to retype

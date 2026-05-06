@@ -181,3 +181,4 @@ typedef struct {
 } ms_client_iface_t;
 
 const ms_client_iface_t *app_ms_client_ws(void);
+const ms_client_iface_t *app_ms_client_osc(void);

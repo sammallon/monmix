@@ -205,7 +205,15 @@ void app_main(void)
     // after app_display_init brings up LVGL.
     app_touch_inject_init();
 
-    const ms_client_iface_t *ms = app_ms_client_ws();
+    // Static at-startup pick. Switching protocols at runtime would mean
+    // tearing down + swapping the global s_ms reference inside app_ui.c,
+    // which the rest of the firmware (state observers, console commands,
+    // pending-set tracking) doesn't currently treat as live-replaceable.
+    // The settings panel persists the new choice and reboots instead.
+    const ms_client_iface_t *ms =
+        (app_config_ms_protocol() == APP_MS_PROTOCOL_OSC)
+            ? app_ms_client_osc()
+            : app_ms_client_ws();
     app_ui_init(ms);
     app_ui_set_status("Connecting WiFi...");
 
