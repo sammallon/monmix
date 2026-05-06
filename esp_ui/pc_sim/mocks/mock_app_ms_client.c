@@ -108,4 +108,8 @@ static const ms_client_iface_t s_iface = {
     .is_console_attached         = NULL,
 };
 
-const ms_client_iface_t *app_ms_client_ws(void) { return &s_iface; }
+const ms_client_iface_t *app_ms_client_ws(void)  { return &s_iface; }
+// Both backends share the mock: sim's "no --ms-host" path still needs the
+// app_ms_client_osc symbol if the user toggled the protocol pref. Tablet
+// firmware overrides this with the real OSC implementation.
+const ms_client_iface_t *app_ms_client_osc(void) { return &s_iface; }

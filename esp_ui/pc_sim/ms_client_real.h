@@ -8,4 +8,9 @@
 // free. Internally starts a worker thread running mongoose's event loop.
 const ms_client_iface_t *ms_client_real_create(const char *host, int port);
 
+// OSC variant: uses host:http_port for the boot REST fetch and
+// host:osc_port for the UDP/OSC pipe. Same iface; same worker-thread
+// model; mongoose UDP carries the wire.
+const ms_client_iface_t *ms_client_real_osc_create(const char *host, int http_port, int osc_port);
+
 #endif

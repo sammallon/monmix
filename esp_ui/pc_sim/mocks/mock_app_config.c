@@ -9,10 +9,12 @@
 #define DEFAULT_CHANNEL_COUNT 8
 static int      s_channel_ids[APP_CONFIG_MAX_CHANNELS] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 static size_t   s_channel_count = DEFAULT_CHANNEL_COUNT;
-static char     s_wifi_ssid[33] = "sim-wifi";
-static char     s_wifi_pass[65] = "sim-pass";
-static char     s_ms_host[64]   = "127.0.0.1";
-static uint16_t s_ms_port       = 9000;
+static char              s_wifi_ssid[33] = "sim-wifi";
+static char              s_wifi_pass[65] = "sim-pass";
+static char              s_ms_host[64]   = "127.0.0.1";
+static uint16_t          s_ms_port       = 9000;
+static app_ms_protocol_t s_ms_proto      = APP_MS_PROTOCOL_WS;
+static uint16_t          s_ms_osc_port   = 3000;
 
 void app_config_init(void) {}
 
@@ -28,15 +30,24 @@ bool app_config_set_channel_ids(const int *ids, size_t count) {
     return true;
 }
 
-const char *app_config_wifi_ssid(void) { return s_wifi_ssid; }
-const char *app_config_wifi_pass(void) { return s_wifi_pass; }
-const char *app_config_ms_host (void) { return s_ms_host;   }
-uint16_t    app_config_ms_port (void) { return s_ms_port;   }
+const char        *app_config_wifi_ssid (void) { return s_wifi_ssid; }
+const char        *app_config_wifi_pass (void) { return s_wifi_pass; }
+const char        *app_config_ms_host   (void) { return s_ms_host;   }
+uint16_t           app_config_ms_port   (void) { return s_ms_port;   }
+app_ms_protocol_t  app_config_ms_protocol(void){ return s_ms_proto;  }
+uint16_t           app_config_ms_osc_port(void){ return s_ms_osc_port; }
 
 bool app_config_set_wifi_ssid(const char *s) { strncpy(s_wifi_ssid, s, 32); s_wifi_ssid[32] = 0; return true; }
 bool app_config_set_wifi_pass(const char *s) { strncpy(s_wifi_pass, s, 64); s_wifi_pass[64] = 0; return true; }
 bool app_config_set_ms_host  (const char *s) { strncpy(s_ms_host,   s, 63); s_ms_host[63]   = 0; return true; }
 bool app_config_set_ms_port  (uint16_t   p)  { s_ms_port = p; return true; }
+bool app_config_set_ms_protocol(app_ms_protocol_t p) { s_ms_proto = p; return true; }
+bool app_config_set_ms_osc_port(uint16_t p)  { s_ms_osc_port = p; return true; }
+
+// Sim-only seed: pc_main uses these to honor --protocol / --osc-port CLI
+// flags before app_ui_init reads them.
+void mock_app_config_seed_protocol(app_ms_protocol_t p) { s_ms_proto = p; }
+void mock_app_config_seed_osc_port(uint16_t p)          { s_ms_osc_port = p; }
 
 // In-memory mirror of the saved-networks ring -- enough for sim tests of
 // the wcfg picker UI to exercise the saved/scanned merge path without

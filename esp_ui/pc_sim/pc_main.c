@@ -252,6 +252,8 @@ int main(int argc, char **argv) {
     const char *script_path = NULL;
     const char *ms_host     = NULL;
     int         ms_port     = 8080;
+    int         ms_osc_port = 3000;
+    const char *protocol    = NULL;       // "ws" | "osc"; NULL -> follow app_config
     bool        do_throttle = false;
     bool        headless    = false;
     for (int i = 1; i < argc; ++i) {
@@ -261,6 +263,10 @@ int main(int argc, char **argv) {
             ms_host = argv[++i];
         } else if (!strcmp(argv[i], "--ms-port") && i + 1 < argc) {
             ms_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--osc-port") && i + 1 < argc) {
+            ms_osc_port = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--protocol") && i + 1 < argc) {
+            protocol = argv[++i];
         } else if (!strcmp(argv[i], "--throttle")) {
             do_throttle = true;
         } else if (!strcmp(argv[i], "--headless")) {
@@ -304,9 +310,29 @@ int main(int argc, char **argv) {
     app_state_master_set_id(60);
     app_state_master_set_name("Mix 1", false);
 
-    const ms_client_iface_t *ms = ms_host
-        ? ms_client_real_create(ms_host, ms_port)
-        : app_ms_client_ws();
+    // Pick the protocol. CLI --protocol wins; otherwise fall through to
+    // whatever app_config says (the settings panel may have persisted a
+    // prior choice into mock NVS).
+    bool use_osc = false;
+    if (protocol) {
+        use_osc = (strcmp(protocol, "osc") == 0);
+        // Mirror the firmware: persist via app_config so the settings
+        // panel reflects the active backend on first open.
+        extern void mock_app_config_seed_protocol(app_ms_protocol_t);
+        extern void mock_app_config_seed_osc_port(uint16_t);
+        mock_app_config_seed_protocol(use_osc ? APP_MS_PROTOCOL_OSC : APP_MS_PROTOCOL_WS);
+        mock_app_config_seed_osc_port((uint16_t)ms_osc_port);
+    } else {
+        use_osc = (app_config_ms_protocol() == APP_MS_PROTOCOL_OSC);
+    }
+
+    const ms_client_iface_t *ms;
+    if (ms_host) {
+        ms = use_osc ? ms_client_real_osc_create(ms_host, ms_port, ms_osc_port)
+                     : ms_client_real_create(ms_host, ms_port);
+    } else {
+        ms = use_osc ? app_ms_client_osc() : app_ms_client_ws();
+    }
     g_ms = ms;
     app_ui_init(ms);
     app_ui_set_channel_total(80);

@@ -140,6 +140,7 @@ set(MOCK_SRC
 
 set(SIM_SRC
     ms_client_real.c
+    ms_client_real_osc.c
     throttle.c
     ${MONGOOSE_DIR}/mongoose.c
     ${CJSON_DIR}/cJSON.c
