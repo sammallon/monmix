@@ -232,9 +232,17 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
             printf("OK set_format %s\n", text);
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
-            // Drive the mix-change path the same way the picker does
-            // (via ms->set_mix). Used by the unsubscribe regression test.
+            // Drive the mix-change path the same way the picker does:
+            // ms->set_mix() updates the active subscription, AND
+            // app_prefs_set_selected_mix_index persists the choice so
+            // a subsequent boot restores it (try_apply_ms_info path).
+            // Both pieces are part of the on_mix_picker_btn_clicked
+            // flow on the device; mirroring them here lets a script
+            // exercise either path without faking touch coords.
             if (g_ms && g_ms->set_mix) g_ms->set_mix(x);
+            if (x >= 0 && x <= 255) {
+                app_prefs_set_selected_mix_index((uint8_t) x);
+            }
             printf("OK set_mix %d\n", x);
         } else if (strcmp(cmd, "quit") == 0) {
             printf("OK quit\n");
