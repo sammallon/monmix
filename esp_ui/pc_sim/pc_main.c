@@ -258,6 +258,16 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_ui_chpick_apply(ids, (size_t) n);
             lvgl_port_unlock();
             printf("OK chpick_save n=%d\n", n);
+        } else if (strcmp(cmd, "dump_tiles") == 0) {
+            // Emits one settings_tile line per channel grid cell. The
+            // settings overlay must be open already (gear-icon tap then
+            // sleep). Holds lvgl_port_lock for the dump itself even
+            // though the read is just lv_obj_get_x — keep the discipline
+            // consistent with the rest of the script-driven hooks.
+            lvgl_port_lock(0);
+            app_ui_settings_dump_tiles();
+            lvgl_port_unlock();
+            printf("OK dump_tiles\n");
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
             // Drive the mix-change path the same way the picker does:
             // ms->set_mix() updates the active subscription, AND

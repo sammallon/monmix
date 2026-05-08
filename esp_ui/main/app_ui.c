@@ -2412,10 +2412,12 @@ static void build_settings_overlay(void)
     // Section: Channels — 4 columns x 6 rows. The bottom-right slot is
     // permanently the master strip's tile (always reachable regardless
     // of how many input channels are tracked). The remaining 23 slots
-    // fill row-major from top-left with channel tiles. Tile geometry is
-    // a bit taller than before so name + swatch breathe in the larger
-    // cell; LV_LABEL_LONG_DOT truncates with "..." when the name doesn't
-    // fit.
+    // hold channel tiles. Tile geometry is a bit taller than before so
+    // name + swatch breathe in the larger cell; LV_LABEL_LONG_DOT
+    // truncates with "..." when the name doesn't fit.
+    //
+    // Column-major iteration: fill column 0 top-to-bottom, then column 1,
+    // then column 2. Reads more naturally for a list of channel slots.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 272);
@@ -2459,8 +2461,8 @@ static void build_settings_overlay(void)
     if (total > MAX_TILES) total = MAX_TILES;
 
     for (size_t i = 0; i < total; ++i) {
-        int col = (int)(i % grid_cols);
-        int row = (int)(i / grid_cols);
+        int col = (int)(i / grid_rows);
+        int row = (int)(i % grid_rows);
         int x = col * (tile_w + col_gap);
         int y = row * (tile_h + row_gap);
 
@@ -2481,7 +2483,7 @@ static void build_settings_overlay(void)
         lv_label_set_text(name, name_text);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name, tile_w - swatch_sz - 24);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, swatch_sz + 8, 0);
         // Drag-to-reorder lives on the name label (LVGL 9 only fires
         // LONG_PRESSED on CLICKABLE objects; lv_obj_create-style
         // containers don't get the event without explicit flag-add,
@@ -2504,7 +2506,7 @@ static void build_settings_overlay(void)
 
         lv_obj_t *swatch = lv_obj_create(tile);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
-        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(swatch, LV_ALIGN_LEFT_MID, 0, 0);
         lv_obj_set_style_radius(swatch, 4, 0);
         lv_obj_set_style_border_width(swatch, 1, 0);
         lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
@@ -2537,7 +2539,7 @@ static void build_settings_overlay(void)
         lv_obj_t *name = lv_label_create(tile);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name, tile_w - swatch_sz - 24);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, swatch_sz + 8, 0);
         lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
                             (void *)(uintptr_t) UI_TARGET_MASTER);
@@ -2547,7 +2549,7 @@ static void build_settings_overlay(void)
 
         lv_obj_t *swatch = lv_obj_create(tile);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
-        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(swatch, LV_ALIGN_LEFT_MID, 0, 0);
         lv_obj_set_style_radius(swatch, 4, 0);
         lv_obj_set_style_border_width(swatch, 1, 0);
         lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
@@ -5053,6 +5055,28 @@ void app_ui_chpick_apply(const int *ids, size_t count)
         return;
     }
     chpick_apply_async(NULL);
+}
+
+// Dump tile coordinates for the settings-overlay channel grid. Used by
+// the sim's settings-grid regression test to assert column-major fill
+// (tile y increases for adjacent indices within a column) and swatch-
+// on-left placement (swatch_x < name_x in every tile).
+void app_ui_settings_dump_tiles(void)
+{
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        lv_obj_t *tile = s_row_tile_objs[i];
+        if (!tile) continue;
+        lv_obj_t *name   = s_row_name_labels[i];
+        lv_obj_t *swatch = s_color_swatches[i];
+        int tx = (int) lv_obj_get_x(tile);
+        int ty = (int) lv_obj_get_y(tile);
+        int nx = name   ? (int) lv_obj_get_x(name)   : -1;
+        int sx = swatch ? (int) lv_obj_get_x(swatch) : -1;
+        printf("settings_tile i=%zu x=%d y=%d name_x=%d swatch_x=%d\n",
+               i, tx, ty, nx, sx);
+    }
+    fflush(stdout);
 }
 
 static void on_chpick_save_yes(lv_event_t *e)
