@@ -293,9 +293,10 @@ static bool      s_ssid_list_retried_empty;  // already retried once on empty
 // Channel picker overlay (entry: Settings -> Edit Channels...).
 // Shows every channel on the connected console as a row with a checkbox;
 // user picks up to APP_UI_MAX_TRACKED_CHANNELS to track on faders. Save
-// persists to NVS via app_config_set_channel_ids and reboots; the rebuild
-// path under live broadcast traffic is a known race (see esp_ui_main.c
-// safe_max comment), so reboot is the simpler shape.
+// persists to NVS via app_config_set_channel_ids and rebuilds the fader
+// UI live: ms->stop joins the worker, app_state_init reseeds against the
+// new ids, app_ui_present_channels rebuilds the strips, ms->start
+// re-subscribes for the new set. No reboot.
 static int       s_total_channels;        // totalChannels from /console/information
 static lv_obj_t *s_chpick_overlay;
 static lv_obj_t *s_chpick_list;
@@ -402,6 +403,10 @@ static lv_obj_t *s_reboot_confirm;
 // to miss in the pre-reset window before the panel goes black.
 static lv_obj_t *s_rebooting_overlay;
 static void show_rebooting_overlay(void);
+// Channel-picker live-apply overlay (different label than rebooting).
+static lv_obj_t *s_applying_overlay;
+static void show_applying_overlay(void);
+static void hide_applying_overlay(void);
 static void wifi_panel_open(void);
 static void wifi_panel_close(void);
 static void wifi_panel_refresh(void);
@@ -2524,6 +2529,46 @@ static void show_rebooting_overlay(void)
     lv_refr_now(NULL);
 }
 
+// Applying overlay -- like the rebooting one but with different label
+// text so the user doesn't think the device is restarting. Shown by the
+// channel-picker save path while chpick_apply_async runs.
+static void show_applying_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    if (!s_applying_overlay) {
+        lv_obj_t *ov = lv_obj_create(scr);
+        lv_obj_set_size(ov, lv_obj_get_width(scr), lv_obj_get_height(scr));
+        lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ov, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ov, 0, 0);
+        lv_obj_set_style_radius(ov, 0, 0);
+        lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *spinner = lv_spinner_create(ov);
+        lv_obj_set_size(spinner, 80, 80);
+        lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -30);
+
+        lv_obj_t *lbl = lv_label_create(ov);
+        lv_label_set_text(lbl, "Applying...");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align_to(lbl, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+        s_applying_overlay = ov;
+    } else {
+        lv_obj_remove_flag(s_applying_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(s_applying_overlay);
+    lv_refr_now(NULL);
+}
+
+static void hide_applying_overlay(void)
+{
+    if (s_applying_overlay) {
+        lv_obj_add_flag(s_applying_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void on_reboot_no(lv_event_t *e)
 {
     (void) e;
@@ -4412,11 +4457,46 @@ static void build_chpick_discard_confirm(void)
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Save-confirm popup. Save applies via reboot (the rebuild-while-live
-// path has a known race -- see esp_ui_main.c safe_max comment), and
-// users would be surprised by a chip reset they didn't agree to. So
-// Save shows this confirm first.
+// Save-confirm popup. Save rebuilds the fader UI live (see
+// chpick_apply_async); the confirm exists because the rebuild visibly
+// recomposes the screen and we want a deliberate second tap.
 static lv_obj_t *s_chpick_save_confirm;
+
+// Run on the LVGL task (lv_async_call) so the actual stop+rebuild
+// happens between event dispatches -- mirrors reorder_persist_and_rebuild.
+// app_ui_present_channels destroys the very widgets a save-button event
+// dispatch would unwind through if we did this inline.
+static void chpick_apply_async(void *unused)
+{
+    (void) unused;
+
+    // Stop the worker so subscribe state for the old id set is dropped
+    // cleanly. ws_stop / osc_stop now join the worker before returning;
+    // adding the join was the prerequisite for this path.
+    if (s_ms && s_ms->stop) s_ms->stop();
+
+    // Reseed app_state against the freshly-persisted id list. NVS is
+    // authoritative here: app_config_set_channel_ids ran in on_chpick_save_yes
+    // before we queued this async, so app_config_channel_ids returns the
+    // new set.
+    size_t n = 0;
+    const int *ids = app_config_channel_ids(&n);
+    app_state_init(ids, n);
+
+    // Rebuild faders. present_channels is idempotent on re-call: it
+    // lv_obj_cleans the tileview and recreates strips against the new
+    // app_state. Master strip is built once and survives the clean.
+    app_ui_present_channels();
+
+    // Start the worker again. The on-connect handler in subscribe_all
+    // reads fresh app_state_count() so the new id set is what gets
+    // subscribed. The strip-name cache primed at boot covers any newly
+    // added ids without an extra fetch.
+    if (s_ms && s_ms->start) s_ms->start();
+
+    hide_applying_overlay();
+    chpick_close();
+}
 
 static void on_chpick_save_yes(lv_event_t *e)
 {
@@ -4435,9 +4515,12 @@ static void on_chpick_save_yes(lv_event_t *e)
                           "#FF6060 Save failed (NVS error).#");
         return;
     }
-    show_rebooting_overlay();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    if (s_chpick_save_confirm) lv_obj_add_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
+    show_applying_overlay();
+    // Defer until after this event finishes dispatching -- the picker
+    // overlay (which owns the Save button we're inside) gets destroyed
+    // by chpick_close inside chpick_apply_async.
+    lv_async_call(chpick_apply_async, NULL);
 }
 
 static void on_chpick_save_no(lv_event_t *e)
@@ -4460,7 +4543,7 @@ static void build_chpick_save_confirm(void)
 
     lv_obj_t *msg = lv_label_create(p);
     lv_label_set_text(msg,
-                      "Save selection and restart the device?\n"
+                      "Save selection?\n"
                       "The fader UI will rebuild against the new channels.");
     lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -4477,7 +4560,7 @@ static void build_chpick_save_confirm(void)
     lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
     lv_obj_t *yl = lv_label_create(yes);
-    lv_label_set_text(yl, LV_SYMBOL_OK " Save & Restart");
+    lv_label_set_text(yl, LV_SYMBOL_OK " Save");
     lv_obj_center(yl);
     lv_obj_add_event_cb(yes, on_chpick_save_yes, LV_EVENT_CLICKED, NULL);
 
