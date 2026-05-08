@@ -86,8 +86,12 @@ TEST = {
         f"mcfg_apply {BACK_HOST} {BACK_PORT}\n"
         # Long settle: WS has to reconnect, /console/information GET has
         # to land, fetch_all_strip_names has to repopulate the cache, and
-        # the on-state-change observer has to repaint the strips.
-        "sleep 5000\n"
+        # the on-state-change observer has to repaint the strips. On
+        # hardware the regression marker is the heartbeat task's
+        # "console_attached false -> true" log; HEARTBEAT_INTERVAL_MS is
+        # 5000 so we need >= one full cycle plus the /app/state HTTP
+        # round trip plus phase slack. 10000 covers the worst case.
+        "sleep 10000\n"
         "echo POST_BACK\n"
         "quit\n"
     ),
