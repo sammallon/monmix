@@ -4466,16 +4466,24 @@ static lv_obj_t *s_chpick_save_confirm;
 // happens between event dispatches -- mirrors reorder_persist_and_rebuild.
 // app_ui_present_channels destroys the very widgets a save-button event
 // dispatch would unwind through if we did this inline.
+//
+// Deadlock note: ms->stop joins the worker thread, and the worker
+// thread acquires lvgl_port_lock from on_state_change to schedule
+// async sweeps. We're called with lvgl_port_lock held (lv_timer_handler
+// runs under it), so we MUST drop the lock across stop/start or the
+// worker will hang waiting for it while we're hung waiting for the
+// worker. Symptom is a stuck UI on Save against a busy console.
 static void chpick_apply_async(void *unused)
 {
     (void) unused;
     size_t before = app_state_count();
     ESP_LOGI(TAG, "chpick: live-apply start (current=%u)", (unsigned) before);
 
-    // Stop the worker so subscribe state for the old id set is dropped
-    // cleanly. ws_stop / osc_stop now join the worker before returning;
-    // adding the join was the prerequisite for this path.
+    // Drop lvgl_port_lock for the join. Worker may be mid-broadcast
+    // routing -> on_state_change -> lvgl_port_lock; deadlocks otherwise.
+    lvgl_port_unlock();
     if (s_ms && s_ms->stop) s_ms->stop();
+    lvgl_port_lock(0);
 
     // Reseed app_state against the freshly-persisted id list. NVS is
     // authoritative here: app_config_set_channel_ids ran in on_chpick_save_yes
@@ -4493,8 +4501,12 @@ static void chpick_apply_async(void *unused)
     // Start the worker again. The on-connect handler in subscribe_all
     // reads fresh app_state_count() so the new id set is what gets
     // subscribed. The strip-name cache primed at boot covers any newly
-    // added ids without an extra fetch.
+    // added ids without an extra fetch. Lock release isn't strictly
+    // needed here -- start() returns immediately after spawning the
+    // worker -- but keeps the symmetry with stop().
+    lvgl_port_unlock();
     if (s_ms && s_ms->start) s_ms->start();
+    lvgl_port_lock(0);
 
     ESP_LOGI(TAG, "chpick: live-apply done (now=%u)", (unsigned) app_state_count());
     hide_applying_overlay();
