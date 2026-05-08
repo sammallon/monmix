@@ -178,7 +178,24 @@ typedef struct {
     // alongside `lvl`, see repro_ms_subscribe_format.py). Idempotent;
     // called on every level-format pref change.
     void (*set_level_format)(app_level_format_t f);
+
+    // Send /console/data/unsubscribe for every active subscription, then
+    // close the WS with a proper close frame (1000 NORMAL). Blocks up to
+    // ~500 ms for the close ACK. Safe to call when not connected (no-op).
+    // Distinct from stop(): stop() tears the worker down without server
+    // notice, shutdown_graceful() informs MS first so it doesn't leak the
+    // subscription state and an abruptly-closed connection. Called from
+    // the reboot path (so MS doesn't have to clean up after every flash
+    // cycle) and from pc_sim's exit handlers.
+    void (*shutdown_graceful)(void);
 } ms_client_iface_t;
+
+// Helper: route an esp_restart() through the active client's
+// shutdown_graceful first, with a short delay for log flush. Defined in
+// app_console.c (the only TU that already pulls in esp_system + the
+// active-client accessor). Use this instead of calling esp_restart()
+// directly so MS isn't left holding a stale WS connection.
+void app_reboot_graceful(void);
 
 const ms_client_iface_t *app_ms_client_ws(void);
 const ms_client_iface_t *app_ms_client_osc(void);
