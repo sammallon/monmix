@@ -46,6 +46,14 @@ static uint32_t s_user_timeout_ms = DEFAULT_TIMEOUT_MS;
 static app_power_phase_t s_phase = APP_POWER_PHASE_AWAKE;
 static lv_timer_t       *s_tick_timer;
 static uint32_t          s_phase_entered_at_ms;
+// Absolute lv_tick at which the current AWAKE period began. The user
+// picked a duration; this stamp + that duration is the wall-clock-like
+// deadline. Touches during AWAKE do NOT reset this (the user's intent
+// was "stay awake for X, period"); only an explicit duration pick from
+// the wake menu (via warn-tap or post-sleep) restarts it. Re-stamped
+// also on transition INTO a degraded state so the cap window starts
+// fresh from the link drop.
+static uint32_t          s_awake_started_at_ms;
 static bool              s_was_degraded;
 
 // Saved brightness pref so unblanking restores the user's last
@@ -106,6 +114,13 @@ void app_power_set_time_scale(uint32_t numerator, uint32_t denominator)
 
 void app_power_kick(void)
 {
+    // Force the awake clock to restart from now. This is for callers
+    // that explicitly want to grant a fresh duration -- it's the
+    // equivalent of an in-app "I'm here" signal. Touches DON'T call
+    // this; the absolute-from-wake design forbids touch-resets.
+    // Tests use it to reset between phases without driving the wake
+    // menu.
+    s_awake_started_at_ms = lv_tick_get();
     lv_display_trigger_activity(NULL);
 }
 
@@ -235,6 +250,12 @@ static void enter_awake(void)
 {
     s_phase = APP_POWER_PHASE_AWAKE;
     s_phase_entered_at_ms = lv_tick_get();
+    // The awake clock starts at every fresh AWAKE entry: boot, post-
+    // sleep wake-menu pick, post-warning wake-menu pick. That's the
+    // ONLY way the user-picked duration restarts -- in-AWAKE touches
+    // do nothing, so "stay awake for 4 h" really means 4 h from this
+    // pick.
+    s_awake_started_at_ms = s_phase_entered_at_ms;
     if (s_warn_overlay)  lv_obj_add_flag(s_warn_overlay,  LV_OBJ_FLAG_HIDDEN);
     if (s_blank_overlay) lv_obj_add_flag(s_blank_overlay, LV_OBJ_FLAG_HIDDEN);
     if (s_wake_menu)     lv_obj_add_flag(s_wake_menu,     LV_OBJ_FLAG_HIDDEN);
@@ -244,7 +265,6 @@ static void enter_awake(void)
     uint8_t pct = s_saved_brightness_pct;
     if (pct < 5) pct = app_prefs_get_brightness_pct();
     app_display_set_backlight_pct(pct);
-    lv_display_trigger_activity(NULL);
 }
 
 static void enter_warn(void)
@@ -318,17 +338,17 @@ static void tick_cb(lv_timer_t *t)
     uint32_t inactive = lv_display_get_inactive_time(NULL);
     uint32_t now      = lv_tick_get();
 
-    // Watch degraded transitions. Reset inactivity ONLY on INTO
+    // Watch degraded transitions. Reset the awake clock ONLY on INTO
     // degraded so the user gets the full degraded-cap window from the
     // moment the link drops. Going OUT of degraded keeps existing
-    // inactivity intact -- a wifi blip while the user was away
-    // shouldn't briefly re-light the panel for nobody.
+    // elapsed intact -- a wifi blip while the user was away shouldn't
+    // briefly re-light the panel for nobody.
     bool deg = degraded_state();
     if (deg != s_was_degraded) {
         bool went_degraded = !s_was_degraded && deg;
         s_was_degraded = deg;
         if (went_degraded) {
-            lv_display_trigger_activity(NULL);
+            s_awake_started_at_ms = now;
         }
         // If we were already in WARNING due to a long idle and the
         // connection just came back, demote to AWAKE so the user
@@ -342,25 +362,38 @@ static void tick_cb(lv_timer_t *t)
     uint32_t timeout    = app_power_get_effective_timeout_ms();
     uint32_t warn_ms    = pwr_scale(WARN_MS);
     uint32_t warn_start = (timeout > warn_ms) ? (timeout - warn_ms) : 0;
+    uint32_t elapsed    = now - s_awake_started_at_ms;
+    // last_touch_ms is the absolute lv_tick of the last input event.
+    // On no recent input it grows linearly with `now` (and stays
+    // anchored to the previous touch); on touch it jumps to ~now.
+    // Comparing to s_phase_entered_at_ms tells us "did the user touch
+    // *since* the current phase began?" -- the cancel-on-warn path
+    // uses this to avoid mistaking a pre-warn touch for a warn-dismiss.
+    uint32_t last_touch_ms = (now > inactive) ? (now - inactive) : 0;
 
     switch (s_phase) {
         case APP_POWER_PHASE_AWAKE:
-            if (inactive >= timeout) {
+            // Absolute from the awake-start. Touches do nothing here:
+            // the user said "stay awake for X" and they meant it.
+            if (elapsed >= timeout) {
                 enter_sleep();
-            } else if (inactive >= warn_start) {
+            } else if (elapsed >= warn_start) {
                 enter_warn();
             }
             break;
 
         case APP_POWER_PHASE_WARNING:
-            // Touch during warn dismisses (LVGL resets inactive_time
-            // on press → we drop back to AWAKE).
-            if (inactive < warn_start) {
-                enter_awake();
-            } else if (inactive >= timeout) {
+            // Touch DURING warning -> open the wake menu so the user
+            // picks a fresh duration that's absolute from this point.
+            // We compare last_touch_ms to s_phase_entered_at_ms so a
+            // pre-warn touch (carried over from AWAKE) doesn't look
+            // like a warn-dismiss.
+            if (last_touch_ms > s_phase_entered_at_ms) {
+                enter_wake_menu();
+            } else if (elapsed >= timeout) {
                 enter_sleep();
             } else if (s_warn_count_label) {
-                uint32_t remaining = timeout - inactive;
+                uint32_t remaining = timeout - elapsed;
                 char buf[32];
                 snprintf(buf, sizeof(buf), "Sleeping in %us",
                          (unsigned)((remaining + 999) / 1000));
@@ -369,10 +402,11 @@ static void tick_cb(lv_timer_t *t)
             break;
 
         case APP_POWER_PHASE_SLEEP:
-            // A tap on the blank overlay resets inactive_time to ~0;
-            // detect that and show the wake menu. Use a small
-            // threshold (200 ms) to debounce rapid sweep cycles.
-            if (inactive < 200) {
+            // A tap on the blank overlay -> wake menu. last_touch_ms
+            // > s_phase_entered_at_ms tells us the touch happened
+            // after sleep entry (vs being a leftover from the awake
+            // session that put us here).
+            if (last_touch_ms > s_phase_entered_at_ms) {
                 enter_wake_menu();
             }
             break;
@@ -410,6 +444,12 @@ void app_power_init(const ms_client_iface_t *ms)
     s_ms = ms;
     s_was_degraded = degraded_state();
     s_saved_brightness_pct = app_prefs_get_brightness_pct();
+    // Stamp the awake clock at boot so the first warning fires after
+    // (default_timeout - warn_ms) since boot, not since the LVGL tick
+    // started. The user's first interaction with the device is right
+    // after boot, so anchoring to boot is the right "wake" event.
+    s_phase_entered_at_ms = lv_tick_get();
+    s_awake_started_at_ms = s_phase_entered_at_ms;
 
     // Build overlays up front so the first phase transition doesn't
     // block on widget creation while LVGL is mid-render. Hidden by
