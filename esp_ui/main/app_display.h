@@ -22,3 +22,11 @@ void app_display_apply_rotation(app_display_rotation_t rot);
 // Drive the backlight LEDC PWM duty to the given percentage. Clamped to
 // 5..100 -- a fully-dark mis-tap leaves no non-touch recovery path.
 void app_display_set_backlight_pct(uint8_t pct);
+
+// Drive the backlight all the way off (LEDC duty 0). Bypasses the 5%
+// floor that protects against mis-tap-blank from the user-facing
+// surfaces (settings slider, set-bright REPL); the M7 sleep path is
+// the only deliberate caller and pairs the off-state with a touch-
+// capturing overlay that wakes the device. Pair every call with a
+// matching app_display_set_backlight_pct(...) on wake to restore.
+void app_display_set_backlight_off(void);

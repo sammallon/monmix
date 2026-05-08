@@ -270,11 +270,14 @@ static void enter_sleep(void)
     lv_obj_remove_flag(s_blank_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_blank_overlay);
     s_saved_brightness_pct = app_prefs_get_brightness_pct();
-    // 5 % is the lowest the brightness API allows; lower than that
-    // requires a separate hardware path (see TODO in M7 README) so
-    // we settle for "very dim + opaque overlay" today. The visible
-    // result is still effectively a black screen.
-    app_display_set_backlight_pct(5);
+    // Real off, not the 5 % floor -- a visibly-lit panel overnight
+    // defeats the point of "sleep". The opaque overlay still
+    // captures touches so a tap wakes through to the wake menu; the
+    // user sees a dark panel until then. The pct-setter's floor
+    // stays in place for the user-facing surfaces (slider,
+    // set-bright); only this code path takes the LED all the way
+    // down.
+    app_display_set_backlight_off();
     ESP_LOGI(TAG, "entering sleep (effective_timeout=%ums)",
              (unsigned) app_power_get_effective_timeout_ms());
 }

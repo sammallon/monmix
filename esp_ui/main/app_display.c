@@ -393,6 +393,18 @@ void app_display_set_backlight_pct(uint8_t pct)
                     LEDC_FADE_NO_WAIT);
 }
 
+void app_display_set_backlight_off(void)
+{
+    // Duty 0 = LED fully off. Same fade transition shape as the
+    // pct-setter so a sleep transition reads as a smooth fade, not
+    // a snap. Pairs with a touch-capturing overlay (M7) so the
+    // device can still be woken with a tap on the dark panel.
+    ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0,
+                            0u, LCD_BL_FADE_MS);
+    ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0,
+                    LEDC_FADE_NO_WAIT);
+}
+
 void app_display_apply_theme(app_theme_t theme)
 {
     lv_display_t *disp = lv_display_get_default();

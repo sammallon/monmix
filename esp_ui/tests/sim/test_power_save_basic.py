@@ -37,12 +37,19 @@ TEST = {
             "OK power_phase=AWAKE eff_to_ms=30000",
             "I (app_power) entering sleep",
             "OK power_phase=SLEEP",
+            # Sleep drives backlight all the way off (mock prints
+            # "backlight=off"). Real device drops LEDC duty to 0.
+            # On wake the saved brightness % is restored.
+            "[mock_display] backlight=off",
             "OK power_phase=WAKE_MENU",
             "wake-menu pick: 1 h",
         ],
         "stdout_not_contains": [
             "LV_ASSERT",
             "Assertion failed",
+            # Sleep must NOT use the 5% floor any more -- that was the
+            # symptom the user noticed (panel visibly lit at night).
+            "[mock_display] backlight=5%",
         ],
     },
     "hw_compatible": False,  # PC sim only -- needs power-scale CLI flag

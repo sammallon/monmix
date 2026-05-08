@@ -37,3 +37,7 @@ void app_display_apply_rotation(app_display_rotation_t rot) {
 void app_display_set_backlight_pct(uint8_t pct) {
     fprintf(stdout, "[mock_display] backlight=%u%%\n", (unsigned)pct);
 }
+
+void app_display_set_backlight_off(void) {
+    fprintf(stdout, "[mock_display] backlight=off\n");
+}
