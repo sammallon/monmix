@@ -18,6 +18,7 @@
 #include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_ms_info.h"
+#include "app_power.h"
 #include "app_prefs.h"
 #include "app_config.h"
 #include "app_state.h"
@@ -253,6 +254,13 @@ void app_main(void)
     // on-change callback retries on every MS state transition (and on every
     // /app/state heartbeat tick that flips console_attached).
     try_apply_ms_info(ms);
+
+    // M7 display power management. Idle counter, warning dialog, blank
+    // overlay, and wake-time menu. Wired to MS so the degraded-state
+    // 60 s cap activates when WiFi/MS/console go away. Real-time scale
+    // (1/1) on the device; PC sim sets a smaller denominator via
+    // app_power_set_time_scale before init.
+    app_power_init(ms);
 
     // ws_start always returns true when the client object initializes; the
     // websocket subsystem itself handles reconnect once WiFi is up. Spawns
