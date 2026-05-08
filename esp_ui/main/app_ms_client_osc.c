@@ -203,6 +203,10 @@ static struct {
 
     TaskHandle_t            task;
     volatile bool           running;
+    // Bounded join: see app_ms_client_ws.c::ws_stop. Picker live-apply
+    // restarts the worker immediately after stopping it; without the
+    // join the second osc_task races the dying one on the global g.
+    SemaphoreHandle_t       exit_sig;
 
     // Mongoose owns only the boot-time HTTP fetches now; the OSC pipe is
     // raw udp_pcb so the udp_recv callback can drop irrelevant packets in
@@ -996,6 +1000,7 @@ static void osc_task(void *unused) {
 
     udp_pcb_down();
     mg_mgr_free(&g.mgr);
+    if (g.exit_sig) xSemaphoreGive(g.exit_sig);
     vTaskDelete(NULL);
 }
 
@@ -1006,11 +1011,17 @@ static void osc_task(void *unused) {
 static bool osc_start(void) {
     if (g.task) return true;
     g.outq_mtx = xSemaphoreCreateMutex();
+    g.exit_sig = xSemaphoreCreateBinary();
     g.rx_q     = xQueueCreate(OSC_RX_QUEUE_DEPTH, sizeof(osc_rx_entry_t));
     if (!g.rx_q) {
         ESP_LOGE(TAG, "rx queue create failed");
         return false;
     }
+    // Reset prime/info state so a restart re-fetches /console/information
+    // and re-primes against the (potentially new) tracked-channel list.
+    g.info_fetched = false;
+    g.primed       = false;
+    g.prime_idx    = 0;
     osc_expect_init(&g.expect, g.expect_slots, OSC_EXPECT_SIZE,
                     OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
     g.running  = true;
@@ -1025,7 +1036,34 @@ static bool osc_start(void) {
 
 static void osc_stop(void) {
     g.running = false;
+    // Bounded join. Same rationale as ws_stop: the picker live-apply
+    // path restarts the worker immediately, and the new task can't be
+    // allowed to race the old one on the global g (mgr, queues, pcb).
+    if (g.exit_sig) {
+        if (xSemaphoreTake(g.exit_sig, pdMS_TO_TICKS(1500)) != pdTRUE) {
+            ESP_LOGW(TAG, "osc_stop: worker join timed out");
+        }
+        vSemaphoreDelete(g.exit_sig);
+        g.exit_sig = NULL;
+    }
     g.task = NULL;
+    // Drain + free outq, drop the mutex. Anything still queued was for
+    // the prior session and would emit on the wrong filter/level.
+    if (g.outq_mtx) {
+        outq_entry_t *e = outq_drain();
+        while (e) {
+            outq_entry_t *next = e->next;
+            free(e->pkt);
+            free(e);
+            e = next;
+        }
+        vSemaphoreDelete(g.outq_mtx);
+        g.outq_mtx = NULL;
+    }
+    if (g.rx_q) {
+        vQueueDelete(g.rx_q);
+        g.rx_q = NULL;
+    }
     set_state(APP_MS_STATE_BOOT);
 }
 
