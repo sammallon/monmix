@@ -56,3 +56,11 @@ void app_ui_force_mix_show(bool force);
 // Persists to NVS, reseeds app_state, rebuilds faders, restarts the MS
 // worker. Caller must hold lvgl_port_lock.
 void app_ui_chpick_apply(const int *ids, size_t count);
+
+// Test hook: apply a new MS host/port live (same path the MS-config Save
+// button takes). Opens the MS overlay if needed, sets the textareas,
+// and triggers on_mcfg_save -- which persists, drops the s_ms_setup_done
+// gate, and live-reconnects the MS client. Used by the names-on-reconfigure
+// regression to drive the bug repro without driving overlay taps. Caller
+// must hold lvgl_port_lock.
+void app_ui_mcfg_apply(const char *host, const char *port_str);

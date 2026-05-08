@@ -5063,6 +5063,27 @@ void app_ui_chpick_apply(const int *ids, size_t count)
     chpick_apply_async(NULL);
 }
 
+// Test hook -- see app_ui.h. Drives the same path on_mcfg_save takes when
+// the user taps Save in the MS-config overlay: seed the textareas (the
+// overlay is built lazily so call mcfg_open if needed), then hand off to
+// on_mcfg_save which validates, persists via app_config_*, drops the
+// s_ms_setup_done gate, and triggers ms->reconnect(). Used by the
+// names-on-reconfigure regression test to flip MS host without faking
+// overlay taps + keyboard typing.
+void app_ui_mcfg_apply(const char *host, const char *port_str)
+{
+    if (!host || !port_str) return;
+    if (!s_mcfg_overlay) build_mcfg_overlay();
+    // mcfg_open snapshots the current app_config_ms_* values into the
+    // textareas + s_mcfg_orig_*; that re-snapshot is needed so the dirty
+    // detector is consistent. Then we overwrite the textareas with the
+    // test's intended values before calling on_mcfg_save.
+    mcfg_open();
+    lv_textarea_set_text(s_mcfg_host_ta, host);
+    lv_textarea_set_text(s_mcfg_port_ta, port_str);
+    on_mcfg_save(NULL);
+}
+
 static void on_chpick_save_yes(lv_event_t *e)
 {
     (void)e;

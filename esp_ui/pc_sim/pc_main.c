@@ -257,6 +257,44 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_ui_chpick_apply(ids, (size_t) n);
             lvgl_port_unlock();
             printf("OK chpick_save n=%d\n", n);
+        } else if (strncmp(cmd, "mcfg_apply", 10) == 0) {
+            // "mcfg_apply HOST PORT" — drive the MS-config Save path with
+            // the given host + port. Same code path the user takes via
+            // taps + the `type` REPL command. Used by the names-on-
+            // reconfigure regression to flip host without faking taps.
+            char host_buf[64];
+            int  port_num;
+            if (sscanf(cmd, "mcfg_apply %63s %d", host_buf, &port_num) != 2) {
+                printf("ERR mcfg_apply usage: mcfg_apply HOST PORT\n");
+            } else {
+                char port_buf[12];
+                snprintf(port_buf, sizeof(port_buf), "%d", port_num);
+                lvgl_port_lock(0);
+                app_ui_mcfg_apply(host_buf, port_buf);
+                lvgl_port_unlock();
+                printf("OK mcfg_apply %s %d\n", host_buf, port_num);
+            }
+        } else if (strncmp(cmd, "type ", 5) == 0) {
+            // Mirror the device's `type` REPL command: write into whichever
+            // textarea is focused. Useful so a single sim script can stand
+            // in for a tap-and-type sequence without coordinate hardcoding.
+            // Walks the focused indev's group first, then falls back to
+            // scanning the screen tree for a focused textarea.
+            const char *text = cmd + 5;
+            while (*text == ' ' || *text == '\t') ++text;
+            lvgl_port_lock(0);
+            lv_obj_t *ta = NULL;
+            lv_indev_t *indev = NULL;
+            while ((indev = lv_indev_get_next(indev)) != NULL) {
+                lv_group_t *g = lv_indev_get_group(indev);
+                if (!g) continue;
+                lv_obj_t *f = lv_group_get_focused(g);
+                if (f && lv_obj_check_type(f, &lv_textarea_class)) { ta = f; break; }
+            }
+            if (ta) lv_textarea_set_text(ta, text);
+            lvgl_port_unlock();
+            if (ta) printf("OK type %s\n", text);
+            else    printf("ERR type: no focused textarea\n");
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
             // Drive the mix-change path the same way the picker does:
             // ms->set_mix() updates the active subscription, AND
