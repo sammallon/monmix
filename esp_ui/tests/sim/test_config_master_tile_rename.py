@@ -10,15 +10,20 @@ TEST = {
     "name": "config_master_tile_rename",
     "description": "Tapping master tile name + Save writes cfg.name for master id.",
     "args": [],
-    # Coordinates from the 4x6 grid inside an overlay with pad 16.
-    # List screen pos: (16, 312). list pad 6 -> list content (22,318).
-    # Tile [3][5]: (763, 548)-(1002, 590). Tile content mid-y = 569.
-    # Name label LEFT_MID rect ~ (769, 561)-(956, 577) -> tap (820, 569).
-    # Save button at popup's TOP_RIGHT (110x36) -> rect ~(902,12)-(1012,48).
+    # Layout (column-major + swatch-on-left after fix-settings-grid):
+    #   overlay pad 16, list pos (0, 296), list pad 6 -> list content (22, 318)
+    #   tile_w=239, tile_h=42, col_gap=8, row_gap=4, swatch_sz=28
+    # Master tile [3][5] (col=3, row=5): list-content (741, 230)
+    #   -> screen (763, 548)-(1002, 590); inner mid-y = 569
+    # Inside tile (pad 6): swatch LEFT_MID at offset (0,0) screen (783, 569);
+    #   name LEFT_MID at offset (swatch_sz+8, 0) -> name x_left = 805,
+    #   width 187 -> name center ~ (898, 569).
+    # Rename popup Save: TOP_RIGHT 110x36 inside popup with pad 12 ->
+    #   rect (902, 12)-(1012, 48), tap (957, 30).
     "script": (
-        "tap 1000 16\n"           # gear -> settings overlay
+        "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
-        "tap 820 569\n"           # master tile name -> rename popup
+        "tap 898 569\n"           # master tile name -> rename popup
         "sleep 300\n"
         "tap 957 30\n"            # Save -- prefilled "Mix 1" carries
         "sleep 200\n"

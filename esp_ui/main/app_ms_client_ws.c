@@ -105,6 +105,12 @@ static struct {
 
     TaskHandle_t            task;
     volatile bool           running;
+    // Bounded join: ws_stop blocks on this until ws_task has freed mgr
+    // and is about to vTaskDelete itself. Without it, ws_start right
+    // after ws_stop would race a still-running ws_task on the global g.
+    // Picker live-apply (channel-set rebuild) is the path that exercises
+    // start-after-stop most aggressively.
+    SemaphoreHandle_t       exit_sig;
 
     struct mg_mgr           mgr;
     struct mg_connection   *ws_conn;
@@ -781,6 +787,7 @@ static void ws_task(void *unused) {
     }
 
     mg_mgr_free(&g.mgr);
+    if (g.exit_sig) xSemaphoreGive(g.exit_sig);
     vTaskDelete(NULL);
 }
 
@@ -816,6 +823,7 @@ static bool ws_is_console_attached(void) { return g.console_attached; }
 static bool ws_start(void) {
     if (g.task) return true;
     g.outq_mtx = xSemaphoreCreateMutex();
+    g.exit_sig = xSemaphoreCreateBinary();
     g.running  = true;
     g.state    = APP_MS_STATE_BOOT;
     g.subscriber_count = g.subscriber_count;  // keep prior registrations
@@ -838,10 +846,33 @@ static bool ws_start(void) {
 
 static void ws_stop(void) {
     g.running = false;
-    // The task tears itself down on the next loop iteration. We don't
-    // join: xTaskCreate's deletion is async, and we don't need to wait
-    // here -- nothing on the caller's side touches the mgr.
+    // Bounded join. Picker live-apply restarts the worker right after
+    // stopping it; without waiting, the new ws_task races the old one on
+    // the global g (mgr, outq, etc). One MGR_POLL_MS cycle plus slack is
+    // enough; if we time out we'd rather log and proceed than deadlock
+    // the LVGL caller.
+    if (g.exit_sig) {
+        if (xSemaphoreTake(g.exit_sig, pdMS_TO_TICKS(1500)) != pdTRUE) {
+            ESP_LOGW(TAG, "ws_stop: worker join timed out");
+        }
+        vSemaphoreDelete(g.exit_sig);
+        g.exit_sig = NULL;
+    }
     g.task = NULL;
+    // outq cleanup: the worker drained whatever it could before exit;
+    // anything still queued belongs to the prior session and we drop it.
+    // Without explicit deletion the mutex leaks across start/stop cycles.
+    if (g.outq_mtx) {
+        outq_entry_t *e = outq_drain();
+        while (e) {
+            outq_entry_t *next = e->next;
+            free(e->json);
+            free(e);
+            e = next;
+        }
+        vSemaphoreDelete(g.outq_mtx);
+        g.outq_mtx = NULL;
+    }
     set_state(APP_MS_STATE_BOOT);
 }
 
@@ -959,7 +990,27 @@ static bool ws_is_mix_routed     (int idx)     { (void)idx; return true; }   // 
 static void ws_fetch_mix_routing (void)        {}                            // TODO: P11
 static bool ws_is_mix_list_ready (void)        { return g.mix_list_received; }
 static void ws_resubscribe       (void)        { if (g.ws_open) { g.subscribed = false; subscribe_all(); } }
+// Force the worker onto a new ws_url after a runtime host/port change:
+// recompose first so the next mg_ws_connect picks up the new target,
+// then drain the open connection (if any) so the worker drops to the
+// reconnect branch immediately. compose_urls runs from the LVGL task
+// here while the worker reads g.ws_url inside mg_ws_connect; this is
+// safe because the worker only reaches that read AFTER MG_EV_CLOSE
+// fires for the just-drained connection, which happens after we
+// return. When the host actually changed, drop the per-host caches so
+// the boot-setup retry primes fresh values; on a same-host reconnect
+// (network blip) keep them so the UI doesn't flash placeholders.
 static void ws_reconnect         (void)        {
+    char prev_url[sizeof(g.ws_url)];
+    memcpy(prev_url, g.ws_url, sizeof(prev_url));
+    compose_urls();
+    if (strcmp(prev_url, g.ws_url) != 0) {
+        g.routability_known = false;
+        g.total_channels    = 0;
+        memset(g.strip_names, 0, sizeof(g.strip_names));
+        memset(g.routable,    0, sizeof(g.routable));
+        g.console_attached  = false;
+    }
     if (g.ws_conn) g.ws_conn->is_draining = 1;
 }
 
@@ -1122,6 +1173,74 @@ static void ws_set_level_format(app_level_format_t f) {
     if (g.ws_open) subscribe_all();
 }
 
+// Pre-shutdown: walk every active subscription and queue an unsubscribe,
+// then drain the queue with a short pump so the POSTs actually go out
+// before we send the WS CLOSE frame. MS otherwise carries the
+// subscription state forward and accumulates them across reboot/flash
+// cycles. Safe when not connected (early return). Called from the
+// reboot path before esp_restart() and from pc_sim's exit handlers.
+static void ws_shutdown_graceful(void)
+{
+    if (!g.task) return;            // never started
+    if (!g.ws_open || !g.ws_conn) return;  // nothing to inform MS about
+
+    ESP_LOGI(TAG, "graceful shutdown: queuing unsubscribes");
+
+    // Channels (under the active mix).
+    size_t n = app_state_count();
+    for (size_t i = 0; i < n; ++i) {
+        int id = app_state_id_for_idx(i);
+        if (id >= 0) unsubscribe_channel(id, g.mix_idx);
+    }
+    // Master.
+    unsubscribe_master(master_channel_id());
+    // Routable cfg.name set (subscribe_all_routable_names is the parallel
+    // subscribe path; mirror it here so the pairing is 1:1 per OpenAPI).
+    if (g.routability_known) {
+        int max = g.total_channels;
+        if (max > MAX_STRIP_NAMES) max = MAX_STRIP_NAMES;
+        for (int id = 0; id < max; ++id) {
+            if (!g.routable[id]) continue;
+            char dotted[80];
+            snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", id);
+            send_unsubscribe(dotted, "val");
+        }
+    }
+    // Mix names.
+    for (int i = 0; i < g.mix_count && i < MAX_MIX_BUSES; ++i) {
+        char dotted[80];
+        snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", g.mix_offset + i);
+        send_unsubscribe(dotted, "val");
+    }
+    // Metering, if armed.
+    if (g.meter_subscribed) meter_send_unsubscribe();
+
+    // Wait for the worker to drain the queue. Bounded poll: 25 ms cadence
+    // matches MGR_POLL_MS so each iteration covers one drain pass. ~300 ms
+    // budget is generous for the typical ~30 unsubscribes (each ~250 B).
+    for (int i = 0; i < 12; ++i) {
+        bool empty;
+        xSemaphoreTake(g.outq_mtx, portMAX_DELAY);
+        empty = (g.outq_head == NULL);
+        xSemaphoreGive(g.outq_mtx);
+        if (empty) break;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    // Send WS CLOSE so MS gets a clean handshake instead of a TCP RST.
+    // Mongoose's ws_send with op CLOSE handles the framing; we just need
+    // to ensure it lands before stop() tears the mgr down.
+    if (g.ws_open && g.ws_conn) {
+        mg_ws_send(g.ws_conn, NULL, 0, WEBSOCKET_OP_CLOSE);
+        // Give the close frame a chance to flush + ACK. ws_evt's
+        // MG_EV_CLOSE clears g.ws_open when the server-side close lands.
+        for (int i = 0; i < 20; ++i) {
+            if (!g.ws_open) break;
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+    }
+}
+
 static const ms_client_iface_t s_iface = {
     .start                       = ws_start,
     .set_level                   = ws_set_level,
@@ -1150,6 +1269,7 @@ static const ms_client_iface_t s_iface = {
     .set_meter_enabled           = ws_set_meter_enabled,
     .set_level_format            = ws_set_level_format,
     .is_console_attached         = ws_is_console_attached,
+    .shutdown_graceful           = ws_shutdown_graceful,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void) { return &s_iface; }

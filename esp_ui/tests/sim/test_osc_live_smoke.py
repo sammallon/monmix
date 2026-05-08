@@ -40,4 +40,10 @@ TEST = {
     "skip_if":     lambda: not os.environ.get("MONMIX_MS_HOST"),
     "skip_reason": "MONMIX_MS_HOST not set; skipping live-MS test",
     "timeout_s":   30,
+    # Sim-only: protocol selection on hw is NVS-backed and the live client
+    # is created at boot. Toggling to OSC for a single test would need a
+    # write-then-reboot dance the hw runner doesn't support; the device's
+    # protocol stays whatever app_config_set_ms_protocol last persisted.
+    # Sim's --protocol osc just constructs a different client at startup.
+    "hw_compatible": False,
 }

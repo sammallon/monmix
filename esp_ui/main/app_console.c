@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "mbedtls/base64.h"
@@ -218,11 +219,27 @@ static void emit_b64_line(const uint8_t *src, size_t n)
     }
 }
 
-static int cmd_screenshot_impl(void);
+// Optional rect (x,y,w,h) clips the rendered frame before zlib + b64 so
+// callers that only need a small region (settings overlay, picker dialog)
+// don't pay the full 1024x600 wire cost. Negative w/h means "full screen".
+static int cmd_screenshot_impl(int rx, int ry, int rw, int rh);
 
 static int cmd_screenshot(int argc, char **argv)
 {
-    (void) argc; (void) argv;
+    int rx = 0, ry = 0, rw = -1, rh = -1;
+    if (argc == 5) {
+        rx = atoi(argv[1]);
+        ry = atoi(argv[2]);
+        rw = atoi(argv[3]);
+        rh = atoi(argv[4]);
+        if (rw <= 0 || rh <= 0) {
+            printf("usage: screenshot [<x> <y> <w> <h>]\n");
+            return 1;
+        }
+    } else if (argc != 1) {
+        printf("usage: screenshot [<x> <y> <w> <h>]\n");
+        return 1;
+    }
 
     // Silence other tasks' UART logging for the duration of the screenshot.
     // The base64 emit takes ~2 s of dense UART writes; any concurrent
@@ -232,12 +249,12 @@ static int cmd_screenshot(int argc, char **argv)
     // the prior level so every return path inside the impl stays simple.
     esp_log_level_t prior = esp_log_level_get("*");
     esp_log_level_set("*", ESP_LOG_NONE);
-    int rc = cmd_screenshot_impl();
+    int rc = cmd_screenshot_impl(rx, ry, rw, rh);
     esp_log_level_set("*", prior);
     return rc;
 }
 
-static int cmd_screenshot_impl(void)
+static int cmd_screenshot_impl(int rx, int ry, int rw, int rh)
 {
     // The default LVGL draw-buffer allocator pulls from DMA-capable internal
     // RAM (so the PPA can hit it during normal flush). At 1024×600×2 bytes =
@@ -292,13 +309,65 @@ static int cmd_screenshot_impl(void)
     // lv_draw_buf_destroy (we own the underlying allocation).
     lv_draw_buf_t *buf = &db;
 
+    // Partial-rect clipping: walk the requested rows out of the full-frame
+    // render into a tightly-packed temp buffer, then point the compression
+    // input at that. Cheaper to clip after render (LVGL doesn't expose a
+    // bounded snapshot path) and before deflate (compressing 1.2 MB then
+    // throwing most of it away wastes both time and code).
+    uint32_t out_w      = buf->header.w;
+    uint32_t out_h      = buf->header.h;
+    uint32_t out_stride = buf->header.stride;
+    const uint8_t *src_pixels = buf->data;
+    size_t   src_data_size = buf->data_size;
+    uint8_t *clipped = NULL;
+    if (rw > 0 && rh > 0) {
+        // Clamp to screen bounds; reject if the rect lands fully off-screen.
+        if (rx < 0) { rw += rx; rx = 0; }
+        if (ry < 0) { rh += ry; ry = 0; }
+        if (rx >= (int) buf->header.w || ry >= (int) buf->header.h ||
+            rw <= 0 || rh <= 0) {
+            free(snap_raw);
+            printf("screenshot: rect outside screen bounds\n");
+            APP_LOGD_E("screenshot", "rect outside screen bounds");
+            return 1;
+        }
+        if (rx + rw > (int) buf->header.w) rw = (int) buf->header.w - rx;
+        if (ry + rh > (int) buf->header.h) rh = (int) buf->header.h - ry;
+
+        const size_t bpp        = 2;  // RGB565
+        const size_t row_bytes  = (size_t) rw * bpp;
+        const size_t clip_bytes = row_bytes * (size_t) rh;
+        clipped = heap_caps_malloc(clip_bytes,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!clipped) {
+            free(snap_raw);
+            printf("screenshot: PSRAM alloc failed for clip (%u bytes)\n",
+                   (unsigned) clip_bytes);
+            APP_LOGD_E("screenshot", "clip PSRAM alloc failed (%u)",
+                       (unsigned) clip_bytes);
+            return 1;
+        }
+        for (int row = 0; row < rh; row++) {
+            const uint8_t *src_row = (const uint8_t *) buf->data
+                + ((size_t) (ry + row) * out_stride)
+                + ((size_t) rx * bpp);
+            memcpy(clipped + (size_t) row * row_bytes, src_row, row_bytes);
+        }
+        out_w          = (uint32_t) rw;
+        out_h          = (uint32_t) rh;
+        out_stride     = (uint32_t) row_bytes;
+        src_pixels     = clipped;
+        src_data_size  = clip_bytes;
+    }
+
     // Compress pixels with deflate via the ROM miniz. Mostly-solid-color UI
     // screens compress 5–10× — at 1024×600 RGB565 that's roughly 1.2 MB →
     // 150 KB, cutting the b64 transfer at 921600 baud from ~17 s to ~2 s.
-    size_t   src_len = buf->data_size;
+    size_t   src_len = src_data_size;
     size_t   cap     = src_len + 256;   // worst-case over-estimate
     uint8_t *cbuf    = malloc(cap);
     if (!cbuf) {
+        free(clipped);
         free(snap_raw);
         printf("screenshot: out of memory for compress buffer\n");
         APP_LOGD_E("screenshot", "compress buffer alloc failed (need %u)",
@@ -315,6 +384,7 @@ static int cmd_screenshot_impl(void)
     tdefl_compressor *comp = malloc(sizeof(*comp));
     if (!comp) {
         free(cbuf);
+        free(clipped);
         free(snap_raw);
         printf("screenshot: tdefl_compressor alloc failed (need %u bytes)\n",
                (unsigned) sizeof(*comp));
@@ -327,7 +397,7 @@ static int cmd_screenshot_impl(void)
                TDEFL_WRITE_ZLIB_HEADER | TDEFL_DEFAULT_MAX_PROBES);
     size_t       in_size  = src_len;
     size_t       out_size = cap;
-    tdefl_status st = tdefl_compress(comp, buf->data, &in_size,
+    tdefl_status st = tdefl_compress(comp, src_pixels, &in_size,
                                      cbuf, &out_size, TDEFL_FINISH);
     int64_t t_compress_us = esp_timer_get_time() - t0;
     free(comp);
@@ -337,6 +407,7 @@ static int cmd_screenshot_impl(void)
         APP_LOGD_E("screenshot", "deflate failed status=%d in=%u out=%u",
                    (int) st, (unsigned) in_size, (unsigned) out_size);
         free(cbuf);
+        free(clipped);
         free(snap_raw);
         return 1;
     }
@@ -361,9 +432,9 @@ static int cmd_screenshot_impl(void)
         uint32_t flags;              // bit 0 = zlib-compressed payload
     } hdr;
     memcpy(hdr.magic, "MMSCRN\0\0", 8);
-    hdr.w                 = buf->header.w;
-    hdr.h                 = buf->header.h;
-    hdr.stride            = buf->header.stride;
+    hdr.w                 = out_w;
+    hdr.h                 = out_h;
+    hdr.stride            = out_stride;
     hdr.format            = (uint32_t) buf->header.cf;
     hdr.uncompressed_size = (uint32_t) src_len;
     hdr.compressed_size   = (uint32_t) comp_len;
@@ -383,6 +454,7 @@ static int cmd_screenshot_impl(void)
     }
 
     free(cbuf);
+    free(clipped);
     free(snap_raw);
     printf("===END BASE64===\n");
     return 0;
@@ -591,6 +663,77 @@ static int cmd_ms_info(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `type <text...>` — write text into the currently-focused textarea by
+// going around the on-screen lv_keyboard. Resolves the target via the
+// indev focus chain first (covers panels with proper group setup) and
+// falls back to walking the active screen for any textarea carrying
+// LV_STATE_FOCUSED. Used by hardware tests that need to populate IP /
+// SSID / host fields without driving 30+ keyboard taps.
+// ─────────────────────────────────────────────────────────────────────────
+
+static lv_obj_t *find_textarea_in_tree(lv_obj_t *root)
+{
+    if (!root) return NULL;
+    if (lv_obj_check_type(root, &lv_textarea_class) &&
+        lv_obj_has_state(root, LV_STATE_FOCUSED)) {
+        return root;
+    }
+    uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; ++i) {
+        lv_obj_t *c = lv_obj_get_child(root, i);
+        lv_obj_t *r = find_textarea_in_tree(c);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+static lv_obj_t *find_focused_textarea(void)
+{
+    lv_indev_t *indev = NULL;
+    while ((indev = lv_indev_get_next(indev)) != NULL) {
+        lv_group_t *g = lv_indev_get_group(indev);
+        if (!g) continue;
+        lv_obj_t *f = lv_group_get_focused(g);
+        if (f && lv_obj_check_type(f, &lv_textarea_class)) return f;
+    }
+    return find_textarea_in_tree(lv_screen_active());
+}
+
+static int cmd_type(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: type <text...> (writes into focused textarea)\n");
+        return 1;
+    }
+    char buf[160];
+    size_t pos = 0;
+    for (int i = 1; i < argc; ++i) {
+        size_t need = strlen(argv[i]) + (i > 1 ? 1 : 0);
+        if (pos + need + 1 > sizeof(buf)) break;
+        if (i > 1) buf[pos++] = ' ';
+        size_t l = strlen(argv[i]);
+        memcpy(buf + pos, argv[i], l);
+        pos += l;
+    }
+    buf[pos] = 0;
+
+    if (!lvgl_port_lock(1000)) {
+        printf("type: lvgl_port_lock failed\n");
+        return 1;
+    }
+    lv_obj_t *ta = find_focused_textarea();
+    if (!ta) {
+        lvgl_port_unlock();
+        printf("type: no focused textarea (tap one first)\n");
+        return 1;
+    }
+    lv_textarea_set_text(ta, buf);
+    lvgl_port_unlock();
+    printf("type: '%s'\n", buf);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `prefs-dump` — print effective + per-source (NVS, SD) prefs state with
 // per-key mtimes. Used by P0 verification to confirm conflict-resolution
 // + missing-key paths land correctly.
@@ -749,6 +892,120 @@ static int cmd_ws_status(int argc, char **argv)
     return 0;
 }
 
+// `chpick-save <id1,id2,...>` -- mirror pc_sim's chpick_save script command.
+// Drives app_ui_chpick_apply directly so the chpick_live_apply regression
+// can run on hw without coordinating with the picker's checkbox grid.
+// Comma-separated id list, capped at APP_UI_MAX_TRACKED_CHANNELS.
+static int cmd_chpick_save(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: chpick-save <id1,id2,...>\n");
+        return 1;
+    }
+    int ids[APP_UI_MAX_TRACKED_CHANNELS];
+    int  n   = 0;
+    char *p  = argv[1];
+    while (*p && n < (int)(sizeof(ids)/sizeof(ids[0]))) {
+        int v;
+        int consumed = 0;
+        if (sscanf(p, "%d%n", &v, &consumed) == 1 && consumed > 0) {
+            ids[n++] = v;
+            p += consumed;
+            if (*p == ',') ++p;
+        } else {
+            break;
+        }
+    }
+    if (!lvgl_port_lock(1000)) {
+        printf("chpick-save: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_chpick_apply(ids, (size_t) n);
+    lvgl_port_unlock();
+    printf("OK chpick_save n=%d\n", n);
+    return 0;
+}
+
+// `dump-tiles` -- mirror pc_sim's dump_tiles script command. Settings overlay
+// must already be open (the test taps the gear icon + waits before issuing
+// this). Holds lvgl_port_lock for the dump.
+static int cmd_dump_tiles(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    if (!lvgl_port_lock(1000)) {
+        printf("dump-tiles: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_settings_dump_tiles();
+    lvgl_port_unlock();
+    printf("OK dump_tiles\n");
+    return 0;
+}
+
+// Drive the MS-config Save path from the REPL. Used by the names-on-
+// reconfigure regression test (tests/sim/test_ms_host_change_names.py)
+// in its hw lane: the test toggles the MS host to a bogus value, waits
+// for the strip-name cache to clear, then toggles back to verify
+// re-priming works against the new host. Bypasses the overlay-tap dance
+// the user did manually when first reproducing the bug.
+static int cmd_mcfg_apply(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: mcfg-apply <host> <port>\n");
+        return 1;
+    }
+    if (!lvgl_port_lock(1000)) {
+        printf("mcfg-apply: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_mcfg_apply(argv[1], argv[2]);
+    lvgl_port_unlock();
+    printf("mcfg-apply: host=%s port=%s\n", argv[1], argv[2]);
+    return 0;
+}
+
+// Resolve the currently-active MS client per the protocol pref. Same
+// selection logic as esp_ui_main.c so reboot/pre-flash paths inform the
+// right backend without esp_ui_main having to publish its s_ms pointer.
+static const ms_client_iface_t *active_ms_client(void)
+{
+    return (app_config_ms_protocol() == APP_MS_PROTOCOL_OSC)
+        ? app_ms_client_osc()
+        : app_ms_client_ws();
+}
+
+// Public wrapper used by every esp_restart() call site in main/. Calls
+// shutdown_graceful() on the active client (sends unsubscribes + WS
+// CLOSE), waits briefly for log + UART output to flush, then resets the
+// chip. Without this MS keeps the prior subscriptions in its server
+// table across the reboot, accumulating leaked entries every flash
+// cycle.
+void app_reboot_graceful(void)
+{
+    const ms_client_iface_t *ms = active_ms_client();
+    if (ms && ms->shutdown_graceful) ms->shutdown_graceful();
+    // Brief tail so any final ESP_LOG / printf draining UART completes
+    // before the chip resets and the host sees a half-line.
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
+}
+
+// `pre-flash` -- graceful MS shutdown, then print a marker the host
+// flash workflow can grep for. Doesn't reboot; idf.py's DTR/RTS pulse
+// will trigger the reset shortly after, by which point the WS is
+// already closed cleanly. The marker line stands alone so a host
+// script's regex doesn't catch a substring of an unrelated log line.
+static int cmd_pre_flash(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    const ms_client_iface_t *ms = active_ms_client();
+    if (ms && ms->shutdown_graceful) ms->shutdown_graceful();
+    // One line, fixed token. Matches `^READY-TO-FLASH$`.
+    printf("READY-TO-FLASH\n");
+    fflush(stdout);
+    return 0;
+}
+
 // Live LCD backlight control. Used to A/B-test brownout-vs-storm theory:
 // drop the backlight from the default 80% to a low single-digit percentage,
 // run the stress reproducer, see if the storm still fires. If dimming
@@ -778,8 +1035,9 @@ void app_console_init(void)
         { .command = "ls",           .help = "list files in a directory (default /sdcard)",   .func = cmd_ls           },
         { .command = "cat-b64",      .help = "base64-print a file framed with markers",       .func = cmd_cat_b64      },
         { .command = "coredump-b64", .help = "base64-print the flash coredump partition",     .func = cmd_coredump_b64 },
-        { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI",   .func = cmd_screenshot   },
+        { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI; optional [x y w h] rect", .func = cmd_screenshot   },
         { .command = "touch",        .help = "<x> <y> [tap|down|up] — synthetic LVGL touch",  .func = cmd_touch        },
+        { .command = "type",         .help = "<text...> -- write into the focused textarea",  .func = cmd_type         },
         { .command = "level-format", .help = "query/set fader value readout: norm | db",      .func = cmd_level_format },
         { .command = "signal-indicator", .help = "query/set: none | signal-present | meter",  .func = cmd_signal_indicator },
         { .command = "theme",        .help = "query/set UI theme: dark | light",              .func = cmd_theme        },
@@ -794,6 +1052,10 @@ void app_console_init(void)
         { .command = "wifi-reassoc", .help = "force STA disconnect+reconnect via watchdog API", .func = cmd_wifi_reassoc },
         { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
         { .command = "set-bright",   .help = "<0..100> -- set LCD backlight % (default 80)",  .func = cmd_set_bright   },
+        { .command = "mcfg-apply",   .help = "<host> <port> -- drive MS-config Save (test hook)", .func = cmd_mcfg_apply   },
+        { .command = "chpick-save",  .help = "<id1,id2,...> -- drive picker live-apply (test hook)", .func = cmd_chpick_save },
+        { .command = "dump-tiles",   .help = "dump settings-overlay tile coords (overlay must be open)", .func = cmd_dump_tiles  },
+        { .command = "pre-flash",    .help = "graceful MS shutdown + print READY-TO-FLASH",   .func = cmd_pre_flash    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

@@ -82,6 +82,27 @@ def translate(script, test_name):
             steps.append(f"cmd:level-format {parts[1]}")
         elif op == "set_mix":
             steps.append(f"cmd:set-mix {parts[1]}")
+        elif op == "mcfg_apply":
+            # mcfg_apply HOST PORT -> mcfg-apply REPL command on device.
+            # The REPL takes the LVGL lock and calls app_ui_mcfg_apply,
+            # the same hook the sim drives.
+            steps.append(f"cmd:mcfg-apply {parts[1]} {parts[2]}")
+        elif op == "type":
+            # type TEXT... -> `type` REPL command (writes to focused
+            # textarea). Pass through everything after the keyword.
+            text = line[len("type"):].strip()
+            steps.append(f"cmd:type {text}")
+        elif op == "chpick_save":
+            # chpick_save id1,id2,... -> chpick-save REPL command. Same
+            # comma-separated id list grammar; the device cmd calls
+            # app_ui_chpick_apply just like pc_sim does.
+            arg = parts[1] if len(parts) > 1 else ""
+            steps.append(f"cmd:chpick-save {arg}" if arg else "cmd:chpick-save")
+        elif op == "dump_tiles":
+            # dump_tiles -- requires the settings overlay to already be
+            # open on hw, same as the sim hook. Test scripts must `tap`
+            # the gear + `sleep` first.
+            steps.append("cmd:dump-tiles")
         elif op.startswith("cmd:"):
             # Already in hw form (e.g. from a test's hw_script). Pass through
             # verbatim so hw-only tests can target REPL commands that don't
@@ -141,17 +162,37 @@ def run_one(test, port):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("filter", nargs="?")
+    ap.add_argument("--list", action="store_true",
+                    help="discover hw_compatible tests and print the translated "
+                         "REPL grammar without touching the serial port")
     args = ap.parse_args()
-
-    port = os.environ.get("MONMIX_HW_PORT")
-    if not port:
-        sys.stderr.write("set MONMIX_HW_PORT=<COMx> before running\n")
-        return 2
 
     tests = discover(args.filter)
     if not tests:
         sys.stderr.write("no matching tests\n")
         return 1
+
+    if args.list:
+        # Discovery + dry-run: lets a sandbox confirm a test will be picked up
+        # without any serial I/O. Only --list omits the MONMIX_HW_PORT check.
+        for path in tests:
+            try:
+                test = load_test(path)
+            except Exception as e:
+                print(f"LOAD-ERR {path.name}: {e}")
+                continue
+            tag = "HW" if test.get("hw_compatible") else "skip"
+            print(f"{tag} {test['name']:<40s}  ({path.name})")
+            if not test.get("hw_compatible"): continue
+            steps = translate(test.get("hw_script", test["script"]), test["name"])
+            for s in steps:
+                print(f"     {s}")
+        return 0
+
+    port = os.environ.get("MONMIX_HW_PORT")
+    if not port:
+        sys.stderr.write("set MONMIX_HW_PORT=<COMx> before running\n")
+        return 2
 
     passed = failed = skipped = 0
     for path in tests:

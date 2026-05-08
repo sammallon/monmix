@@ -48,3 +48,25 @@ void app_ui_set_status(const char *text);
 // mix-list-ready gate. Pass false to release the override and revert to
 // the gated path. Used by the `mix-show` console command for diagnosis.
 void app_ui_force_mix_show(bool force);
+
+// Test hook: apply a new tracked-channel selection live (the same path
+// the channel-picker Save flow takes after persisting to NVS). Used by
+// pc_sim's chpick_save script command so a regression can exercise the
+// stop+rebuild+restart lifecycle without driving the picker UI.
+// Persists to NVS, reseeds app_state, rebuilds faders, restarts the MS
+// worker. Caller must hold lvgl_port_lock.
+void app_ui_chpick_apply(const int *ids, size_t count);
+
+// Test hook: print one "settings_tile i=<i> x=<x> y=<y> name_x=<nx> swatch_x=<sx>"
+// line per channel tile in the settings overlay's grid, for asserting
+// column-major ordering and swatch-on-left placement. The settings
+// overlay must be open when called. Caller must hold lvgl_port_lock.
+void app_ui_settings_dump_tiles(void);
+
+// Test hook: apply a new MS host/port live (same path the MS-config Save
+// button takes). Opens the MS overlay if needed, sets the textareas,
+// and triggers on_mcfg_save -- which persists, drops the s_ms_setup_done
+// gate, and live-reconnects the MS client. Used by the names-on-reconfigure
+// regression to drive the bug repro without driving overlay taps. Caller
+// must hold lvgl_port_lock.
+void app_ui_mcfg_apply(const char *host, const char *port_str);

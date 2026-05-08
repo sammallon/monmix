@@ -62,10 +62,9 @@ TEST = {
             },
         },
     ],
-    # Hardware variant: same shape but driven through the REPL set-mix
-    # cmd. Mix-index persistence on hw is real NVS, so a tablet reboot
-    # between phases would actually carry it. Leaving hw-compatible OFF
-    # for now -- a hw run would need a power-cycle hook the harness
-    # doesn't have yet.
+    # Sim-only: hw runner has no phase / reboot support, and the second
+    # phase here is "boot the device fresh and observe restored mix". A
+    # power-cycle hook would unblock this; until then, NVS persistence
+    # on hw is exercised manually by power-cycling after a set-mix.
     "hw_compatible": False,
 }

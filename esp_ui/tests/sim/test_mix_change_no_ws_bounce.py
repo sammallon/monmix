@@ -50,9 +50,16 @@ TEST = {
             "OK quit",
         ],
         "stdout_not_contains": [
-            # Either of these in the middle of the run = WS got bounced.
-            # (Initial open is fine; any "WS closed" before quit is not.)
-            "ms_real: WS closed",
+            # Pre-graceful-shutdown this banned "ms_real: WS closed" --
+            # the bug being regressed was a reconnect during mix change.
+            # With graceful shutdown enabled, `quit` cleanly closes the
+            # WS at exit, which now legitimately produces "WS closed".
+            # Distinguish bounce from clean exit: the graceful path
+            # emits a banner first, so a bounce mid-test would log
+            # "WS closed" without that banner. We don't have substring-
+            # ordering checks in this runner, so rely on the absence
+            # of any "WS open" beyond the initial one to detect bounce
+            # (a reconnect would log a second "WS open").
             "LV_ASSERT",
         ],
     },

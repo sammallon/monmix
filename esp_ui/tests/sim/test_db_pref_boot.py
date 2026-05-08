@@ -33,6 +33,11 @@ TEST = {
     "skip_if": lambda: not MS_HOST,
     "skip_reason": "needs MONMIX_MS_HOST pointing at a live MS",
     "timeout_s": 30,
+    # Sim-only: hw runner has no phase support and no clean way to reboot
+    # the device mid-test from the REPL while keeping the serial session.
+    # The on-device persistence path is exercised manually by power-cycling
+    # after a level-format change.
+    "hw_compatible": False,
     "phases": [
         {
             "name": "seed_db",

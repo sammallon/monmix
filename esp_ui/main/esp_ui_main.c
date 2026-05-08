@@ -18,6 +18,7 @@
 #include "app_logd.h"
 #include "app_ms_client.h"
 #include "app_ms_info.h"
+#include "app_ms_setup.h"
 #include "app_power.h"
 #include "app_prefs.h"
 #include "app_config.h"
@@ -119,6 +120,16 @@ static void try_apply_ms_info(const ms_client_iface_t *ms)
         }
         if (ms->set_mix) ms->set_mix(saved);
     }
+}
+
+// Drop the boot-setup gate so the next CONNECTED state change re-runs
+// try_apply_ms_info. Called from the MS-config save path when host/port
+// change at runtime: the cached strip names + routability + mix routing
+// belong to the old host (or were never primed if MS was unreachable at
+// boot) and need re-priming against the new instance.
+void app_ms_setup_reset(void)
+{
+    s_ms_setup_done = false;
 }
 
 // Fires from the WS event task on every MS state transition AND from

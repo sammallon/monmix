@@ -22,7 +22,9 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include <SDL_syswm.h>
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -101,6 +103,27 @@ static int           g_last_x;
 static int           g_last_y;
 static const ms_client_iface_t *g_ms;
 
+// All exit paths (SDL_QUIT, SIGINT/SIGTERM, atexit, `quit` script cmd)
+// route through here so MS gets unsubscribes + WS close instead of an
+// abrupt TCP RST. Idempotent via the static flag -- atexit fires after
+// a signal handler already ran, and the script `quit` flow exits via
+// return-from-main which also fires atexit.
+static volatile int g_shutdown_done = 0;
+static void shutdown_ms_once(void) {
+    if (g_shutdown_done) return;
+    g_shutdown_done = 1;
+    if (g_ms && g_ms->shutdown_graceful) g_ms->shutdown_graceful();
+}
+
+// SIGINT/SIGTERM. Print and exit cleanly so atexit + flush run; signal
+// handlers can't safely call into mongoose directly, but exit() from
+// inside a handler is async-signal-safe and triggers our atexit hook.
+static void on_signal(int sig) {
+    fprintf(stderr, "pc_sim: caught signal %d, exiting\n", sig);
+    fflush(stderr);
+    exit(0);
+}
+
 static void inject_motion(int x, int y) {
     g_last_x = x; g_last_y = y;
     SDL_Event ev = (SDL_Event){0};
@@ -149,9 +172,55 @@ static void pump_for(uint32_t ms, uint32_t *prev_ticks) {
     }
 }
 
+// LVGL-snapshot-backed BMP write. Used as the fallback when the SDL
+// video driver doesn't provide a renderer (e.g. headless+dummy). Renders
+// the LVGL active screen into a caller-allocated XRGB8888 buffer, wraps
+// it in an SDL_Surface (no renderer required), and saves a BMP. The
+// XRGB8888 byte order matches SDL_PIXELFORMAT_BGRA32 on little-endian
+// so the wrap is a straight pointer reinterpret.
+static int take_screenshot_via_lvgl(const char *path) {
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr) { fprintf(stderr, "screenshot: no active screen\n"); return -10; }
+    int32_t w = lv_obj_get_width(scr);
+    int32_t h = lv_obj_get_height(scr);
+    if (w <= 0 || h <= 0) { fprintf(stderr, "screenshot: bad screen dims\n"); return -11; }
+
+    size_t buf_size = (size_t) w * (size_t) h * 4;
+    uint8_t *pixels = (uint8_t *) malloc(buf_size);
+    if (!pixels) { fprintf(stderr, "screenshot: alloc failed\n"); return -12; }
+
+    lv_image_dsc_t dsc;
+    memset(&dsc, 0, sizeof(dsc));
+    if (lv_snapshot_take_to_buf(scr, LV_COLOR_FORMAT_XRGB8888, &dsc, pixels, buf_size) != LV_RESULT_OK) {
+        fprintf(stderr, "screenshot: lv_snapshot_take_to_buf failed\n");
+        free(pixels);
+        return -13;
+    }
+
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormatFrom(
+        pixels, w, h, 32, w * 4, SDL_PIXELFORMAT_BGRA32);
+    if (!surf) {
+        fprintf(stderr, "screenshot: SDL_CreateRGBSurfaceWithFormatFrom: %s\n", SDL_GetError());
+        free(pixels);
+        return -14;
+    }
+    int rc = SDL_SaveBMP(surf, path);
+    SDL_FreeSurface(surf);
+    free(pixels);
+    if (rc != 0) {
+        fprintf(stderr, "screenshot: SaveBMP(%s): %s\n", path, SDL_GetError());
+        return -15;
+    }
+    return 0;
+}
+
 static int take_screenshot(const char *path) {
     SDL_Renderer *r = lv_sdl_window_get_renderer(g_disp);
-    if (!r) { fprintf(stderr, "screenshot: no renderer\n"); return -1; }
+    if (!r) {
+        // dummy/offscreen video drivers don't expose a renderer; render
+        // the screen via LVGL's snapshot API instead.
+        return take_screenshot_via_lvgl(path);
+    }
     int w, h;
     if (SDL_GetRendererOutputSize(r, &w, &h) != 0) {
         fprintf(stderr, "screenshot: GetRendererOutputSize: %s\n", SDL_GetError());
@@ -233,6 +302,80 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_prefs_set_level_format(f);
             if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
             printf("OK set_format %s\n", text);
+        } else if (strncmp(cmd, "chpick_save", 11) == 0) {
+            // Comma-separated id list, e.g. "chpick_save 0,2,5". Empty list
+            // means "track no channels"; bare "chpick_save" is the same.
+            // Drives app_ui_chpick_apply directly so the test exercises the
+            // stop+rebuild+restart path without driving the picker UI.
+            int ids[64];
+            int n = 0;
+            const char *p = cmd + 11;
+            while (*p == ' ' || *p == '\t') ++p;
+            while (*p && n < (int)(sizeof(ids)/sizeof(ids[0]))) {
+                int v;
+                int consumed = 0;
+                if (sscanf(p, "%d%n", &v, &consumed) == 1 && consumed > 0) {
+                    ids[n++] = v;
+                    p += consumed;
+                    if (*p == ',') ++p;
+                } else {
+                    break;
+                }
+            }
+            // Hold lvgl_port_lock the same way an LVGL-task event would --
+            // app_ui_chpick_apply documents that requirement.
+            lvgl_port_lock(0);
+            app_ui_chpick_apply(ids, (size_t) n);
+            lvgl_port_unlock();
+            printf("OK chpick_save n=%d\n", n);
+        } else if (strcmp(cmd, "dump_tiles") == 0) {
+            // Emits one settings_tile line per channel grid cell. The
+            // settings overlay must be open already (gear-icon tap then
+            // sleep). Holds lvgl_port_lock for the dump itself even
+            // though the read is just lv_obj_get_x — keep the discipline
+            // consistent with the rest of the script-driven hooks.
+            lvgl_port_lock(0);
+            app_ui_settings_dump_tiles();
+            lvgl_port_unlock();
+            printf("OK dump_tiles\n");
+        } else if (strncmp(cmd, "mcfg_apply", 10) == 0) {
+            // "mcfg_apply HOST PORT" — drive the MS-config Save path with
+            // the given host + port. Same code path the user takes via
+            // taps + the `type` REPL command. Used by the names-on-
+            // reconfigure regression to flip host without faking taps.
+            char host_buf[64];
+            int  port_num;
+            if (sscanf(cmd, "mcfg_apply %63s %d", host_buf, &port_num) != 2) {
+                printf("ERR mcfg_apply usage: mcfg_apply HOST PORT\n");
+            } else {
+                char port_buf[12];
+                snprintf(port_buf, sizeof(port_buf), "%d", port_num);
+                lvgl_port_lock(0);
+                app_ui_mcfg_apply(host_buf, port_buf);
+                lvgl_port_unlock();
+                printf("OK mcfg_apply %s %d\n", host_buf, port_num);
+            }
+        } else if (strncmp(cmd, "type ", 5) == 0) {
+            // Mirror the device's `type` REPL command: write into whichever
+            // textarea is focused. Useful so a single sim script can stand
+            // in for a tap-and-type sequence without coordinate hardcoding.
+            // Walks the focused indev's group first, then falls back to
+            // scanning the screen tree for a focused textarea.
+            const char *text = cmd + 5;
+            while (*text == ' ' || *text == '\t') ++text;
+            lvgl_port_lock(0);
+            lv_obj_t *ta = NULL;
+            lv_indev_t *indev = NULL;
+            while ((indev = lv_indev_get_next(indev)) != NULL) {
+                lv_group_t *g = lv_indev_get_group(indev);
+                if (!g) continue;
+                lv_obj_t *f = lv_group_get_focused(g);
+                if (f && lv_obj_check_type(f, &lv_textarea_class)) { ta = f; break; }
+            }
+            if (ta) lv_textarea_set_text(ta, text);
+            lvgl_port_unlock();
+            if (ta) printf("OK type %s\n", text);
+            else    printf("ERR type: no focused textarea\n");
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
             // Drive the mix-change path the same way the picker does:
             // ms->set_mix() updates the active subscription, AND
@@ -302,6 +445,10 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             mock_app_wifi_set_state(s);
             printf("OK power_degraded %s\n", text);
         } else if (strcmp(cmd, "quit") == 0) {
+            // Flush MS before printing the OK marker so test stdout
+            // captures the full unsubscribe sequence; the harness
+            // greps for "OK quit" as the run-completed marker.
+            shutdown_ms_once();
             printf("OK quit\n");
             return 1;
         } else {
@@ -347,6 +494,29 @@ int main(int argc, char **argv) {
     }
     if (do_throttle) throttle_apply();
 
+    // Headless mode: route SDL through the dummy video driver so no real
+    // OS window is created. The "offscreen" driver would also work (and
+    // would even keep an SDL_Renderer alive) but it isn't compiled into
+    // the SDL2 dev pack we use, so dummy + a snapshot-based screenshot
+    // fallback is the working combo. Earlier attempts at hiding the
+    // window post-create couldn't prevent the activation flash because
+    // on Windows SDL_CreateWindow shows + activates the window before
+    // any SDL_HideWindow call gets a chance to run.
+    if (headless) {
+        SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    }
+
+    // Suppress focus-stealing on every internal SDL_RaiseWindow. Cheap
+    // insurance for non-headless interactive runs.
+    SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+
+    // Register exit hooks BEFORE the MS client comes up. atexit covers
+    // normal return-from-main + exit(); the signal handlers turn ^C and
+    // SIGTERM into a clean exit() call so the atexit chain runs.
+    atexit(shutdown_ms_once);
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -361,7 +531,22 @@ int main(int argc, char **argv) {
     // Headless: hide the SDL window after creation so scripted runs don't
     // pop a window onto the user's screen. Rendering still happens to the
     // off-screen renderer, so screenshot commands work normally.
+    //
+    // On Windows, lv_sdl_window_create shows + raises the window before we
+    // get a chance to call SDL_HideWindow, so for a moment the window
+    // appears and grabs focus from whatever the user is typing into. Set
+    // WS_EX_NOACTIVATE so the OS won't activate the window even on that
+    // brief flash, then hide it permanently.
     if (headless && g_sdl_window) {
+#ifdef _WIN32
+        SDL_SysWMinfo wmi;
+        SDL_VERSION(&wmi.version);
+        if (SDL_GetWindowWMInfo(g_sdl_window, &wmi)) {
+            HWND hwnd = wmi.info.win.window;
+            LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        }
+#endif
         SDL_HideWindow(g_sdl_window);
     }
 
@@ -458,9 +643,17 @@ int main(int argc, char **argv) {
     // Interactive mode: pump until the SDL window is closed. Same
     // lvgl_port_lock discipline as pump_for -- non-LVGL threads (mongoose
     // worker) take the lock to touch widgets, so the handler must hold
-    // it during render too.
+    // it during render too. SDL_QUIT (window close) exits via the same
+    // atexit path as the script `quit` command, so MS gets unsubscribes
+    // + WS close before we tear down.
     uint32_t prev = SDL_GetTicks();
     for (;;) {
+        SDL_Event ev;
+        while (SDL_PeepEvents(&ev, 1, SDL_PEEKEVENT, SDL_QUIT, SDL_QUIT) > 0) {
+            // PeepEvents leaves it in the queue for LVGL's SDL driver to
+            // consume too; we just observe and break out.
+            return 0;   // atexit -> shutdown_ms_once -> graceful close
+        }
         uint32_t now = SDL_GetTicks();
         lv_tick_inc(now - prev);
         prev = now;

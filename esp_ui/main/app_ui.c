@@ -1,6 +1,7 @@
 #include "app_ui.h"
 #include "app_display.h"
 #include "app_logd.h"
+#include "app_ms_setup.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_time.h"
@@ -316,9 +317,10 @@ static bool      s_ssid_long_press_consumed;
 // Channel picker overlay (entry: Settings -> Edit Channels...).
 // Shows every channel on the connected console as a row with a checkbox;
 // user picks up to APP_UI_MAX_TRACKED_CHANNELS to track on faders. Save
-// persists to NVS via app_config_set_channel_ids and reboots; the rebuild
-// path under live broadcast traffic is a known race (see esp_ui_main.c
-// safe_max comment), so reboot is the simpler shape.
+// persists to NVS via app_config_set_channel_ids and rebuilds the fader
+// UI live: ms->stop joins the worker, app_state_init reseeds against the
+// new ids, app_ui_present_channels rebuilds the strips, ms->start
+// re-subscribes for the new set. No reboot.
 static int       s_total_channels;        // totalChannels from /console/information
 static lv_obj_t *s_chpick_overlay;
 static lv_obj_t *s_chpick_list;
@@ -447,6 +449,10 @@ static lv_obj_t *s_reboot_confirm;
 // to miss in the pre-reset window before the panel goes black.
 static lv_obj_t *s_rebooting_overlay;
 static void show_rebooting_overlay(void);
+// Channel-picker live-apply overlay (different label than rebooting).
+static lv_obj_t *s_applying_overlay;
+static void show_applying_overlay(void);
+static void hide_applying_overlay(void);
 static void wifi_panel_open(void);
 static void wifi_panel_close(void);
 static void wifi_panel_refresh(void);
@@ -2407,10 +2413,12 @@ static void build_settings_overlay(void)
     // Section: Channels — 4 columns x 6 rows. The bottom-right slot is
     // permanently the master strip's tile (always reachable regardless
     // of how many input channels are tracked). The remaining 23 slots
-    // fill row-major from top-left with channel tiles. Tile geometry is
-    // a bit taller than before so name + swatch breathe in the larger
-    // cell; LV_LABEL_LONG_DOT truncates with "..." when the name doesn't
-    // fit.
+    // hold channel tiles. Tile geometry is a bit taller than before so
+    // name + swatch breathe in the larger cell; LV_LABEL_LONG_DOT
+    // truncates with "..." when the name doesn't fit.
+    //
+    // Column-major iteration: fill column 0 top-to-bottom, then column 1,
+    // then column 2. Reads more naturally for a list of channel slots.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 272);
@@ -2454,8 +2462,8 @@ static void build_settings_overlay(void)
     if (total > MAX_TILES) total = MAX_TILES;
 
     for (size_t i = 0; i < total; ++i) {
-        int col = (int)(i % grid_cols);
-        int row = (int)(i / grid_cols);
+        int col = (int)(i / grid_rows);
+        int row = (int)(i % grid_rows);
         int x = col * (tile_w + col_gap);
         int y = row * (tile_h + row_gap);
 
@@ -2476,7 +2484,7 @@ static void build_settings_overlay(void)
         lv_label_set_text(name, name_text);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name, tile_w - swatch_sz - 24);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, swatch_sz + 8, 0);
         // Drag-to-reorder lives on the name label (LVGL 9 only fires
         // LONG_PRESSED on CLICKABLE objects; lv_obj_create-style
         // containers don't get the event without explicit flag-add,
@@ -2499,7 +2507,7 @@ static void build_settings_overlay(void)
 
         lv_obj_t *swatch = lv_obj_create(tile);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
-        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(swatch, LV_ALIGN_LEFT_MID, 0, 0);
         lv_obj_set_style_radius(swatch, 4, 0);
         lv_obj_set_style_border_width(swatch, 1, 0);
         lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
@@ -2532,7 +2540,7 @@ static void build_settings_overlay(void)
         lv_obj_t *name = lv_label_create(tile);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
         lv_obj_set_width(name, tile_w - swatch_sz - 24);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, swatch_sz + 8, 0);
         lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
                             (void *)(uintptr_t) UI_TARGET_MASTER);
@@ -2542,7 +2550,7 @@ static void build_settings_overlay(void)
 
         lv_obj_t *swatch = lv_obj_create(tile);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
-        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_align(swatch, LV_ALIGN_LEFT_MID, 0, 0);
         lv_obj_set_style_radius(swatch, 4, 0);
         lv_obj_set_style_border_width(swatch, 1, 0);
         lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
@@ -2693,7 +2701,7 @@ static void on_reboot_yes(lv_event_t *e)
     ESP_LOGW(TAG, "user-initiated reboot");
     show_rebooting_overlay();
     vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
 }
 
 // Build (lazy) and present a full-screen "Rebooting..." overlay so the
@@ -2728,6 +2736,46 @@ static void show_rebooting_overlay(void)
     }
     lv_obj_move_foreground(s_rebooting_overlay);
     lv_refr_now(NULL);
+}
+
+// Applying overlay -- like the rebooting one but with different label
+// text so the user doesn't think the device is restarting. Shown by the
+// channel-picker save path while chpick_apply_async runs.
+static void show_applying_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    if (!s_applying_overlay) {
+        lv_obj_t *ov = lv_obj_create(scr);
+        lv_obj_set_size(ov, lv_obj_get_width(scr), lv_obj_get_height(scr));
+        lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ov, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ov, 0, 0);
+        lv_obj_set_style_radius(ov, 0, 0);
+        lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *spinner = lv_spinner_create(ov);
+        lv_obj_set_size(spinner, 80, 80);
+        lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -30);
+
+        lv_obj_t *lbl = lv_label_create(ov);
+        lv_label_set_text(lbl, "Applying...");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align_to(lbl, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+        s_applying_overlay = ov;
+    } else {
+        lv_obj_remove_flag(s_applying_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(s_applying_overlay);
+    lv_refr_now(NULL);
+}
+
+static void hide_applying_overlay(void)
+{
+    if (s_applying_overlay) {
+        lv_obj_add_flag(s_applying_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void on_reboot_no(lv_event_t *e)
@@ -3620,7 +3668,7 @@ static void on_wcfg_save_yes(lv_event_t *e)
     if (!app_wifi_reconfigure()) {
         show_rebooting_overlay();
         vTaskDelay(pdMS_TO_TICKS(800));
-        esp_restart();
+        app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
         return;   // unreached
     }
     // NTP server / DHCP-NTP changes apply live too -- apply_sntp_config
@@ -4555,10 +4603,17 @@ static void on_mcfg_save(lv_event_t *e)
     lv_label_set_text(s_mcfg_status_label,
                       "#40C060 Saved. Reconnecting to MS...#");
 
+    // Drop the boot-setup gate so the next CONNECTED transition re-primes
+    // strip names + routability + mix routing against the new host. If MS
+    // was unreachable at boot the gate is already false and this is a
+    // no-op; if MS came good against the old host the gate latched true
+    // and would otherwise short-circuit the retry.
+    app_ms_setup_reset();
+
     // Live-apply for host/port/osc-port within the same protocol. The
-    // active client recomposes URLs from app_config_* on its next
-    // reconnect cycle -- the iface's reconnect() closes the current
-    // connection and the worker re-opens with whatever NVS now returns.
+    // iface's reconnect() recomposes URLs from app_config_* and drains
+    // the current connection so the worker reopens against the new
+    // target on its next poll cycle.
     if (s_ms && s_ms->reconnect) s_ms->reconnect();
 }
 
@@ -4566,7 +4621,7 @@ static void on_mcfg_reboot_yes(lv_event_t *e)
 {
     (void)e;
     if (s_mcfg_reboot_confirm) lv_obj_add_flag(s_mcfg_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
-    esp_restart();
+    app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
 }
 
 static void on_mcfg_reboot_no(lv_event_t *e)
@@ -4942,11 +4997,116 @@ static void build_chpick_discard_confirm(void)
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Save-confirm popup. Save applies via reboot (the rebuild-while-live
-// path has a known race -- see esp_ui_main.c safe_max comment), and
-// users would be surprised by a chip reset they didn't agree to. So
-// Save shows this confirm first.
+// Save-confirm popup. Save rebuilds the fader UI live (see
+// chpick_apply_async); the confirm exists because the rebuild visibly
+// recomposes the screen and we want a deliberate second tap.
 static lv_obj_t *s_chpick_save_confirm;
+
+// Run on the LVGL task (lv_async_call) so the actual stop+rebuild
+// happens between event dispatches -- mirrors reorder_persist_and_rebuild.
+// app_ui_present_channels destroys the very widgets a save-button event
+// dispatch would unwind through if we did this inline.
+//
+// Deadlock note: ms->stop joins the worker thread, and the worker
+// thread acquires lvgl_port_lock from on_state_change to schedule
+// async sweeps. We're called with lvgl_port_lock held (lv_timer_handler
+// runs under it), so we MUST drop the lock across stop/start or the
+// worker will hang waiting for it while we're hung waiting for the
+// worker. Symptom is a stuck UI on Save against a busy console.
+static void chpick_apply_async(void *unused)
+{
+    (void) unused;
+    size_t before = app_state_count();
+    ESP_LOGI(TAG, "chpick: live-apply start (current=%u)", (unsigned) before);
+
+    // Drop lvgl_port_lock for the join. Worker may be mid-broadcast
+    // routing -> on_state_change -> lvgl_port_lock; deadlocks otherwise.
+    lvgl_port_unlock();
+    if (s_ms && s_ms->stop) s_ms->stop();
+    lvgl_port_lock(0);
+
+    // Reseed app_state against the freshly-persisted id list. NVS is
+    // authoritative here: app_config_set_channel_ids ran in on_chpick_save_yes
+    // before we queued this async, so app_config_channel_ids returns the
+    // new set.
+    size_t n = 0;
+    const int *ids = app_config_channel_ids(&n);
+    app_state_init(ids, n);
+
+    // Rebuild faders. present_channels is idempotent on re-call: it
+    // lv_obj_cleans the tileview and recreates strips against the new
+    // app_state. Master strip is built once and survives the clean.
+    app_ui_present_channels();
+
+    // Start the worker again. The on-connect handler in subscribe_all
+    // reads fresh app_state_count() so the new id set is what gets
+    // subscribed. The strip-name cache primed at boot covers any newly
+    // added ids without an extra fetch. Lock release isn't strictly
+    // needed here -- start() returns immediately after spawning the
+    // worker -- but keeps the symmetry with stop().
+    lvgl_port_unlock();
+    if (s_ms && s_ms->start) s_ms->start();
+    lvgl_port_lock(0);
+
+    ESP_LOGI(TAG, "chpick: live-apply done (now=%u)", (unsigned) app_state_count());
+    hide_applying_overlay();
+    chpick_close();
+}
+
+// Test hook -- see app_ui.h. Persists the selection then runs the same
+// stop+rebuild+restart sequence as the picker's Save path. Skips the
+// overlay/close UI since the test driver isn't going through the picker.
+void app_ui_chpick_apply(const int *ids, size_t count)
+{
+    if (!app_config_set_channel_ids(ids, count)) {
+        ESP_LOGE(TAG, "chpick_apply: NVS write failed");
+        return;
+    }
+    chpick_apply_async(NULL);
+}
+
+// Dump tile coordinates for the settings-overlay channel grid. Used by
+// the sim's settings-grid regression test to assert column-major fill
+// (tile y increases for adjacent indices within a column) and swatch-
+// on-left placement (swatch_x < name_x in every tile).
+void app_ui_settings_dump_tiles(void)
+{
+    size_t total = app_state_count();
+    for (size_t i = 0; i < total; ++i) {
+        lv_obj_t *tile = s_row_tile_objs[i];
+        if (!tile) continue;
+        lv_obj_t *name   = s_row_name_labels[i];
+        lv_obj_t *swatch = s_color_swatches[i];
+        int tx = (int) lv_obj_get_x(tile);
+        int ty = (int) lv_obj_get_y(tile);
+        int nx = name   ? (int) lv_obj_get_x(name)   : -1;
+        int sx = swatch ? (int) lv_obj_get_x(swatch) : -1;
+        printf("settings_tile i=%zu x=%d y=%d name_x=%d swatch_x=%d\n",
+               i, tx, ty, nx, sx);
+    }
+    fflush(stdout);
+}
+
+// Test hook -- see app_ui.h. Drives the same path on_mcfg_save takes when
+// the user taps Save in the MS-config overlay: seed the textareas (the
+// overlay is built lazily so call mcfg_open if needed), then hand off to
+// on_mcfg_save which validates, persists via app_config_*, drops the
+// s_ms_setup_done gate, and triggers ms->reconnect(). Used by the
+// names-on-reconfigure regression test to flip MS host without faking
+// overlay taps + keyboard typing.
+void app_ui_mcfg_apply(const char *host, const char *port_str)
+{
+    if (!host || !port_str) return;
+    if (!s_mcfg_overlay) build_mcfg_overlay();
+    // mcfg_open snapshots the current app_config_ms_* values into the
+    // textareas + s_mcfg_orig_*; that re-snapshot is needed so the dirty
+    // detector is consistent. Then we overwrite the textareas with the
+    // test's intended values before calling on_mcfg_save.
+    mcfg_open();
+    lv_textarea_set_text(s_mcfg_host_ta, host);
+    lv_textarea_set_text(s_mcfg_port_ta, port_str);
+    on_mcfg_save(NULL);
+}
 
 static void on_chpick_save_yes(lv_event_t *e)
 {
@@ -4965,9 +5125,12 @@ static void on_chpick_save_yes(lv_event_t *e)
                           "#FF6060 Save failed (NVS error).#");
         return;
     }
-    show_rebooting_overlay();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    if (s_chpick_save_confirm) lv_obj_add_flag(s_chpick_save_confirm, LV_OBJ_FLAG_HIDDEN);
+    show_applying_overlay();
+    // Defer until after this event finishes dispatching -- the picker
+    // overlay (which owns the Save button we're inside) gets destroyed
+    // by chpick_close inside chpick_apply_async.
+    lv_async_call(chpick_apply_async, NULL);
 }
 
 static void on_chpick_save_no(lv_event_t *e)
@@ -4990,7 +5153,7 @@ static void build_chpick_save_confirm(void)
 
     lv_obj_t *msg = lv_label_create(p);
     lv_label_set_text(msg,
-                      "Save selection and restart the device?\n"
+                      "Save selection?\n"
                       "The fader UI will rebuild against the new channels.");
     lv_obj_align(msg, LV_ALIGN_TOP_LEFT, 0, 0);
 
@@ -5007,7 +5170,7 @@ static void build_chpick_save_confirm(void)
     lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(yes, lv_color_hex(0x40C060), 0);
     lv_obj_t *yl = lv_label_create(yes);
-    lv_label_set_text(yl, LV_SYMBOL_OK " Save & Restart");
+    lv_label_set_text(yl, LV_SYMBOL_OK " Save");
     lv_obj_center(yl);
     lv_obj_add_event_cb(yes, on_chpick_save_yes, LV_EVENT_CLICKED, NULL);
 

@@ -77,6 +77,9 @@ static void m_fetch_channel_routability(int total) { (void)total; }
 static bool m_is_channel_routable(int id)          { (void)id; return true; }
 static void m_set_meter_enabled(bool on)           { (void)on; }
 static void m_set_level_format(app_level_format_t f) { (void)f; }
+static void m_shutdown_graceful(void) {
+    fprintf(stdout, "[mock_ms] shutdown_graceful\n");
+}
 
 static const ms_client_iface_t s_iface = {
     .start                       = m_start,
@@ -106,6 +109,7 @@ static const ms_client_iface_t s_iface = {
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
     .is_console_attached         = NULL,
+    .shutdown_graceful           = m_shutdown_graceful,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void)  { return &s_iface; }
@@ -113,3 +117,9 @@ const ms_client_iface_t *app_ms_client_ws(void)  { return &s_iface; }
 // app_ms_client_osc symbol if the user toggled the protocol pref. Tablet
 // firmware overrides this with the real OSC implementation.
 const ms_client_iface_t *app_ms_client_osc(void) { return &s_iface; }
+
+// On the tablet this clears esp_ui_main.c's s_ms_setup_done so the
+// boot-time MS-info prime re-runs after a host change. The sim doesn't
+// model that gate (the mock client always reports CONNECTED + skips
+// fetch_all_strip_names anyway), so this is a no-op stub for link parity.
+void app_ms_setup_reset(void) {}

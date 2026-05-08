@@ -631,12 +631,43 @@ static int worker_thread(void *unused) {
 // ms_client_iface_t
 // ────────────────────────────────────────────────────────────────────────────
 
-static bool m_start(void) { return true; /* started by ms_client_real_osc_create */ }
+// Spawn the worker. Split from ms_client_real_osc_create so the picker
+// live-apply path can stop + reseed app_state + start again. Mirrors the
+// firmware's osc_start/osc_stop shape; same rationale as the WS twin.
+static bool m_start(void) {
+    if (g_osc.thread) return true;
+    if (!g_osc.outq_mtx) g_osc.outq_mtx = SDL_CreateMutex();
+    osc_expect_init(&g_osc.expect, g_osc.expect_slots, OSC_EXPECT_SIZE,
+                    OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
+    g_osc.running          = true;
+    g_osc.state            = APP_MS_STATE_BOOT;
+    g_osc.udp_open         = false;
+    g_osc.info_fetched     = false;
+    g_osc.primed           = false;
+    g_osc.prime_idx        = 0;
+    g_osc.last_heartbeat_ms= 0;
+    g_osc.last_init_ms     = 0;
+    g_osc.last_watchdog_ms = 0;
+    g_osc.last_expect_tick_ms = 0;
+    g_osc.level_fmt        = app_prefs_get_level_format();
+    g_osc.thread           = SDL_CreateThread(worker_thread, "ms_real_osc", NULL);
+    return g_osc.thread != NULL;
+}
+
 static void m_stop(void) {
     g_osc.running = false;
     if (g_osc.thread) {
         SDL_WaitThread(g_osc.thread, NULL);
         g_osc.thread = NULL;
+    }
+    // Drop any queued outbound packets so a restart against a new
+    // channel set doesn't emit on stale filter/level state.
+    outq_entry_t *e = outq_drain();
+    while (e) {
+        outq_entry_t *next = e->next;
+        free(e->pkt);
+        free(e);
+        e = next;
     }
 }
 
@@ -727,6 +758,21 @@ static const char *m_get_strip_name(int id) {
 static void m_fetch_channel_routability(int total) { (void)total; }
 static bool m_is_channel_routable      (int id)    { (void)id; return true; }
 static void m_set_meter_enabled(bool on)           { (void)on; }
+// OSC shutdown is asymmetric vs WS: no /unsubscribe path, MS's
+// heartbeat-subscribe entry expires server-side after ~5 s of silence.
+// Drain pending UDP sends so a final SET right before exit isn't
+// dropped. Documented in main/app_ms_client_osc.c::osc_shutdown_graceful.
+static void m_shutdown_graceful(void) {
+    if (!g_osc.thread) return;
+    for (int i = 0; i < 10; ++i) {
+        SDL_LockMutex(g_osc.outq_mtx);
+        bool empty = (g_osc.outq_head == NULL);
+        SDL_UnlockMutex(g_osc.outq_mtx);
+        if (empty) break;
+        SDL_Delay(25);
+    }
+}
+
 static void m_set_level_format(app_level_format_t f) {
     if (g_osc.level_fmt == f) return;
     g_osc.level_fmt = f;
@@ -769,6 +815,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = m_is_channel_routable,
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
+    .shutdown_graceful           = m_shutdown_graceful,
 };
 
 const ms_client_iface_t *ms_client_real_osc_create(const char *host, int http_port, int osc_port) {
@@ -778,12 +825,8 @@ const ms_client_iface_t *ms_client_real_osc_create(const char *host, int http_po
     snprintf(g_osc.udp_url,   sizeof(g_osc.udp_url),   "udp://%s:%d", host, osc_port);
     snprintf(g_osc.http_base, sizeof(g_osc.http_base), "http://%s:%d", host, http_port);
 
-    g_osc.outq_mtx  = SDL_CreateMutex();
-    osc_expect_init(&g_osc.expect, g_osc.expect_slots, OSC_EXPECT_SIZE,
-                    OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
-    g_osc.running   = true;
-    g_osc.state     = APP_MS_STATE_BOOT;
-    g_osc.level_fmt = app_prefs_get_level_format();
-    g_osc.thread    = SDL_CreateThread(worker_thread, "ms_real_osc", NULL);
+    // Worker is started by m_start, mirroring the firmware. pc_main calls
+    // ms->start() right after create, so existing call sites still work.
+    g_osc.state = APP_MS_STATE_BOOT;
     return &s_iface;
 }

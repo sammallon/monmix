@@ -203,6 +203,10 @@ static struct {
 
     TaskHandle_t            task;
     volatile bool           running;
+    // Bounded join: see app_ms_client_ws.c::ws_stop. Picker live-apply
+    // restarts the worker immediately after stopping it; without the
+    // join the second osc_task races the dying one on the global g.
+    SemaphoreHandle_t       exit_sig;
 
     // Mongoose owns only the boot-time HTTP fetches now; the OSC pipe is
     // raw udp_pcb so the udp_recv callback can drop irrelevant packets in
@@ -996,6 +1000,7 @@ static void osc_task(void *unused) {
 
     udp_pcb_down();
     mg_mgr_free(&g.mgr);
+    if (g.exit_sig) xSemaphoreGive(g.exit_sig);
     vTaskDelete(NULL);
 }
 
@@ -1006,11 +1011,17 @@ static void osc_task(void *unused) {
 static bool osc_start(void) {
     if (g.task) return true;
     g.outq_mtx = xSemaphoreCreateMutex();
+    g.exit_sig = xSemaphoreCreateBinary();
     g.rx_q     = xQueueCreate(OSC_RX_QUEUE_DEPTH, sizeof(osc_rx_entry_t));
     if (!g.rx_q) {
         ESP_LOGE(TAG, "rx queue create failed");
         return false;
     }
+    // Reset prime/info state so a restart re-fetches /console/information
+    // and re-primes against the (potentially new) tracked-channel list.
+    g.info_fetched = false;
+    g.primed       = false;
+    g.prime_idx    = 0;
     osc_expect_init(&g.expect, g.expect_slots, OSC_EXPECT_SIZE,
                     OSC_EXPECT_TIMEOUT_MS, osc_expect_retry_send, NULL);
     g.running  = true;
@@ -1025,7 +1036,34 @@ static bool osc_start(void) {
 
 static void osc_stop(void) {
     g.running = false;
+    // Bounded join. Same rationale as ws_stop: the picker live-apply
+    // path restarts the worker immediately, and the new task can't be
+    // allowed to race the old one on the global g (mgr, queues, pcb).
+    if (g.exit_sig) {
+        if (xSemaphoreTake(g.exit_sig, pdMS_TO_TICKS(1500)) != pdTRUE) {
+            ESP_LOGW(TAG, "osc_stop: worker join timed out");
+        }
+        vSemaphoreDelete(g.exit_sig);
+        g.exit_sig = NULL;
+    }
     g.task = NULL;
+    // Drain + free outq, drop the mutex. Anything still queued was for
+    // the prior session and would emit on the wrong filter/level.
+    if (g.outq_mtx) {
+        outq_entry_t *e = outq_drain();
+        while (e) {
+            outq_entry_t *next = e->next;
+            free(e->pkt);
+            free(e);
+            e = next;
+        }
+        vSemaphoreDelete(g.outq_mtx);
+        g.outq_mtx = NULL;
+    }
+    if (g.rx_q) {
+        vQueueDelete(g.rx_q);
+        g.rx_q = NULL;
+    }
     set_state(APP_MS_STATE_BOOT);
 }
 
@@ -1122,6 +1160,19 @@ static void osc_resubscribe       (void)        {
     g.prime_idx = 0;
 }
 static void osc_reconnect         (void)        {
+    // Pick up any host/port change made via the MS-config save path. The
+    // worker keeps the cached g.udp_host / g.info_url so without this
+    // recompose a host-change reconnect targets the OLD host. On a same-
+    // host reconnect (network blip) compose_urls is a no-op rewrite of
+    // the same strings. When the host actually changed, drop info_fetched
+    // so the next /console/information GET re-runs against the new host.
+    char prev_host[sizeof(g.udp_host)];
+    memcpy(prev_host, g.udp_host, sizeof(prev_host));
+    int  prev_port = g.udp_port;
+    compose_urls();
+    if (strcmp(prev_host, g.udp_host) != 0 || prev_port != g.udp_port) {
+        g.info_fetched = false;
+    }
     udp_pcb_down();
     // PCB will come back up on the next loop iteration via udp_pcb_up.
 }
@@ -1137,6 +1188,34 @@ static void osc_fetch_channel_routability(int total)     { (void)total; /* TODO 
 static bool osc_is_channel_routable      (int id)        { (void)id; return true; }
 
 static void osc_set_meter_enabled(bool on)               { (void)on; /* TODO */ }
+
+// OSC graceful shutdown is asymmetric vs WS: there is no /unsubscribe
+// path on the OSC bridge -- MS's heartbeat-subscribe model just stops
+// pushing to a UDP source after ~5 s of no inbound /hi packets. The
+// equivalent of "tell MS we're going" is "stop heartbeating and let the
+// timeout drop us"; UDP has no connection state to clean up. We still
+// drain any pending outbound packets so a final SET (e.g. user toggled
+// mute right before reboot) doesn't get dropped in the worker queue.
+// The WS-vs-OSC asymmetry is intentional: documenting it here so a
+// future reader doesn't try to add a non-existent unsubscribe path.
+static void osc_shutdown_graceful(void)
+{
+    if (!g.task) return;
+
+    // Drain whatever's queued so the last user action lands. ~250 ms
+    // budget; outbound is one UDP send per poll, queue is typically
+    // single-digit entries.
+    for (int i = 0; i < 10; ++i) {
+        bool empty;
+        xSemaphoreTake(g.outq_mtx, portMAX_DELAY);
+        empty = (g.outq_head == NULL);
+        xSemaphoreGive(g.outq_mtx);
+        if (empty) break;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    // Heartbeat dies naturally when the worker stops. MS's UDP-source
+    // entry expires server-side; nothing more to do.
+}
 
 static void osc_set_level_format(app_level_format_t f) {
     if (g.level_format == f) return;
@@ -1186,6 +1265,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = osc_is_channel_routable,
     .set_meter_enabled           = osc_set_meter_enabled,
     .set_level_format            = osc_set_level_format,
+    .shutdown_graceful           = osc_shutdown_graceful,
 };
 
 const ms_client_iface_t *app_ms_client_osc(void) { return &s_iface; }

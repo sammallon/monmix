@@ -166,8 +166,21 @@ def main():
                 raw = send_and_drain(ser, step[4:], idle_grace=0.4, max_wait=8)
                 print(raw.decode("utf-8", "replace"), end="", flush=True)
             elif step.startswith("wait:"):
+                # Drain the device's serial output across the wait window
+                # so background log lines (heartbeat ticks, async WS
+                # events) make it into captured stdout. Without this the
+                # OS buffers them invisibly and they're lost when the
+                # final ser.close() runs -- breaks tests that assert on
+                # event-driven log lines emitted between commands.
                 ms = int(step[5:])
-                time.sleep(ms / 1000.0)
+                deadline = time.time() + ms / 1000.0
+                while time.time() < deadline:
+                    chunk = ser.read(4096)
+                    if chunk:
+                        sys.stdout.write(chunk.decode("utf-8", "replace"))
+                        sys.stdout.flush()
+                    else:
+                        time.sleep(0.05)
             else:
                 print(f"  ! unknown step: {step!r}")
         print("=== done ===")
