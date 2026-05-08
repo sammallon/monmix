@@ -80,6 +80,7 @@ void              app_wifi_format_ip(char *buf, size_t buflen) {
     snapshot_host();
     if (buf && buflen > 0) snprintf(buf, buflen, "%s", s_ipv4);
 }
+const char       *app_wifi_get_security_str(void) { return "WPA2-PSK"; }
 
 // Periodic-ish ticker fed by app_ui's existing wifi_state_color polling.
 // We can't fire from register_on_change directly -- lv_async_call from
