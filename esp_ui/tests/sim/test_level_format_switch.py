@@ -43,4 +43,22 @@ TEST = {
             "Assertion failed",
         ],
     },
+    # Hardware variant: same `cmd:level-format db` flips the pref. The
+    # firmware's level-format command echoes "level-format: db", which
+    # matches sim's "OK set_format db" only loosely -- write hw_expect
+    # against the device's printf, not the sim marker. No live-MS gating
+    # here: a hw run without MS still drives the prefs setter, and the
+    # absence of LV_ASSERT is the meaningful invariant.
+    "hw_compatible": True,
+    "hw_expect": {
+        "exit_code": 0,
+        "stdout_contains": [
+            "level-format: db",
+        ],
+        "stdout_not_contains": [
+            "LV_ASSERT",
+            "panic",
+            "abort",
+        ],
+    },
 }

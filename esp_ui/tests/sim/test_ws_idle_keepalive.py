@@ -45,4 +45,22 @@ TEST = {
             "LV_ASSERT",
         ],
     },
+    # Hardware variant: same 45 s idle, just on the device. Firmware logs
+    # "ws closed" (lowercase) instead of "WS closed" -- if the keepalive
+    # regressed the device would print that mid-sleep. There's no `quit`
+    # equivalent, so the script just sleeps; lack of a close mid-idle is
+    # the assertion.
+    "hw_compatible": True,
+    "hw_script": (
+        "sleep 45000\n"
+    ),
+    "hw_expect": {
+        "exit_code": 0,
+        "stdout_not_contains": [
+            "ws closed",
+            "LV_ASSERT",
+            "panic",
+            "abort",
+        ],
+    },
 }
