@@ -105,6 +105,19 @@ typedef struct {
     // gate (the other being get_state() == CONNECTED).
     bool (*is_mix_list_ready)(void);
 
+    // True once MS has reported `state == "connected"` on /app/state. This
+    // is *separate* from get_state() — the WS connects to MS itself, but
+    // MS may still be trying to attach to its physical console (common
+    // scenario: console gets powered off after service and back on the
+    // following week). While the WS is up but the console isn't, queries
+    // like /console/information return default-shaped data and broadcasts
+    // never fire, so the boot-time setup must wait on this flag.
+    // Polled via /app/state heartbeat at HEARTBEAT_INTERVAL_MS; flips
+    // notify_subscribers so the UI's MS icon can show a distinct
+    // "MS up, console offline" state. Defaults to false until the first
+    // heartbeat lands.
+    bool (*is_console_attached)(void);
+
     // Re-subscribe every tracked channel under the current mix bus. Used
     // by the discovery flow after reseeding app_state. No-op when the WS
     // isn't connected.

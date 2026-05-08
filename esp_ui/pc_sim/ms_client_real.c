@@ -184,6 +184,38 @@ static void subscribe_master(int master_id) {
     send_subscribe(dotted, "val");
 }
 
+// Per OpenAPI: /console/data/unsubscribe takes the same body as subscribe
+// and "the path must match 1:1 the path used for the subscription". Used
+// on mix-change so MS drops the old mix's broadcasts without bouncing
+// the WS. cfg.name + mix-name subs aren't mix-specific so they stay live.
+static void send_unsubscribe(const char *dotted, const char *fmt) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"method\":\"POST\",\"path\":\"/console/data/unsubscribe\","
+             "\"body\":{\"path\":\"%s\",\"format\":\"%s\"}}",
+             dotted, fmt);
+    outq_push(buf);
+}
+
+static void unsubscribe_channel(int ch_id, int mix_idx) {
+    const char *lvl_fmt = (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
+    char dotted[64];
+    snprintf(dotted, sizeof(dotted), "ch.%d.levelData.%d.lvl", ch_id, mix_idx);
+    send_unsubscribe(dotted, lvl_fmt);
+    snprintf(dotted, sizeof(dotted), "ch.%d.levelData.%d.on", ch_id, mix_idx);
+    send_unsubscribe(dotted, "val");
+}
+
+static void unsubscribe_master(int master_id) {
+    if (master_id < 0) return;
+    const char *lvl_fmt = (g_ms.level_fmt == APP_LEVEL_FORMAT_DB) ? "val" : "norm";
+    char dotted[64];
+    snprintf(dotted, sizeof(dotted), "ch.%d.mix.lvl", master_id);
+    send_unsubscribe(dotted, lvl_fmt);
+    snprintf(dotted, sizeof(dotted), "ch.%d.mix.on", master_id);
+    send_unsubscribe(dotted, "val");
+}
+
 static void subscribe_all(void) {
     size_t n = app_state_count();
     for (size_t i = 0; i < n; ++i) {
@@ -511,9 +543,28 @@ static void m_register(app_ms_on_change_t cb, void *ctx) {
 static int m_get_mix(void)          { return g_ms.mix_idx; }
 static void m_set_mix(int idx) {
     if (g_ms.mix_idx == idx) return;
+    int old_mix = g_ms.mix_idx;
+    int old_master_id = -1;
+    {
+        app_channel_t master;
+        if (app_state_master_get(&master)) old_master_id = master.id;
+    }
     g_ms.mix_idx = idx;
     g_ms.subscribed = false;
-    if (g_ms.ws_open) subscribe_all();
+    if (g_ms.ws_open) {
+        // Unsubscribe the old mix's per-channel + master paths so MS
+        // stops broadcasting them. Avoids needing to bounce the WS.
+        printf("ms_real: mix change %d -> %d (unsubscribe + resubscribe)\n",
+               old_mix, idx);
+        fflush(stdout);
+        size_t n = app_state_count();
+        for (size_t i = 0; i < n; ++i) {
+            int ch = app_state_id_for_idx(i);
+            if (ch >= 0) unsubscribe_channel(ch, old_mix);
+        }
+        unsubscribe_master(old_master_id);
+        subscribe_all();
+    }
 }
 static void m_set_mix_layout(int off, int cnt) { g_ms.mix_offset = off; g_ms.mix_count = cnt; }
 static const char *m_get_mix_name(int idx) {
@@ -575,6 +626,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = m_is_channel_routable,
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
+    .is_console_attached         = NULL,
 };
 
 const ms_client_iface_t *ms_client_real_create(const char *host, int port) {

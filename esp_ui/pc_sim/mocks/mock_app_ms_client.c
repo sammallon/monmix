@@ -105,6 +105,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = m_is_channel_routable,
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
+    .is_console_attached         = NULL,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void) { return &s_iface; }

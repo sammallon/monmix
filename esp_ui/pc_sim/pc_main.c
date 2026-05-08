@@ -231,6 +231,11 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_prefs_set_level_format(f);
             if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
             printf("OK set_format %s\n", text);
+        } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
+            // Drive the mix-change path the same way the picker does
+            // (via ms->set_mix). Used by the unsubscribe regression test.
+            if (g_ms && g_ms->set_mix) g_ms->set_mix(x);
+            printf("OK set_mix %d\n", x);
         } else if (strcmp(cmd, "quit") == 0) {
             printf("OK quit\n");
             return 1;

@@ -61,5 +61,10 @@ void app_state_master_set_level(float level, bool notify);
 void app_state_master_set_level_db(float db, bool notify);
 void app_state_master_set_name(const char *name, bool notify);
 void app_state_master_set_mute(bool mute, bool notify);
+void app_state_master_set_meter_db(float db, bool notify);
 
 void app_state_master_register_on_change(app_state_master_on_change_t cb, void *ctx);
+// Same split as the per-channel meter path: avoid forcing a heavy
+// master-strip redraw on every 10 Hz meter sample.
+typedef void (*app_state_master_on_meter_t)(void *ctx);
+void app_state_master_register_on_meter(app_state_master_on_meter_t cb, void *ctx);

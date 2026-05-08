@@ -27,3 +27,14 @@ typedef struct {
 // from a non-LVGL worker task — ~50 ms typical, 5 s timeout. Returns
 // true on success and fills *out; logs and returns false on error.
 bool app_ms_info_fetch(const char *host, int port, app_ms_info_t *out);
+
+// Blocking HTTP GET on http://<host>:<port>/app/state. Returns true iff
+// MS itself is up AND has finished attaching to its console (state ==
+// "connected"). Reason: MS responds to /console/information with default
+// shape (channels list etc) before the console link finishes coming up,
+// so the call succeeds but every name reads as a placeholder, every
+// fader sits at -inf, and the picker has nothing to filter against.
+// Gate the boot-time setup on this returning true. Per OpenAPI, `state`
+// is a free-form string with no documented enum; we treat any value
+// other than "connected" as not-ready.
+bool app_ms_info_console_ready(const char *host, int port);

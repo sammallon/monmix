@@ -645,6 +645,24 @@ static int cmd_mix_show(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `set-mix <idx>` — drive the mix-bus change path the same way the picker
+// does (ms->set_mix). Used by tests/hw to exercise the unsubscribe/
+// resubscribe flow without needing on-device touch synthesis. Mirrors
+// pc_sim's `set_mix` script command for sim/hw parity.
+// ─────────────────────────────────────────────────────────────────────────
+
+static int cmd_set_mix(int argc, char **argv)
+{
+    if (argc < 2) { printf("usage: set-mix <idx>\n"); return 1; }
+    int idx = atoi(argv[1]);
+    if (idx < 0) { printf("set-mix: idx must be >= 0\n"); return 1; }
+    const ms_client_iface_t *ms = app_ms_client_ws();
+    if (!ms || !ms->set_mix) { printf("set-mix: no client\n"); return 1; }
+    ms->set_mix(idx);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // REPL bootstrap.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -665,6 +683,7 @@ void app_console_init(void)
         { .command = "log-trace",    .help = "query or toggle disk-log trace level (on|off)", .func = cmd_log_trace    },
         { .command = "prefs-dump",   .help = "dump effective + NVS + SD prefs state (P0 verify)", .func = cmd_prefs_dump   },
         { .command = "mix-show",     .help = "[on|off] force mix-indicator visible (diagnose P5)", .func = cmd_mix_show     },
+        { .command = "set-mix",      .help = "<idx> drive ms->set_mix(idx) -- exercises unsubscribe/resubscribe", .func = cmd_set_mix },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

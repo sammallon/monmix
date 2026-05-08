@@ -70,15 +70,17 @@ static lv_obj_t *s_splash_logo_img;
 #define FADER_BOX_H         500
 #define FADER_BOX_PAD       8
 #define SLIDER_W            28
-// Slider is centered in the box. Vertical budget within the 484 px inner
-// area, top-to-bottom: name label (~20) + slider (centered) + mute button
-// (32 at bottom-mid offset -28) + value label (~20 at bottom). The LVGL
-// slider knob is bigger than the math math (the styled thumb extends past
-// the track by more than its bare radius), so even SLIDER_H=320 left the
-// knob kissing the MUTE button at value=0. 300 leaves an unambiguous
-// gap; we lose 20 px of slider travel which is invisible at the 0–100
-// integer scale we display.
+// Slider top-aligned at SLIDER_TOP_Y inside the box (NOT CENTER aligned
+// like before — that would push the slider down by half the height
+// difference and undo the upward extension). Vertical budget within the
+// 484 px inner area, top-to-bottom: name label (3 lines wrap, height 60)
+// + 6 px gap + signal dot (10 px at y=66..76) + 6 px gap + slider
+// (y=82..382) + 42 px gap (room for the LVGL knob's overhang at
+// value=0; the comment-of-record on the prior 320 px slider said even
+// 320 had the knob kissing MUTE) + mute button (32 at bottom-mid offset
+// -28 -> y=424..456) + value label (~20 at bottom).
 #define SLIDER_H            300
+#define SLIDER_TOP_Y        82
 #define MUTE_BTN_W          50
 #define MUTE_BTN_H          32
 #define DOT_SIZE            12
@@ -386,6 +388,13 @@ static void on_edit_channels_clicked(lv_event_t *e);
 // Reboot confirmation popup — built lazily, modal, two buttons. esp_restart
 // is called on the Yes path; Cancel just hides the popup.
 static lv_obj_t *s_reboot_confirm;
+
+// Full-screen "Rebooting..." modal shown briefly between the user
+// pressing a save/reboot button and esp_restart() firing. Without it
+// the save paths only flash a small inline status label that's easy
+// to miss in the pre-reset window before the panel goes black.
+static lv_obj_t *s_rebooting_overlay;
+static void show_rebooting_overlay(void);
 static void wifi_panel_open(void);
 static void wifi_panel_close(void);
 static void wifi_panel_refresh(void);
@@ -405,6 +414,16 @@ static void on_ms_state_change(void *ctx);
 // = 20 Hz feels live to the user but keeps the websocket task from
 // monopolizing its core.
 #define SET_MIN_INTERVAL_MS 50
+
+// Default timeout for lvgl_port_lock when called from a non-LVGL task.
+// 1 s is the floor that empirically gives LVGL room to finish any
+// reasonable in-flight render. The previous value (100 ms) silently
+// dropped icon-state updates whenever LVGL was mid-render -- the wifi/ms
+// icon would stay showing the stale state forever, indistinguishable
+// to the user from "still disconnected." A real LVGL deadlock would
+// still bound the calling event task within 1 s rather than starving
+// it forever.
+#define LVGL_LOCK_TIMEOUT_MS 1000
 EXT_RAM_BSS_ATTR static uint32_t s_last_send_ms[APP_CONFIG_MAX_CHANNELS];
 
 static void apply_status(void *arg)
@@ -424,7 +443,7 @@ void app_ui_set_status(const char *text)
     // lv_async_call mutates LVGL's timer list, so it MUST hold lvgl_port_lock
     // when called from a non-LVGL task. Without it, the WS / wifi tasks race
     // the LVGL task and updates get lost.
-    if (!lvgl_port_lock(100)) {
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) {
         free(copy);
         return;
     }
@@ -567,6 +586,16 @@ static volatile bool s_master_dirty;
 EXT_RAM_BSS_ATTR static volatile bool s_meter_dirty[APP_CONFIG_MAX_CHANNELS];
 static volatile bool s_meter_sweep_queued;
 
+// PRESENT mode = "signal in last 1 s" debounce. Updated by
+// apply_meter_pending whenever a meter sample exceeds threshold; the
+// dot stays lit for HOLD_MS after, then fades. -40 dB threshold keeps
+// noise floor from triggering the indicator. Same logic for the master.
+#define SIGNAL_PRESENT_THRESHOLD_DB  -40.0f
+#define SIGNAL_PRESENT_HOLD_MS       1000
+EXT_RAM_BSS_ATTR static uint32_t s_last_signal_ms[APP_CONFIG_MAX_CHANNELS];
+static uint32_t s_master_last_signal_ms;
+static volatile bool s_master_meter_dirty;
+
 static void apply_pending(void *unused)
 {
     (void)unused;
@@ -641,28 +670,11 @@ static void apply_pending(void *unused)
             lv_obj_set_style_bg_color(s_widgets[i].slider, bar_color,  LV_PART_INDICATOR);
             lv_obj_set_style_bg_color(s_widgets[i].slider, knob_color, LV_PART_KNOB);
         }
-        // Indicator widgets — exactly one of {dot, meter bar} is visible
-        // depending on signal_indicator pref. Meter mode driven from
-        // ch.meter_db which is fed by the metering broadcast handler;
-        // signal-present mode is the legacy "level > 0 && !mute" derive.
+        // Indicator-widget visibility is owned by apply_meter_pending now
+        // (it reads meter_db + last_signal_ms with debounce). Here we only
+        // handle bar visibility on mode change so a flip from METER to
+        // NONE/PRESENT clears the bar in the same frame.
         app_signal_indicator_t mode = app_prefs_get_signal_indicator();
-        if (s_widgets[i].signal_dot) {
-            // Position-above-floor check: only one of level/level_db is
-            // kept fresh (single subscription per channel) so derive from
-            // the field that matches the current format.
-            float pos = (fmt == APP_LEVEL_FORMAT_DB)
-                ? app_db_to_position(ch.level_db)
-                : ch.level;
-            bool show_dot = (mode == APP_SIGNAL_INDICATOR_PRESENT) &&
-                            !ch.mute && pos > 0.01f;
-            if (show_dot) {
-                lv_obj_set_style_bg_color(s_widgets[i].signal_dot,
-                                          lv_color_hex(0x40C040), 0);
-                lv_obj_remove_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
         if (s_widgets[i].meter_bar) {
             if (mode == APP_SIGNAL_INDICATOR_METER) {
                 lv_obj_remove_flag(s_widgets[i].meter_bar, LV_OBJ_FLAG_HIDDEN);
@@ -700,7 +712,32 @@ static void apply_pending(void *unused)
                 if (m.mute) lv_obj_add_state   (s_master_widgets.btn_mute, LV_STATE_CHECKED);
                 else        lv_obj_remove_state(s_master_widgets.btn_mute, LV_STATE_CHECKED);
             }
+            if (s_master_widgets.meter_bar) {
+                if (app_prefs_get_signal_indicator() == APP_SIGNAL_INDICATOR_METER) {
+                    lv_obj_remove_flag(s_master_widgets.meter_bar, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(s_master_widgets.meter_bar, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
         }
+    }
+}
+
+// Meter color picker shared by tracked channels and master. Stage-monitor
+// convention: green below -12 dB, yellow -12 to -3, red above -3.
+static uint32_t meter_color_for(float db) {
+    if (db > -3.0f)  return 0xE04040;  // red
+    if (db > -12.0f) return 0xE0D040;  // yellow
+    return 0x40C040;                   // green
+}
+
+static void update_signal_dot_visible(lv_obj_t *dot, bool show) {
+    if (!dot) return;
+    if (show) {
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x40C040), 0);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -708,36 +745,99 @@ static void apply_pending(void *unused)
 // each channel's meter_db, and writes lv_bar_set_value. Decoupled from
 // apply_pending so a 10 Hz meter stream doesn't trigger the heavier
 // slider/label/colour repaint branch on every frame.
+//
+// Also tracks "signal present in the last HOLD_MS" by sampling each new
+// meter db against SIGNAL_PRESENT_THRESHOLD_DB and stamping
+// s_last_signal_ms. PRESENT-mode dot visibility is recomputed every
+// sweep based on (now - last_signal_ms) so an idle channel fades out
+// even if no fresh broadcast arrives (signal_dot_sweep_cb pumps the
+// sweep at 4 Hz to drive the fade).
 static void apply_meter_pending(void *unused)
 {
     (void) unused;
     s_meter_sweep_queued = false;
+    uint32_t now = lv_tick_get();
+    app_signal_indicator_t mode = app_prefs_get_signal_indicator();
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) {
-        if (!s_meter_dirty[i]) continue;
+        bool dirty = s_meter_dirty[i];
         s_meter_dirty[i] = false;
-        if (!s_widgets[i].meter_bar) continue;
         app_channel_t ch;
         if (!app_state_get(i, &ch)) continue;
-        float db = ch.meter_db;
-        // Mute squelches the bar — the audio path is silent, so a non-zero
-        // meter reading from a stale broadcast would mislead. Sentinel
-        // -200 (no sample yet) and the explicit silence flush from
-        // ws_set_meter_enabled both fall through to the floor clamp.
-        if (ch.mute) db = METER_DB_FLOOR;
-        if (db < METER_DB_FLOOR) db = METER_DB_FLOOR;
-        if (db > METER_DB_CEIL)  db = METER_DB_CEIL;
-        int fill = (int) (((db - METER_DB_FLOOR) /
-                           (METER_DB_CEIL - METER_DB_FLOOR)) * 1000.0f);
-        lv_bar_set_value(s_widgets[i].meter_bar, fill, LV_ANIM_OFF);
-        // Color shifts as level rises: green (-60..-12), yellow (-12..-3),
-        // red (-3..0). Stage-monitor convention; thresholds picked to match
-        // typical Si Expression bus headroom.
-        uint32_t hex = 0x40C040;  // green
-        if (db > -3.0f)       hex = 0xE04040;  // red
-        else if (db > -12.0f) hex = 0xE0D040;  // yellow
-        lv_obj_set_style_bg_color(s_widgets[i].meter_bar,
-                                  lv_color_hex(hex), LV_PART_INDICATOR);
+        // Stamp last-signal time only on dirty samples (a fresh value
+        // arrived); the per-tick sweep below still re-evaluates dot
+        // visibility against the stored timestamp so it fades cleanly.
+        if (dirty && !ch.mute && ch.meter_db > SIGNAL_PRESENT_THRESHOLD_DB) {
+            s_last_signal_ms[i] = now;
+        }
+        if (dirty && s_widgets[i].meter_bar && mode == APP_SIGNAL_INDICATOR_METER) {
+            float db = ch.meter_db;
+            // Mute squelches the bar — the audio path is silent, so a
+            // non-zero meter reading from a stale broadcast would mislead.
+            // Sentinel -200 (no sample yet) and the explicit silence
+            // flush from ws_set_meter_enabled both clamp to the floor.
+            if (ch.mute) db = METER_DB_FLOOR;
+            if (db < METER_DB_FLOOR) db = METER_DB_FLOOR;
+            if (db > METER_DB_CEIL)  db = METER_DB_CEIL;
+            int fill = (int) (((db - METER_DB_FLOOR) /
+                               (METER_DB_CEIL - METER_DB_FLOOR)) * 1000.0f);
+            lv_bar_set_value(s_widgets[i].meter_bar, fill, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(s_widgets[i].meter_bar,
+                                      lv_color_hex(meter_color_for(db)),
+                                      LV_PART_INDICATOR);
+        }
+        // PRESENT-mode dot — recompute every sweep so an idle channel
+        // fades 1 s after its last above-threshold sample.
+        if (mode == APP_SIGNAL_INDICATOR_PRESENT && s_widgets[i].signal_dot) {
+            bool show = !ch.mute &&
+                        (now - s_last_signal_ms[i]) < SIGNAL_PRESENT_HOLD_MS;
+            update_signal_dot_visible(s_widgets[i].signal_dot, show);
+        }
+    }
+
+    // Master strip parity. Same logic as input strips.
+    if (s_master_meter_dirty) {
+        s_master_meter_dirty = false;
+        app_channel_t m;
+        if (app_state_master_get(&m)) {
+            if (!m.mute && m.meter_db > SIGNAL_PRESENT_THRESHOLD_DB) {
+                s_master_last_signal_ms = now;
+            }
+            if (s_master_widgets.meter_bar && mode == APP_SIGNAL_INDICATOR_METER) {
+                float db = m.meter_db;
+                if (m.mute) db = METER_DB_FLOOR;
+                if (db < METER_DB_FLOOR) db = METER_DB_FLOOR;
+                if (db > METER_DB_CEIL)  db = METER_DB_CEIL;
+                int fill = (int) (((db - METER_DB_FLOOR) /
+                                   (METER_DB_CEIL - METER_DB_FLOOR)) * 1000.0f);
+                lv_bar_set_value(s_master_widgets.meter_bar, fill, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(s_master_widgets.meter_bar,
+                                          lv_color_hex(meter_color_for(db)),
+                                          LV_PART_INDICATOR);
+            }
+        }
+    }
+    if (mode == APP_SIGNAL_INDICATOR_PRESENT && s_master_widgets.signal_dot) {
+        app_channel_t m;
+        bool show = false;
+        if (app_state_master_get(&m)) {
+            show = !m.mute &&
+                   (now - s_master_last_signal_ms) < SIGNAL_PRESENT_HOLD_MS;
+        }
+        update_signal_dot_visible(s_master_widgets.signal_dot, show);
+    }
+
+    // Belt-and-braces hide of dots when mode isn't PRESENT (apply_pending
+    // already handles the bar side on mode change).
+    if (mode != APP_SIGNAL_INDICATOR_PRESENT) {
+        for (size_t i = 0; i < total; ++i) {
+            if (s_widgets[i].signal_dot) {
+                lv_obj_add_flag(s_widgets[i].signal_dot, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (s_master_widgets.signal_dot) {
+            lv_obj_add_flag(s_master_widgets.signal_dot, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -748,7 +848,7 @@ static void on_meter_change(size_t idx, void *ctx)
     s_meter_dirty[idx] = true;
     if (s_meter_sweep_queued) return;
 
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_meter_sweep_queued) {
         s_meter_sweep_queued = true;
         if (lv_async_call(apply_meter_pending, NULL) != LV_RESULT_OK) {
@@ -756,6 +856,38 @@ static void on_meter_change(size_t idx, void *ctx)
         }
     }
     lvgl_port_unlock();
+}
+
+static void on_master_meter_change(void *ctx)
+{
+    (void) ctx;
+    s_master_meter_dirty = true;
+    if (s_meter_sweep_queued) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
+    if (!s_meter_sweep_queued) {
+        s_meter_sweep_queued = true;
+        if (lv_async_call(apply_meter_pending, NULL) != LV_RESULT_OK) {
+            s_meter_sweep_queued = false;
+        }
+    }
+    lvgl_port_unlock();
+}
+
+// Periodic LVGL timer that re-runs the meter sweep at ~4 Hz so PRESENT-
+// mode dots fade out after their hold window even when MS sends nothing
+// (steady silence -> no broadcasts -> apply_meter_pending wouldn't
+// otherwise rerun and the dot would stay lit until the next change).
+// Cheap: the sweep is a few-hundred-cycle walk over s_meter_dirty.
+static void signal_dot_sweep_cb(lv_timer_t *t)
+{
+    (void)t;
+    app_signal_indicator_t mode = app_prefs_get_signal_indicator();
+    if (mode != APP_SIGNAL_INDICATOR_PRESENT) return;
+    if (s_meter_sweep_queued) return;
+    s_meter_sweep_queued = true;
+    if (lv_async_call(apply_meter_pending, NULL) != LV_RESULT_OK) {
+        s_meter_sweep_queued = false;
+    }
 }
 
 static void on_state_change(size_t idx, void *ctx)
@@ -767,7 +899,7 @@ static void on_state_change(size_t idx, void *ctx)
     // up by it. No lock, no allocation, no work.
     if (s_sweep_queued) return;
 
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_sweep_queued) {
         s_sweep_queued = true;
         if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
@@ -787,7 +919,7 @@ static void on_master_state_change(void *ctx)
     s_master_dirty = true;
     if (s_sweep_queued) return;
 
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_sweep_queued) {
         s_sweep_queued = true;
         if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
@@ -835,7 +967,7 @@ static void on_prefs_change(void *ctx)
     // (>5s on a busy core) to starve IDLE if it runs synchronously on
     // a non-LVGL caller. Queueing on the LVGL task keeps the caller's
     // core free to yield.
-    if (lvgl_port_lock(100)) {
+    if (lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) {
         lv_async_call(apply_theme_async, NULL);
         lvgl_port_unlock();
     }
@@ -847,8 +979,13 @@ static void on_prefs_change(void *ctx)
     // set_meter_enabled lands the message on the WS task so locking isn't
     // our problem here.
     if (s_ms && s_ms->set_meter_enabled) {
-        bool want_meter = (app_prefs_get_signal_indicator() ==
-                           APP_SIGNAL_INDICATOR_METER);
+        // Both PRESENT (single dot) and METER (full bar) drive their
+        // visibility from live meter data now -- PRESENT gates a 1 s
+        // debounce off the same meter_db stream that METER renders
+        // continuously. Subscribe in either mode; only NONE skips it.
+        app_signal_indicator_t mode = app_prefs_get_signal_indicator();
+        bool want_meter = (mode == APP_SIGNAL_INDICATOR_METER ||
+                           mode == APP_SIGNAL_INDICATOR_PRESENT);
         s_ms->set_meter_enabled(want_meter);
         // Force a meter-bar repaint so a mode flip clears any stale fill
         // left over from a previous meter session. apply_pending owns the
@@ -865,7 +1002,7 @@ static void on_prefs_change(void *ctx)
 
     if (s_sweep_queued) return;
 
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_sweep_queued) {
         s_sweep_queued = true;
         if (lv_async_call(apply_pending, NULL) != LV_RESULT_OK) {
@@ -1070,8 +1207,12 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
 
     lv_obj_t *name = lv_label_create(box);
     lv_label_set_text(name, ch.name);
-    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(name, FADER_BOX_W - 2 * FADER_BOX_PAD);
+    // WRAP allows up to 3 lines for long scribble names. Fixed height of 60
+    // caps the visible area so a 4+ line name clips into ellipsis-by-truncation
+    // territory rather than overflowing into the signal-dot row below. With
+    // default Montserrat 14, a line is ~16-18 px so 60 px = ~3 lines.
+    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+    lv_obj_set_size(name, FADER_BOX_W - 2 * FADER_BOX_PAD, 60);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
     s_widgets[idx].label_name = name;
@@ -1091,15 +1232,17 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_add_event_cb(name, on_strip_released, LV_EVENT_PRESS_LOST,
                         (void *)(uintptr_t) idx);
 
-    // Signal-present indicator — small round dot centered below the name
-    // label and above the slider. Visible only when mode != none AND the
-    // channel is actively passing audio (!mute && level > 0). Without live
-    // meter data from MS this is a "configured to pass audio" indicator,
-    // not strict audio presence — useful for the "do I have a cable
-    // problem?" question.
+    // Signal-present indicator — small round dot sitting just above the
+    // slider top so multi-line scribble names (up to 3 lines) don't
+    // overlap it. y=60 puts the dot at content_y 60..70, slider top at
+    // 72 (CENTER align of SLIDER_H=340 in 484 inner). Visible only when
+    // mode != none AND the channel is actively passing audio (!mute &&
+    // level > 0). Without live meter data from MS this is a "configured
+    // to pass audio" indicator, not strict audio presence — useful for
+    // the "do I have a cable problem?" question.
     lv_obj_t *dot = lv_obj_create(box);
     lv_obj_set_size(dot, SIGNAL_DOT_SIZE, SIGNAL_DOT_SIZE);
-    lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 26);
+    lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 60);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(dot, 0, 0);
     lv_obj_set_style_pad_all(dot, 0, 0);
@@ -1116,10 +1259,12 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_set_size(meter, METER_BAR_W, METER_BAR_H);
     lv_bar_set_range(meter, 0, 1000);  // 1000 steps over 60 dB; fine enough
     lv_bar_set_value(meter, 0, LV_ANIM_OFF);
-    // Pin to the left of the slider — slider is centered with width 28,
-    // so its left edge sits at -SLIDER_W/2 from the box centre. Park the
-    // meter bar at -SLIDER_W/2 - METER_BAR_W - small gap.
-    lv_obj_align(meter, LV_ALIGN_CENTER, -SLIDER_W / 2 - METER_BAR_W - 2, 0);
+    // Pin to the left of the slider track. y offset = SLIDER_TOP_Y minus
+    // where a CENTER-aligned bar of equal height would land, so the bar's
+    // top tracks the slider's top regardless of any future SLIDER_TOP_Y
+    // tweak.
+    lv_obj_align(meter, LV_ALIGN_CENTER, -SLIDER_W / 2 - METER_BAR_W - 2,
+                 SLIDER_TOP_Y - ((FADER_BOX_H - 2 * FADER_BOX_PAD - METER_BAR_H) / 2));
     lv_obj_set_style_pad_all(meter, 0, 0);
     lv_obj_set_style_radius(meter, 1, 0);
     lv_obj_set_style_radius(meter, 1, LV_PART_INDICATOR);
@@ -1144,7 +1289,7 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
         lv_slider_set_value(slider, init_v, LV_ANIM_OFF);
     }
     lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
-    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, SLIDER_TOP_Y);
     lv_obj_add_event_cb(slider, on_slider_changed, LV_EVENT_VALUE_CHANGED,
                         (void *)(uintptr_t)idx);
     lv_obj_add_event_cb(slider, on_slider_released, LV_EVENT_RELEASED,
@@ -1163,8 +1308,10 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_set_style_border_width(tick, 0, 0);
     lv_obj_set_style_pad_all(tick, 0, 0);
     lv_obj_clear_flag(tick, LV_OBJ_FLAG_SCROLLABLE);
+    // Tick is anchored to the slider (not the box center) so it keeps
+    // tracking the unity-gain position regardless of slider alignment.
     int tick_y_off = (int)((0.5f - NORM_AT_0DB) * (float) SLIDER_H);
-    lv_obj_align(tick, LV_ALIGN_CENTER, SLIDER_W / 2 + 10, tick_y_off);
+    lv_obj_align_to(tick, slider, LV_ALIGN_RIGHT_MID, 10, tick_y_off);
 
     lv_obj_t *btn_mute = lv_button_create(box);
     // Note: NOT LV_OBJ_FLAG_CHECKABLE — that auto-toggles on press, which
@@ -1297,11 +1444,42 @@ static void build_master_strip(lv_obj_t *parent)
 
     lv_obj_t *name = lv_label_create(box);
     lv_label_set_text(name, m.name[0] ? m.name : "Master");
-    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(name, FADER_BOX_W - 2 * FADER_BOX_PAD);
+    // Match the input-strip name geometry: 3-line wrap with 60 px height
+    // cap. Master mix-bus names ("STAGE LEFT MONITOR MIX") often need it.
+    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+    lv_obj_set_size(name, FADER_BOX_W - 2 * FADER_BOX_PAD, 60);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
     s_master_widgets.label_name = name;
+
+    // Master parity with input strips: signal_dot just above slider top,
+    // meter_bar pinned to slider's left edge. Same y-positions as
+    // build_fader so the master visually reads as the same widget shape.
+    lv_obj_t *master_dot = lv_obj_create(box);
+    lv_obj_set_size(master_dot, SIGNAL_DOT_SIZE, SIGNAL_DOT_SIZE);
+    lv_obj_align(master_dot, LV_ALIGN_TOP_MID, 0, 60);
+    lv_obj_set_style_radius(master_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(master_dot, 0, 0);
+    lv_obj_set_style_pad_all(master_dot, 0, 0);
+    lv_obj_clear_flag(master_dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(master_dot, LV_OBJ_FLAG_HIDDEN);
+    s_master_widgets.signal_dot = master_dot;
+
+    lv_obj_t *master_meter = lv_bar_create(box);
+    lv_obj_set_size(master_meter, METER_BAR_W, METER_BAR_H);
+    lv_bar_set_range(master_meter, 0, 1000);
+    lv_bar_set_value(master_meter, 0, LV_ANIM_OFF);
+    lv_obj_align(master_meter, LV_ALIGN_CENTER, -SLIDER_W / 2 - METER_BAR_W - 2,
+                 SLIDER_TOP_Y - ((FADER_BOX_H - 2 * FADER_BOX_PAD - METER_BAR_H) / 2));
+    lv_obj_set_style_pad_all(master_meter, 0, 0);
+    lv_obj_set_style_radius(master_meter, 1, 0);
+    lv_obj_set_style_radius(master_meter, 1, LV_PART_INDICATOR);
+    lv_obj_set_style_border_width(master_meter, 0, 0);
+    lv_obj_set_style_bg_color(master_meter, lv_color_hex(0x202020), 0);
+    lv_obj_set_style_bg_color(master_meter, lv_color_hex(0x40C040), LV_PART_INDICATOR);
+    lv_obj_clear_flag(master_meter, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(master_meter, LV_OBJ_FLAG_HIDDEN);
+    s_master_widgets.meter_bar = master_meter;
 
     lv_obj_t *slider = lv_slider_create(box);
     lv_slider_set_range(slider, 0, 100);
@@ -1315,7 +1493,7 @@ static void build_master_strip(lv_obj_t *parent)
         lv_slider_set_value(slider, init_v, LV_ANIM_OFF);
     }
     lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
-    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, SLIDER_TOP_Y);
     // Master always reads as the unity-gain accent color — no per-channel
     // color tag for the master since there's only one of it visible at a
     // time. Yellow matches the box outline so the master strip reads as a
@@ -1337,8 +1515,10 @@ static void build_master_strip(lv_obj_t *parent)
     lv_obj_set_style_border_width(tick, 0, 0);
     lv_obj_set_style_pad_all(tick, 0, 0);
     lv_obj_clear_flag(tick, LV_OBJ_FLAG_SCROLLABLE);
+    // Tick is anchored to the slider (not the box center) so it keeps
+    // tracking the unity-gain position regardless of slider alignment.
     int tick_y_off = (int)((0.5f - NORM_AT_0DB) * (float) SLIDER_H);
-    lv_obj_align(tick, LV_ALIGN_CENTER, SLIDER_W / 2 + 10, tick_y_off);
+    lv_obj_align_to(tick, slider, LV_ALIGN_RIGHT_MID, 10, tick_y_off);
 
     lv_obj_t *btn_mute = lv_button_create(box);
     lv_obj_set_size(btn_mute, MUTE_BTN_W, MUTE_BTN_H);
@@ -1496,6 +1676,39 @@ void app_ui_init(const ms_client_iface_t *ms)
                         LV_EVENT_CLICKED, NULL);
     lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
 
+    // Settings-icon hit pads -- transparent rectangles behind each
+    // settings icon (MS / WiFi / gear only; mute-en and mix indicator
+    // keep their own click areas). Each pad's x range goes from the
+    // midpoint to its left neighbour to the midpoint to its right
+    // neighbour (screen edge for gear); y fills 0..STATUS_H so tall
+    // taps still register. Positions use the design-time icon coords.
+    // For the leftmost settings icon (MS), the mix indicator is the
+    // left adjacent button -- its midpoint bounds MS even though the
+    // mix indicator itself doesn't get an extended pad.
+    {
+        struct { int x; int w; lv_event_cb_t cb; } pads[] = {
+            { 911, 37, on_ms_clicked   },  // MS   (916..944; midpts 911 and 948)
+            { 948, 36, on_wifi_clicked },  // WiFi (952..980; midpts 948 and 984)
+            { 984, 40, on_gear_clicked },  // gear (988..1016; midpt 984 to screen edge)
+        };
+        for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]); ++i) {
+            lv_obj_t *pad = lv_obj_create(scr);
+            lv_obj_set_size(pad, pads[i].w, STATUS_H);
+            lv_obj_set_pos(pad, pads[i].x, 0);
+            lv_obj_set_style_bg_opa(pad, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(pad, 0, 0);
+            lv_obj_set_style_pad_all(pad, 0, 0);
+            lv_obj_set_style_radius(pad, 0, 0);
+            lv_obj_clear_flag(pad, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(pad, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(pad, pads[i].cb, LV_EVENT_CLICKED, NULL);
+            // Push to back so the visible icon button stays in front and
+            // gets touches in its own region (the pad only catches taps
+            // OUTSIDE the icon, in the extended hit zone).
+            lv_obj_move_to_index(pad, 0);
+        }
+    }
+
     // Loading spinner — shown while we're not connected to MS so the user
     // sees an explicit "waiting" state instead of stale / empty fader
     // strips. Position centered in the fader area; the tileview overlays
@@ -1510,6 +1723,11 @@ void app_ui_init(const ms_client_iface_t *ms)
     app_state_register_on_change(on_state_change, NULL);
     app_state_register_on_meter(on_meter_change, NULL);
     app_state_master_register_on_change(on_master_state_change, NULL);
+    app_state_master_register_on_meter(on_master_meter_change, NULL);
+    // Periodic dot-fade sweep -- see signal_dot_sweep_cb. 250 ms / 4 Hz
+    // is fine-grained enough for a 1 s hold to look smooth and well below
+    // any LVGL timer overhead floor.
+    lv_timer_create(signal_dot_sweep_cb, 250, NULL);
     app_prefs_register_on_change(on_prefs_change, NULL);
     app_wifi_register_on_change(on_wifi_state_change, NULL);
     if (s_ms && s_ms->register_on_change) {
@@ -2260,7 +2478,43 @@ static void on_reboot_yes(lv_event_t *e)
 {
     (void) e;
     ESP_LOGW(TAG, "user-initiated reboot");
+    show_rebooting_overlay();
+    vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
+}
+
+// Build (lazy) and present a full-screen "Rebooting..." overlay so the
+// user gets unmistakable feedback before the chip resets. lv_refr_now is
+// called inline so the new pixels actually hit the panel before the
+// caller delays + restarts.
+static void show_rebooting_overlay(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    if (!s_rebooting_overlay) {
+        lv_obj_t *ov = lv_obj_create(scr);
+        lv_obj_set_size(ov, lv_obj_get_width(scr), lv_obj_get_height(scr));
+        lv_obj_align(ov, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(ov, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(ov, 0, 0);
+        lv_obj_set_style_radius(ov, 0, 0);
+        lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *spinner = lv_spinner_create(ov);
+        lv_obj_set_size(spinner, 80, 80);
+        lv_obj_align(spinner, LV_ALIGN_CENTER, 0, -30);
+
+        lv_obj_t *lbl = lv_label_create(ov);
+        lv_label_set_text(lbl, "Rebooting...");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align_to(lbl, spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 24);
+
+        s_rebooting_overlay = ov;
+    } else {
+        lv_obj_remove_flag(s_rebooting_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_move_foreground(s_rebooting_overlay);
+    lv_refr_now(NULL);
 }
 
 static void on_reboot_no(lv_event_t *e)
@@ -2582,7 +2836,7 @@ void app_ui_set_mix_count(int count)
     if (count < 0) count = 0;
     s_mix_count = count;
     if (!s_mix_indicator) return;
-    if (!lvgl_port_lock(1000)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     // P5: visibility is now driven by mix_indicator_apply_visibility from
     // the ms_apply_async sweep, not from this entry point. The boot path
     // calls this once with the (potentially zero) count from
@@ -2629,7 +2883,7 @@ void app_ui_force_mix_show(bool force)
 {
     s_mix_force_show = force;
     if (!s_mix_indicator) return;
-    if (!lvgl_port_lock(1000)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     mix_indicator_apply_visibility();
     lvgl_port_unlock();
 }
@@ -2973,6 +3227,10 @@ static void on_wcfg_save_yes(lv_event_t *e)
                           "#FF6060 Save failed (NVS error).#");
         return;
     }
+    // Park the SSID/password in the saved-networks ring so the next venue
+    // change can pick this network back without retyping. Promotes if
+    // already present; evicts the oldest if the ring is full.
+    app_config_wifi_saved_add(ssid, pass);
 
     // Persist DHCP/static + the four IP fields. app_prefs setters bail if
     // the new value matches the live one, so re-saving an unchanged config
@@ -3001,9 +3259,7 @@ static void on_wcfg_save_yes(lv_event_t *e)
     lv_refr_now(NULL);
     app_wifi_apply_ip_config();
     if (!app_wifi_reconfigure()) {
-        lv_label_set_text(s_wcfg_status_label,
-                          "#FF6060 Live reconfig failed. Rebooting...#");
-        lv_refr_now(NULL);
+        show_rebooting_overlay();
         vTaskDelay(pdMS_TO_TICKS(800));
         esp_restart();
         return;   // unreached
@@ -3075,26 +3331,62 @@ static void on_ssid_list_close(lv_event_t *e)
     if (s_ssid_list_popup) lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Toggle the popup between scanning (spinner + label) and results (list).
+// Toggle just the inline "Scanning..." indicator: list itself is always
+// visible so saved networks can be picked without waiting for scan_done.
+// (Earlier rev hid the list and showed a centered spinner overlay -- that
+// flow couldn't surface saved entries.)
 static void ssid_list_set_scanning(bool scanning)
 {
     s_ssid_list_scanning = scanning;
     if (!s_ssid_list_popup) return;
+    if (s_ssid_list_spinner) lv_obj_add_flag(s_ssid_list_spinner, LV_OBJ_FLAG_HIDDEN);
+    if (s_ssid_list_scanning_label) lv_obj_add_flag(s_ssid_list_scanning_label, LV_OBJ_FLAG_HIDDEN);
+    if (s_ssid_list) lv_obj_remove_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Render the picker list: saved networks first (LV_SYMBOL_OK -- "we have the
+// password, tap to fill both"), then scanned APs that aren't already saved
+// (LV_SYMBOL_WIFI -- "tap to fill SSID, password still required"), then an
+// optional "Scanning..." status row when a fresh scan is in flight. The
+// list is rebuilt each call -- cheap at ~24 entries cap.
+static void ssid_list_render(const char (*scanned)[33], size_t scanned_n,
+                             bool scanning)
+{
+    if (!s_ssid_list) return;
+    lv_obj_clean(s_ssid_list);
+
+    char ssid[APP_CONFIG_SSID_MAX];
+    char pass[APP_CONFIG_PASS_MAX];
+
+    size_t saved_n = app_config_wifi_saved_count();
+    for (size_t i = 0; i < saved_n; ++i) {
+        if (!app_config_wifi_saved_get(i, ssid, sizeof(ssid), pass, sizeof(pass))) continue;
+        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_OK, ssid);
+        lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED, NULL);
+    }
+
+    size_t shown_scanned = 0;
+    for (size_t i = 0; i < scanned_n; ++i) {
+        if (app_config_wifi_saved_lookup(scanned[i], pass, sizeof(pass))) continue;
+        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WIFI, scanned[i]);
+        lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED, NULL);
+        shown_scanned++;
+    }
+
     if (scanning) {
-        if (s_ssid_list)            lv_obj_add_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
-        if (s_ssid_list_spinner)    lv_obj_remove_flag(s_ssid_list_spinner, LV_OBJ_FLAG_HIDDEN);
-        if (s_ssid_list_scanning_label) lv_obj_remove_flag(s_ssid_list_scanning_label, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        if (s_ssid_list_spinner)    lv_obj_add_flag(s_ssid_list_spinner, LV_OBJ_FLAG_HIDDEN);
-        if (s_ssid_list_scanning_label) lv_obj_add_flag(s_ssid_list_scanning_label, LV_OBJ_FLAG_HIDDEN);
-        if (s_ssid_list)            lv_obj_remove_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_REFRESH, "Scanning...");
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    } else if (saved_n == 0 && shown_scanned == 0) {
+        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WARNING,
+                                           "No networks found");
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
     }
 }
 
 static void on_wifi_scan_done(void *ctx)
 {
     (void)ctx;
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     lv_async_call(ssid_list_populate_async, NULL);
     lvgl_port_unlock();
 }
@@ -3151,9 +3443,11 @@ static void ssid_list_populate_async(void *arg)
 
     // Empty result on first try -> retry once. The slave can return 0
     // entries while the C6's scan cache is still warming up; a second
-    // pass usually populates it.
+    // pass usually populates it. Saved entries already on screen continue
+    // to be selectable while we re-scan.
     if (n == 0 && !s_ssid_list_retried_empty) {
         s_ssid_list_retried_empty = true;
+        ssid_list_render(NULL, 0, true);
         ssid_list_set_scanning(true);
         lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_ssid_list_popup);
@@ -3161,18 +3455,7 @@ static void ssid_list_populate_async(void *arg)
         return;
     }
 
-    lv_obj_clean(s_ssid_list);
-    if (n == 0) {
-        lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WARNING,
-                                           "No networks found");
-        lv_obj_remove_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-    } else {
-        for (size_t i = 0; i < n; ++i) {
-            lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_WIFI,
-                                               results[i]);
-            lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED, NULL);
-        }
-    }
+    ssid_list_render(results, n, false);
 
     if (s_wcfg_scan_btn) {
         lv_obj_remove_state(s_wcfg_scan_btn, LV_STATE_DISABLED);
@@ -3190,6 +3473,14 @@ static void on_ssid_row_clicked(lv_event_t *e)
     const char *txt = lv_list_get_button_text(s_ssid_list, btn);
     if (txt && s_wcfg_ssid_ta) {
         lv_textarea_set_text(s_wcfg_ssid_ta, txt);
+        // Saved-network shortcut: if the picked SSID has a stored password,
+        // fill the password field too so the user can hit Save without
+        // retyping. Tapping a scan-only entry leaves the password alone.
+        char pass[APP_CONFIG_PASS_MAX];
+        if (s_wcfg_pass_ta &&
+            app_config_wifi_saved_lookup(txt, pass, sizeof(pass))) {
+            lv_textarea_set_text(s_wcfg_pass_ta, pass);
+        }
     }
     if (s_ssid_list_popup) {
         lv_obj_add_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
@@ -3204,15 +3495,23 @@ static void on_wcfg_scan_clicked(lv_event_t *e)
     s_ssid_list_retried_empty = false;
     app_wifi_scan_result_t r = app_wifi_scan_start(on_wifi_scan_done, NULL);
     if (r == APP_WIFI_SCAN_FAILED) {
+        // Scan dispatch failed (e.g. WiFi never came up). Saved networks
+        // remain pickable so a re-association attempt is still one tap away.
+        ssid_list_render(NULL, 0, false);
+        ssid_list_set_scanning(false);
+        lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(s_ssid_list_popup);
         lv_label_set_text(s_wcfg_status_label,
-                          "#FF6060 Scan failed.#");
+                          "#FF6060 Scan failed (WiFi unavailable).#");
         return;
     }
-    // Both STARTED and ALREADY_RUNNING land here -- open the popup in the
-    // scanning state and wait for SCAN_DONE to populate it.
+    // Both STARTED and ALREADY_RUNNING land here -- show saved entries
+    // immediately so the user can pick one without waiting for SCAN_DONE.
+    // Scanned entries get merged in when the scan completes.
     lv_obj_add_state(s_wcfg_scan_btn, LV_STATE_DISABLED);
     lv_label_set_text(s_wcfg_scan_btn_label, "Scanning...");
     lv_label_set_text(s_wcfg_status_label, "");
+    ssid_list_render(NULL, 0, true);
     ssid_list_set_scanning(true);
     lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_ssid_list_popup);
@@ -3932,8 +4231,7 @@ static void on_chpick_save_yes(lv_event_t *e)
                           "#FF6060 Save failed (NVS error).#");
         return;
     }
-    lv_label_set_text(s_chpick_status_label, "#40C060 Saved. Restarting...#");
-    lv_refr_now(NULL);
+    show_rebooting_overlay();
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
 }
@@ -4476,7 +4774,7 @@ static void on_wifi_state_change(void *ctx)
 {
     (void)ctx;
     if (s_wifi_apply_queued) return;
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_wifi_apply_queued) {
         s_wifi_apply_queued = true;
         if (lv_async_call(wifi_apply_async_wrap, NULL) != LV_RESULT_OK) {
@@ -4595,11 +4893,35 @@ static app_ms_state_t ms_state_now(void)
     return (s_ms && s_ms->get_state) ? s_ms->get_state() : APP_MS_STATE_BOOT;
 }
 
+// MS+console combined state. WS state alone isn't the whole story --
+// MS may be reachable but its physical console hasn't been powered on
+// yet. /app/state == "connected" gates the second half via
+// is_console_attached. Color/label distinguish the three useful cases.
+static uint32_t ms_combined_color(app_ms_state_t st)
+{
+    if (st == APP_MS_STATE_CONNECTED &&
+        s_ms && s_ms->is_console_attached &&
+        !s_ms->is_console_attached()) {
+        return 0xE0D040;  // yellow — MS up, waiting on console
+    }
+    return ms_state_color(st);
+}
+
+static const char *ms_combined_text(app_ms_state_t st)
+{
+    if (st == APP_MS_STATE_CONNECTED &&
+        s_ms && s_ms->is_console_attached &&
+        !s_ms->is_console_attached()) {
+        return "Console offline";
+    }
+    return ms_state_text(st);
+}
+
 static void ms_icon_refresh(void)
 {
     if (!s_ms_icon_label) return;
     lv_obj_set_style_text_color(s_ms_icon_label,
-                                lv_color_hex(ms_state_color(ms_state_now())),
+                                lv_color_hex(ms_combined_color(ms_state_now())),
                                 0);
 }
 
@@ -4607,9 +4929,9 @@ static void ms_panel_refresh(void)
 {
     if (!s_ms_panel) return;
     app_ms_state_t st = ms_state_now();
-    lv_label_set_text(s_ms_state_value, ms_state_text(st));
+    lv_label_set_text(s_ms_state_value, ms_combined_text(st));
     lv_obj_set_style_text_color(s_ms_state_value,
-                                lv_color_hex(ms_state_color(st)), 0);
+                                lv_color_hex(ms_combined_color(st)), 0);
     const char *host = (s_ms && s_ms->get_host) ? s_ms->get_host() : "—";
     int port         = (s_ms && s_ms->get_port) ? s_ms->get_port() : 0;
     lv_label_set_text(s_ms_host_value, host);
@@ -4713,7 +5035,7 @@ static void on_ms_state_change(void *ctx)
 {
     (void)ctx;
     if (s_ms_apply_queued) return;
-    if (!lvgl_port_lock(100)) return;
+    if (!lvgl_port_lock(LVGL_LOCK_TIMEOUT_MS)) return;
     if (!s_ms_apply_queued) {
         s_ms_apply_queued = true;
         if (lv_async_call(ms_apply_async_wrap, NULL) != LV_RESULT_OK) {

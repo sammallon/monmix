@@ -80,6 +80,8 @@ def translate(script, test_name):
             shot_idx += 1
         elif op == "set_format":
             steps.append(f"cmd:level-format {parts[1]}")
+        elif op == "set_mix":
+            steps.append(f"cmd:set-mix {parts[1]}")
         elif op in ("quit", "echo", "press", "release", "move"):
             # quit: REPL session naturally ends when run_steps.py finishes.
             # echo: no on-device equivalent, drop.

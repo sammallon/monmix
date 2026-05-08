@@ -121,3 +121,32 @@ bool app_ms_info_fetch(const char *host, int port, app_ms_info_t *out)
              out->matrix_count, out->matrix_offset);
     return true;
 }
+
+bool app_ms_info_console_ready(const char *host, int port)
+{
+    if (!host) return false;
+    char buf[256];
+    http_sink_t sink = { .buf = buf, .cap = sizeof(buf), .len = 0 };
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%d/app/state", host, port);
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = on_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = 2000,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) return false;
+    esp_err_t err = esp_http_client_perform(cli);
+    int status   = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200) return false;
+    buf[sink.len < sink.cap ? sink.len : sink.cap - 1] = '\0';
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return false;
+    cJSON *jstate = cJSON_GetObjectItem(root, "state");
+    bool ready = cJSON_IsString(jstate) && jstate->valuestring &&
+                 strcmp(jstate->valuestring, "connected") == 0;
+    cJSON_Delete(root);
+    return ready;
+}

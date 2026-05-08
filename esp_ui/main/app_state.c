@@ -153,10 +153,12 @@ void app_state_register_on_meter(app_state_on_meter_t cb, void *ctx)
 // input) don't fit the existing array idiom. Its own dirty/notify path so
 // the master strip widget can be redrawn independently of the fader
 // tileview.
-static app_channel_t                 s_master = { .id = -1, .level_db = -200.0f };
+static app_channel_t                 s_master = { .id = -1, .level_db = -200.0f, .meter_db = -200.0f };
 static SemaphoreHandle_t             s_master_mutex;
 static app_state_master_on_change_t  s_master_on_change;
 static void                         *s_master_on_change_ctx;
+static app_state_master_on_meter_t   s_master_on_meter;
+static void                         *s_master_on_meter_ctx;
 
 static void master_lock(void)
 {
@@ -237,4 +239,18 @@ void app_state_master_register_on_change(app_state_master_on_change_t cb, void *
 {
     s_master_on_change     = cb;
     s_master_on_change_ctx = ctx;
+}
+
+void app_state_master_set_meter_db(float db, bool notify)
+{
+    master_lock();
+    s_master.meter_db = db;
+    master_unlock();
+    if (notify && s_master_on_meter) s_master_on_meter(s_master_on_meter_ctx);
+}
+
+void app_state_master_register_on_meter(app_state_master_on_meter_t cb, void *ctx)
+{
+    s_master_on_meter     = cb;
+    s_master_on_meter_ctx = ctx;
 }
