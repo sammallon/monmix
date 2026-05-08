@@ -170,9 +170,55 @@ static void pump_for(uint32_t ms, uint32_t *prev_ticks) {
     }
 }
 
+// LVGL-snapshot-backed BMP write. Used as the fallback when the SDL
+// video driver doesn't provide a renderer (e.g. headless+dummy). Renders
+// the LVGL active screen into a caller-allocated XRGB8888 buffer, wraps
+// it in an SDL_Surface (no renderer required), and saves a BMP. The
+// XRGB8888 byte order matches SDL_PIXELFORMAT_BGRA32 on little-endian
+// so the wrap is a straight pointer reinterpret.
+static int take_screenshot_via_lvgl(const char *path) {
+    lv_obj_t *scr = lv_screen_active();
+    if (!scr) { fprintf(stderr, "screenshot: no active screen\n"); return -10; }
+    int32_t w = lv_obj_get_width(scr);
+    int32_t h = lv_obj_get_height(scr);
+    if (w <= 0 || h <= 0) { fprintf(stderr, "screenshot: bad screen dims\n"); return -11; }
+
+    size_t buf_size = (size_t) w * (size_t) h * 4;
+    uint8_t *pixels = (uint8_t *) malloc(buf_size);
+    if (!pixels) { fprintf(stderr, "screenshot: alloc failed\n"); return -12; }
+
+    lv_image_dsc_t dsc;
+    memset(&dsc, 0, sizeof(dsc));
+    if (lv_snapshot_take_to_buf(scr, LV_COLOR_FORMAT_XRGB8888, &dsc, pixels, buf_size) != LV_RESULT_OK) {
+        fprintf(stderr, "screenshot: lv_snapshot_take_to_buf failed\n");
+        free(pixels);
+        return -13;
+    }
+
+    SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormatFrom(
+        pixels, w, h, 32, w * 4, SDL_PIXELFORMAT_BGRA32);
+    if (!surf) {
+        fprintf(stderr, "screenshot: SDL_CreateRGBSurfaceWithFormatFrom: %s\n", SDL_GetError());
+        free(pixels);
+        return -14;
+    }
+    int rc = SDL_SaveBMP(surf, path);
+    SDL_FreeSurface(surf);
+    free(pixels);
+    if (rc != 0) {
+        fprintf(stderr, "screenshot: SaveBMP(%s): %s\n", path, SDL_GetError());
+        return -15;
+    }
+    return 0;
+}
+
 static int take_screenshot(const char *path) {
     SDL_Renderer *r = lv_sdl_window_get_renderer(g_disp);
-    if (!r) { fprintf(stderr, "screenshot: no renderer\n"); return -1; }
+    if (!r) {
+        // dummy/offscreen video drivers don't expose a renderer; render
+        // the screen via LVGL's snapshot API instead.
+        return take_screenshot_via_lvgl(path);
+    }
     int w, h;
     if (SDL_GetRendererOutputSize(r, &w, &h) != 0) {
         fprintf(stderr, "screenshot: GetRendererOutputSize: %s\n", SDL_GetError());
@@ -384,10 +430,20 @@ int main(int argc, char **argv) {
     }
     if (do_throttle) throttle_apply();
 
-    // Suppress focus-stealing on every internal SDL_RaiseWindow. Helps
-    // interactive runs too -- without this hint the window grabs focus on
-    // each event-loop pump and steals keyboard focus from whatever the
-    // user is typing into.
+    // Headless mode: route SDL through the dummy video driver so no real
+    // OS window is created. The "offscreen" driver would also work (and
+    // would even keep an SDL_Renderer alive) but it isn't compiled into
+    // the SDL2 dev pack we use, so dummy + a snapshot-based screenshot
+    // fallback is the working combo. Earlier attempts at hiding the
+    // window post-create couldn't prevent the activation flash because
+    // on Windows SDL_CreateWindow shows + activates the window before
+    // any SDL_HideWindow call gets a chance to run.
+    if (headless) {
+        SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+    }
+
+    // Suppress focus-stealing on every internal SDL_RaiseWindow. Cheap
+    // insurance for non-headless interactive runs.
     SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
 
     // Register exit hooks BEFORE the MS client comes up. atexit covers

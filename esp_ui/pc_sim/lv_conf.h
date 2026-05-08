@@ -107,7 +107,7 @@
 
 // Misc utilities the UI touches.
 #define LV_USE_OBSERVER 1
-#define LV_USE_SNAPSHOT 0
+#define LV_USE_SNAPSHOT 1   // Required for take_screenshot_via_lvgl fallback when SDL renderer is unavailable (headless+dummy).
 #define LV_USE_SYSMON   0
 #define LV_USE_PROFILER 0
 
