@@ -92,6 +92,17 @@ def translate(script, test_name):
             # textarea). Pass through everything after the keyword.
             text = line[len("type"):].strip()
             steps.append(f"cmd:type {text}")
+        elif op == "chpick_save":
+            # chpick_save id1,id2,... -> chpick-save REPL command. Same
+            # comma-separated id list grammar; the device cmd calls
+            # app_ui_chpick_apply just like pc_sim does.
+            arg = parts[1] if len(parts) > 1 else ""
+            steps.append(f"cmd:chpick-save {arg}" if arg else "cmd:chpick-save")
+        elif op == "dump_tiles":
+            # dump_tiles -- requires the settings overlay to already be
+            # open on hw, same as the sim hook. Test scripts must `tap`
+            # the gear + `sleep` first.
+            steps.append("cmd:dump-tiles")
         elif op.startswith("cmd:"):
             # Already in hw form (e.g. from a test's hw_script). Pass through
             # verbatim so hw-only tests can target REPL commands that don't
