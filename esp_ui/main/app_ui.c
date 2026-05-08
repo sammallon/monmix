@@ -2701,7 +2701,7 @@ static void on_reboot_yes(lv_event_t *e)
     ESP_LOGW(TAG, "user-initiated reboot");
     show_rebooting_overlay();
     vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
 }
 
 // Build (lazy) and present a full-screen "Rebooting..." overlay so the
@@ -3668,7 +3668,7 @@ static void on_wcfg_save_yes(lv_event_t *e)
     if (!app_wifi_reconfigure()) {
         show_rebooting_overlay();
         vTaskDelay(pdMS_TO_TICKS(800));
-        esp_restart();
+        app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
         return;   // unreached
     }
     // NTP server / DHCP-NTP changes apply live too -- apply_sntp_config
@@ -4621,7 +4621,7 @@ static void on_mcfg_reboot_yes(lv_event_t *e)
 {
     (void)e;
     if (s_mcfg_reboot_confirm) lv_obj_add_flag(s_mcfg_reboot_confirm, LV_OBJ_FLAG_HIDDEN);
-    esp_restart();
+    app_reboot_graceful();   // unsubscribes + WS close, then esp_restart
 }
 
 static void on_mcfg_reboot_no(lv_event_t *e)

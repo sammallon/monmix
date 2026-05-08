@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "esp_partition.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "lvgl.h"
 #include "mbedtls/base64.h"
@@ -913,6 +914,48 @@ static int cmd_mcfg_apply(int argc, char **argv)
     return 0;
 }
 
+// Resolve the currently-active MS client per the protocol pref. Same
+// selection logic as esp_ui_main.c so reboot/pre-flash paths inform the
+// right backend without esp_ui_main having to publish its s_ms pointer.
+static const ms_client_iface_t *active_ms_client(void)
+{
+    return (app_config_ms_protocol() == APP_MS_PROTOCOL_OSC)
+        ? app_ms_client_osc()
+        : app_ms_client_ws();
+}
+
+// Public wrapper used by every esp_restart() call site in main/. Calls
+// shutdown_graceful() on the active client (sends unsubscribes + WS
+// CLOSE), waits briefly for log + UART output to flush, then resets the
+// chip. Without this MS keeps the prior subscriptions in its server
+// table across the reboot, accumulating leaked entries every flash
+// cycle.
+void app_reboot_graceful(void)
+{
+    const ms_client_iface_t *ms = active_ms_client();
+    if (ms && ms->shutdown_graceful) ms->shutdown_graceful();
+    // Brief tail so any final ESP_LOG / printf draining UART completes
+    // before the chip resets and the host sees a half-line.
+    vTaskDelay(pdMS_TO_TICKS(150));
+    esp_restart();
+}
+
+// `pre-flash` -- graceful MS shutdown, then print a marker the host
+// flash workflow can grep for. Doesn't reboot; idf.py's DTR/RTS pulse
+// will trigger the reset shortly after, by which point the WS is
+// already closed cleanly. The marker line stands alone so a host
+// script's regex doesn't catch a substring of an unrelated log line.
+static int cmd_pre_flash(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    const ms_client_iface_t *ms = active_ms_client();
+    if (ms && ms->shutdown_graceful) ms->shutdown_graceful();
+    // One line, fixed token. Matches `^READY-TO-FLASH$`.
+    printf("READY-TO-FLASH\n");
+    fflush(stdout);
+    return 0;
+}
+
 // Live LCD backlight control. Used to A/B-test brownout-vs-storm theory:
 // drop the backlight from the default 80% to a low single-digit percentage,
 // run the stress reproducer, see if the storm still fires. If dimming
@@ -960,6 +1003,7 @@ void app_console_init(void)
         { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
         { .command = "set-bright",   .help = "<0..100> -- set LCD backlight % (default 80)",  .func = cmd_set_bright   },
         { .command = "mcfg-apply",   .help = "<host> <port> -- drive MS-config Save (test hook)", .func = cmd_mcfg_apply   },
+        { .command = "pre-flash",    .help = "graceful MS shutdown + print READY-TO-FLASH",   .func = cmd_pre_flash    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

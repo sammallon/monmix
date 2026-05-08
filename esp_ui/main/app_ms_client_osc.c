@@ -1189,6 +1189,34 @@ static bool osc_is_channel_routable      (int id)        { (void)id; return true
 
 static void osc_set_meter_enabled(bool on)               { (void)on; /* TODO */ }
 
+// OSC graceful shutdown is asymmetric vs WS: there is no /unsubscribe
+// path on the OSC bridge -- MS's heartbeat-subscribe model just stops
+// pushing to a UDP source after ~5 s of no inbound /hi packets. The
+// equivalent of "tell MS we're going" is "stop heartbeating and let the
+// timeout drop us"; UDP has no connection state to clean up. We still
+// drain any pending outbound packets so a final SET (e.g. user toggled
+// mute right before reboot) doesn't get dropped in the worker queue.
+// The WS-vs-OSC asymmetry is intentional: documenting it here so a
+// future reader doesn't try to add a non-existent unsubscribe path.
+static void osc_shutdown_graceful(void)
+{
+    if (!g.task) return;
+
+    // Drain whatever's queued so the last user action lands. ~250 ms
+    // budget; outbound is one UDP send per poll, queue is typically
+    // single-digit entries.
+    for (int i = 0; i < 10; ++i) {
+        bool empty;
+        xSemaphoreTake(g.outq_mtx, portMAX_DELAY);
+        empty = (g.outq_head == NULL);
+        xSemaphoreGive(g.outq_mtx);
+        if (empty) break;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    // Heartbeat dies naturally when the worker stops. MS's UDP-source
+    // entry expires server-side; nothing more to do.
+}
+
 static void osc_set_level_format(app_level_format_t f) {
     if (g.level_format == f) return;
     g.level_format = f;
@@ -1237,6 +1265,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = osc_is_channel_routable,
     .set_meter_enabled           = osc_set_meter_enabled,
     .set_level_format            = osc_set_level_format,
+    .shutdown_graceful           = osc_shutdown_graceful,
 };
 
 const ms_client_iface_t *app_ms_client_osc(void) { return &s_iface; }

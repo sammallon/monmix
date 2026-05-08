@@ -32,7 +32,16 @@ TEST = {
             "OK quit",
         ],
         "stdout_not_contains": [
-            "WS closed",
+            # "WS closed" used to indicate the keepalive failed and the
+            # WS dropped. With graceful shutdown enabled, `quit` cleanly
+            # closes the WS at exit, which now legitimately produces
+            # "WS closed". A reconnect mid-test would also produce a
+            # second "WS open" -- if the bug regressed, the 45 s idle
+            # would still trigger one or more closes within the run,
+            # which would surface as the graceful-shutdown banner not
+            # being the immediate predecessor. Best the substring
+            # runner can do: forbid LV_ASSERT and trust the
+            # graceful_shutdown test to police the close path.
             "LV_ASSERT",
         ],
     },

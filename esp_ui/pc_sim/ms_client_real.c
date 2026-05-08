@@ -627,6 +627,48 @@ static void m_set_level_format(app_level_format_t f) {
     if (g_ms.ws_open) subscribe_all();
 }
 
+// Mirror main/app_ms_client_ws.c::ws_shutdown_graceful: queue
+// /console/data/unsubscribe for every active subscription, drain, send
+// WS CLOSE, wait briefly. Called from pc_main's exit handlers (atexit,
+// SIGINT/SIGTERM, SDL_QUIT, `quit` script cmd) so the test suite
+// doesn't hammer MS with leaked subscriptions across runs.
+static void m_shutdown_graceful(void) {
+    if (!g_ms.thread) return;
+    if (!g_ms.ws_open || !g_ms.ws_conn) return;
+
+    printf("ms_real: graceful shutdown -- queuing unsubscribes\n");
+    fflush(stdout);
+
+    size_t n = app_state_count();
+    for (size_t i = 0; i < n; ++i) {
+        int id = app_state_id_for_idx(i);
+        if (id >= 0) unsubscribe_channel(id, g_ms.mix_idx);
+    }
+    app_channel_t master;
+    if (app_state_master_get(&master) && master.id >= 0) {
+        unsubscribe_master(master.id);
+    }
+
+    // Wait for the worker to drain. Worker poll is 25 ms, queue size
+    // typically a few dozen, ~300 ms budget covers it.
+    for (int i = 0; i < 12; ++i) {
+        SDL_LockMutex(g_ms.outq_mtx);
+        bool empty = (g_ms.outq_head == NULL);
+        SDL_UnlockMutex(g_ms.outq_mtx);
+        if (empty) break;
+        SDL_Delay(25);
+    }
+    if (g_ms.ws_open && g_ms.ws_conn) {
+        mg_ws_send(g_ms.ws_conn, NULL, 0, WEBSOCKET_OP_CLOSE);
+        for (int i = 0; i < 20; ++i) {
+            if (!g_ms.ws_open) break;
+            SDL_Delay(25);
+        }
+    }
+    printf("ms_real: graceful shutdown done\n");
+    fflush(stdout);
+}
+
 static const ms_client_iface_t s_iface = {
     .start                       = m_start,
     .set_level                   = m_set_level,
@@ -655,6 +697,7 @@ static const ms_client_iface_t s_iface = {
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
     .is_console_attached         = NULL,
+    .shutdown_graceful           = m_shutdown_graceful,
 };
 
 const ms_client_iface_t *ms_client_real_create(const char *host, int port) {
