@@ -2,6 +2,10 @@
 
 Step syntax (as positional args):
     tap:X,Y              synthetic LVGL tap at (X, Y)
+    down:X,Y             touch press at (X, Y); held until next up. A
+                         second down at a different (X, Y) acts as a
+                         move-while-held (drag gesture).
+    up:X,Y               touch release at (X, Y).
     cmd:CMD ARGS         arbitrary console command (e.g. cmd:level-format db)
     shot:NAME            take a screenshot, save as NAME.png
     wait:MS              sleep for MS milliseconds (let animations settle)
@@ -155,6 +159,22 @@ def main():
                     print(f"  ! bad tap step: {step!r}")
                     continue
                 send_and_drain(ser, f"touch {xy[0].strip()} {xy[1].strip()} tap",
+                               idle_grace=0.4, max_wait=4)
+            elif step.startswith("down:"):
+                # Touch press, held until next up. Subsequent `down:` at a
+                # new (x, y) updates position while pressed = drag.
+                xy = step[5:].split(",")
+                if len(xy) != 2:
+                    print(f"  ! bad down step: {step!r}")
+                    continue
+                send_and_drain(ser, f"touch {xy[0].strip()} {xy[1].strip()} down",
+                               idle_grace=0.4, max_wait=4)
+            elif step.startswith("up:"):
+                xy = step[3:].split(",")
+                if len(xy) != 2:
+                    print(f"  ! bad up step: {step!r}")
+                    continue
+                send_and_drain(ser, f"touch {xy[0].strip()} {xy[1].strip()} up",
                                idle_grace=0.4, max_wait=4)
             elif step.startswith("shot:"):
                 screenshot(ser, step[5:])

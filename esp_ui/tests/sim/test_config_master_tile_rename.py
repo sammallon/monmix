@@ -43,5 +43,37 @@ TEST = {
             "Assertion failed",
         ],
     },
-    "hw_compatible": False,
+    # HW parity: same coordinates work, but the assertion shifts from
+    # the mock_ms log line (sim-only) to direct master_state introspection
+    # via the new master-state REPL command. The rename popup's Save
+    # closes itself on completion, so master_state-after-save reflects
+    # what MS broadcast back via the cfg.name subscription.
+    "hw_compatible": True,
+    "hw_script": (
+        # Boot + initial fader render + scribble names populated.
+        "sleep 3500\n"
+        "tap 1002 16\n"          # gear -> settings overlay
+        "sleep 1500\n"           # overlay build (matches settings_grid)
+        "tap 898 569\n"          # master tile name -> rename popup
+        "sleep 600\n"
+        "tap 957 30\n"           # Save -- prefilled name carries
+        "sleep 800\n"            # popup closes + MS round-trip
+        "cmd:master-state\n"
+    ),
+    "hw_expect": {
+        "exit_code": 0,
+        "stdout_contains": [
+            # Live MS instance puts the master at id 60 (mix_offset=60,
+            # mix_idx=0, "Mix 05" or similar -- match on the id and the
+            # name being non-empty quoted string).
+            "OK master_state id=",
+            "name=\"",
+        ],
+        "stdout_not_contains": [
+            "LV_ASSERT",
+            "panic",
+            "abort",
+            "ERR master_state",
+        ],
+    },
 }

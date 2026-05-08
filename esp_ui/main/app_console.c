@@ -29,6 +29,7 @@
 #include "app_ms_client.h"
 #include "app_ms_info.h"
 #include "app_prefs.h"
+#include "app_state.h"
 #include "app_storage.h"
 #include "app_touch_inject.h"
 #include "app_ui.h"
@@ -942,6 +943,52 @@ static int cmd_dump_tiles(int argc, char **argv)
     return 0;
 }
 
+// `chan-id <slot>` -- print the MS channel id at a given app_state slot.
+// Mirror of pc_sim's chan_id script command. Used by config_drag_reorder
+// hw parity to assert the swap landed without screenshots.
+static int cmd_chan_id(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: chan-id <slot>\n");
+        return 1;
+    }
+    int slot = atoi(argv[1]);
+    int id   = app_state_id_for_idx((size_t) slot);
+    printf("OK chan_id idx=%d ms_id=%d\n", slot, id);
+    return 0;
+}
+
+// `master-state` -- print the master strip's MS channel id + current name.
+// Mirror of pc_sim's master_state script command. Used by
+// config_master_tile_rename hw parity to verify the rename landed.
+static int cmd_master_state(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    app_channel_t m;
+    if (app_state_master_get(&m)) {
+        printf("OK master_state id=%d name=\"%s\"\n", m.id, m.name);
+    } else {
+        printf("ERR master_state: get failed\n");
+    }
+    return 0;
+}
+
+// `prefs-get-color <ms_id>` -- print the saved color-palette index for
+// a given MS channel id (or -1 if unset). Mirror of pc_sim's
+// prefs_get_color script command. Used by config_master_tile_color hw
+// parity to verify on_picker_choice wrote through to app_prefs.
+static int cmd_prefs_get_color(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: prefs-get-color <ms_id>\n");
+        return 1;
+    }
+    int id    = atoi(argv[1]);
+    int color = app_prefs_get_channel_color(id);
+    printf("OK prefs_get_color id=%d color=%d\n", id, color);
+    return 0;
+}
+
 // Drive the MS-config Save path from the REPL. Used by the names-on-
 // reconfigure regression test (tests/sim/test_ms_host_change_names.py)
 // in its hw lane: the test toggles the MS host to a bogus value, waits
@@ -1055,6 +1102,9 @@ void app_console_init(void)
         { .command = "mcfg-apply",   .help = "<host> <port> -- drive MS-config Save (test hook)", .func = cmd_mcfg_apply   },
         { .command = "chpick-save",  .help = "<id1,id2,...> -- drive picker live-apply (test hook)", .func = cmd_chpick_save },
         { .command = "dump-tiles",   .help = "dump settings-overlay tile coords (overlay must be open)", .func = cmd_dump_tiles  },
+        { .command = "chan-id",      .help = "<slot> -- print MS channel id at app_state slot", .func = cmd_chan_id      },
+        { .command = "master-state", .help = "print master strip's MS channel id + name", .func = cmd_master_state },
+        { .command = "prefs-get-color", .help = "<ms_id> -- print saved color-palette index for channel", .func = cmd_prefs_get_color },
         { .command = "pre-flash",    .help = "graceful MS shutdown + print READY-TO-FLASH",   .func = cmd_pre_flash    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
