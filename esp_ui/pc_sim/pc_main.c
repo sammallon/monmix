@@ -22,6 +22,7 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include <SDL_syswm.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,6 +232,32 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_prefs_set_level_format(f);
             if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
             printf("OK set_format %s\n", text);
+        } else if (strncmp(cmd, "chpick_save", 11) == 0) {
+            // Comma-separated id list, e.g. "chpick_save 0,2,5". Empty list
+            // means "track no channels"; bare "chpick_save" is the same.
+            // Drives app_ui_chpick_apply directly so the test exercises the
+            // stop+rebuild+restart path without driving the picker UI.
+            int ids[64];
+            int n = 0;
+            const char *p = cmd + 11;
+            while (*p == ' ' || *p == '\t') ++p;
+            while (*p && n < (int)(sizeof(ids)/sizeof(ids[0]))) {
+                int v;
+                int consumed = 0;
+                if (sscanf(p, "%d%n", &v, &consumed) == 1 && consumed > 0) {
+                    ids[n++] = v;
+                    p += consumed;
+                    if (*p == ',') ++p;
+                } else {
+                    break;
+                }
+            }
+            // Hold lvgl_port_lock the same way an LVGL-task event would --
+            // app_ui_chpick_apply documents that requirement.
+            lvgl_port_lock(0);
+            app_ui_chpick_apply(ids, (size_t) n);
+            lvgl_port_unlock();
+            printf("OK chpick_save n=%d\n", n);
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
             // Drive the mix-change path the same way the picker does:
             // ms->set_mix() updates the active subscription, AND
@@ -283,6 +310,12 @@ int main(int argc, char **argv) {
     }
     if (do_throttle) throttle_apply();
 
+    // Suppress focus-stealing on every internal SDL_RaiseWindow. Helps
+    // interactive runs too -- without this hint the window grabs focus on
+    // each event-loop pump and steals keyboard focus from whatever the
+    // user is typing into.
+    SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -297,7 +330,22 @@ int main(int argc, char **argv) {
     // Headless: hide the SDL window after creation so scripted runs don't
     // pop a window onto the user's screen. Rendering still happens to the
     // off-screen renderer, so screenshot commands work normally.
+    //
+    // On Windows, lv_sdl_window_create shows + raises the window before we
+    // get a chance to call SDL_HideWindow, so for a moment the window
+    // appears and grabs focus from whatever the user is typing into. Set
+    // WS_EX_NOACTIVATE so the OS won't activate the window even on that
+    // brief flash, then hide it permanently.
     if (headless && g_sdl_window) {
+#ifdef _WIN32
+        SDL_SysWMinfo wmi;
+        SDL_VERSION(&wmi.version);
+        if (SDL_GetWindowWMInfo(g_sdl_window, &wmi)) {
+            HWND hwnd = wmi.info.win.window;
+            LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        }
+#endif
         SDL_HideWindow(g_sdl_window);
     }
 

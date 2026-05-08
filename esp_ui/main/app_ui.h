@@ -48,3 +48,11 @@ void app_ui_set_status(const char *text);
 // mix-list-ready gate. Pass false to release the override and revert to
 // the gated path. Used by the `mix-show` console command for diagnosis.
 void app_ui_force_mix_show(bool force);
+
+// Test hook: apply a new tracked-channel selection live (the same path
+// the channel-picker Save flow takes after persisting to NVS). Used by
+// pc_sim's chpick_save script command so a regression can exercise the
+// stop+rebuild+restart lifecycle without driving the picker UI.
+// Persists to NVS, reseeds app_state, rebuilds faders, restarts the MS
+// worker. Caller must hold lvgl_port_lock.
+void app_ui_chpick_apply(const int *ids, size_t count);

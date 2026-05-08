@@ -591,6 +591,77 @@ static int cmd_ms_info(int argc, char **argv)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `type <text...>` — write text into the currently-focused textarea by
+// going around the on-screen lv_keyboard. Resolves the target via the
+// indev focus chain first (covers panels with proper group setup) and
+// falls back to walking the active screen for any textarea carrying
+// LV_STATE_FOCUSED. Used by hardware tests that need to populate IP /
+// SSID / host fields without driving 30+ keyboard taps.
+// ─────────────────────────────────────────────────────────────────────────
+
+static lv_obj_t *find_textarea_in_tree(lv_obj_t *root)
+{
+    if (!root) return NULL;
+    if (lv_obj_check_type(root, &lv_textarea_class) &&
+        lv_obj_has_state(root, LV_STATE_FOCUSED)) {
+        return root;
+    }
+    uint32_t n = lv_obj_get_child_count(root);
+    for (uint32_t i = 0; i < n; ++i) {
+        lv_obj_t *c = lv_obj_get_child(root, i);
+        lv_obj_t *r = find_textarea_in_tree(c);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+static lv_obj_t *find_focused_textarea(void)
+{
+    lv_indev_t *indev = NULL;
+    while ((indev = lv_indev_get_next(indev)) != NULL) {
+        lv_group_t *g = lv_indev_get_group(indev);
+        if (!g) continue;
+        lv_obj_t *f = lv_group_get_focused(g);
+        if (f && lv_obj_check_type(f, &lv_textarea_class)) return f;
+    }
+    return find_textarea_in_tree(lv_screen_active());
+}
+
+static int cmd_type(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: type <text...> (writes into focused textarea)\n");
+        return 1;
+    }
+    char buf[160];
+    size_t pos = 0;
+    for (int i = 1; i < argc; ++i) {
+        size_t need = strlen(argv[i]) + (i > 1 ? 1 : 0);
+        if (pos + need + 1 > sizeof(buf)) break;
+        if (i > 1) buf[pos++] = ' ';
+        size_t l = strlen(argv[i]);
+        memcpy(buf + pos, argv[i], l);
+        pos += l;
+    }
+    buf[pos] = 0;
+
+    if (!lvgl_port_lock(1000)) {
+        printf("type: lvgl_port_lock failed\n");
+        return 1;
+    }
+    lv_obj_t *ta = find_focused_textarea();
+    if (!ta) {
+        lvgl_port_unlock();
+        printf("type: no focused textarea (tap one first)\n");
+        return 1;
+    }
+    lv_textarea_set_text(ta, buf);
+    lvgl_port_unlock();
+    printf("type: '%s'\n", buf);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // `prefs-dump` — print effective + per-source (NVS, SD) prefs state with
 // per-key mtimes. Used by P0 verification to confirm conflict-resolution
 // + missing-key paths land correctly.
@@ -780,6 +851,7 @@ void app_console_init(void)
         { .command = "coredump-b64", .help = "base64-print the flash coredump partition",     .func = cmd_coredump_b64 },
         { .command = "screenshot",   .help = "base64-print an RGB565 screenshot of the UI",   .func = cmd_screenshot   },
         { .command = "touch",        .help = "<x> <y> [tap|down|up] — synthetic LVGL touch",  .func = cmd_touch        },
+        { .command = "type",         .help = "<text...> -- write into the focused textarea",  .func = cmd_type         },
         { .command = "level-format", .help = "query/set fader value readout: norm | db",      .func = cmd_level_format },
         { .command = "signal-indicator", .help = "query/set: none | signal-present | meter",  .func = cmd_signal_indicator },
         { .command = "theme",        .help = "query/set UI theme: dark | light",              .func = cmd_theme        },

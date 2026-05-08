@@ -105,6 +105,12 @@ static struct {
 
     TaskHandle_t            task;
     volatile bool           running;
+    // Bounded join: ws_stop blocks on this until ws_task has freed mgr
+    // and is about to vTaskDelete itself. Without it, ws_start right
+    // after ws_stop would race a still-running ws_task on the global g.
+    // Picker live-apply (channel-set rebuild) is the path that exercises
+    // start-after-stop most aggressively.
+    SemaphoreHandle_t       exit_sig;
 
     struct mg_mgr           mgr;
     struct mg_connection   *ws_conn;
@@ -781,6 +787,7 @@ static void ws_task(void *unused) {
     }
 
     mg_mgr_free(&g.mgr);
+    if (g.exit_sig) xSemaphoreGive(g.exit_sig);
     vTaskDelete(NULL);
 }
 
@@ -816,6 +823,7 @@ static bool ws_is_console_attached(void) { return g.console_attached; }
 static bool ws_start(void) {
     if (g.task) return true;
     g.outq_mtx = xSemaphoreCreateMutex();
+    g.exit_sig = xSemaphoreCreateBinary();
     g.running  = true;
     g.state    = APP_MS_STATE_BOOT;
     g.subscriber_count = g.subscriber_count;  // keep prior registrations
@@ -838,10 +846,33 @@ static bool ws_start(void) {
 
 static void ws_stop(void) {
     g.running = false;
-    // The task tears itself down on the next loop iteration. We don't
-    // join: xTaskCreate's deletion is async, and we don't need to wait
-    // here -- nothing on the caller's side touches the mgr.
+    // Bounded join. Picker live-apply restarts the worker right after
+    // stopping it; without waiting, the new ws_task races the old one on
+    // the global g (mgr, outq, etc). One MGR_POLL_MS cycle plus slack is
+    // enough; if we time out we'd rather log and proceed than deadlock
+    // the LVGL caller.
+    if (g.exit_sig) {
+        if (xSemaphoreTake(g.exit_sig, pdMS_TO_TICKS(1500)) != pdTRUE) {
+            ESP_LOGW(TAG, "ws_stop: worker join timed out");
+        }
+        vSemaphoreDelete(g.exit_sig);
+        g.exit_sig = NULL;
+    }
     g.task = NULL;
+    // outq cleanup: the worker drained whatever it could before exit;
+    // anything still queued belongs to the prior session and we drop it.
+    // Without explicit deletion the mutex leaks across start/stop cycles.
+    if (g.outq_mtx) {
+        outq_entry_t *e = outq_drain();
+        while (e) {
+            outq_entry_t *next = e->next;
+            free(e->json);
+            free(e);
+            e = next;
+        }
+        vSemaphoreDelete(g.outq_mtx);
+        g.outq_mtx = NULL;
+    }
     set_state(APP_MS_STATE_BOOT);
 }
 
