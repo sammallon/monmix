@@ -66,6 +66,9 @@ def translate(script, test_name):
     """
     steps = []
     shot_idx = 0
+    # Track last (x, y) so a parameter-less `release` can map to an up at
+    # the last move/press position, mirroring pc_sim's g_last_x/g_last_y.
+    last_x, last_y = None, None
     for raw in script.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"): continue
@@ -75,6 +78,25 @@ def translate(script, test_name):
             steps.append(f"wait:{parts[1]}")
         elif op == "tap":
             steps.append(f"tap:{parts[1]},{parts[2]}")
+            last_x, last_y = parts[1], parts[2]
+        elif op == "press":
+            # press X Y -> initial touch down. The device's
+            # app_touch_inject_set holds pressed=true until an `up`.
+            steps.append(f"down:{parts[1]},{parts[2]}")
+            last_x, last_y = parts[1], parts[2]
+        elif op == "move":
+            # move X Y while pressed -> just another `down` at the new
+            # position. app_touch_inject's read_cb sees an updated
+            # (x, y) with pressed=true, which LVGL fires as PRESSING.
+            steps.append(f"down:{parts[1]},{parts[2]}")
+            last_x, last_y = parts[1], parts[2]
+        elif op == "release":
+            if last_x is None:
+                print(f"  warning: release with no prior position, skipping")
+                continue
+            # release maps to touch X Y up at the last known position,
+            # matching pc_sim's release-at-last-cursor semantics.
+            steps.append(f"up:{last_x},{last_y}")
         elif op == "screenshot":
             steps.append(f"shot:{test_name}__{shot_idx:02d}")
             shot_idx += 1
@@ -103,18 +125,25 @@ def translate(script, test_name):
             # open on hw, same as the sim hook. Test scripts must `tap`
             # the gear + `sleep` first.
             steps.append("cmd:dump-tiles")
+        elif op == "chan_id":
+            # chan_id <slot> -> chan-id REPL command. Returns "OK chan_id
+            # idx=N ms_id=M" (same line shape as the sim script command).
+            steps.append(f"cmd:chan-id {parts[1]}")
+        elif op == "master_state":
+            # master_state get -> master-state REPL command. The sim
+            # script takes a "get" arg; the hw command takes none.
+            steps.append("cmd:master-state")
+        elif op == "prefs_get_color":
+            steps.append(f"cmd:prefs-get-color {parts[1]}")
         elif op.startswith("cmd:"):
             # Already in hw form (e.g. from a test's hw_script). Pass through
             # verbatim so hw-only tests can target REPL commands that don't
             # have a sim-side translation.
             steps.append(line)
-        elif op in ("quit", "echo", "press", "release", "move"):
+        elif op in ("quit", "echo"):
             # quit: REPL session naturally ends when run_steps.py finishes.
             # echo: no on-device equivalent, drop.
-            # press/release/move: would need raw indev events; not wired
-            # into the device REPL today. Skip with a soft warning.
-            if op in ("press", "release", "move"):
-                print(f"  warning: skipping unsupported op {op!r} (hw)")
+            pass
         else:
             print(f"  warning: unknown op {op!r} in script")
     return steps
