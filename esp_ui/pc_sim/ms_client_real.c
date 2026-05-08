@@ -484,12 +484,40 @@ static int worker_thread(void *unused) {
 // ms_client_iface_t implementations
 // ────────────────────────────────────────────────────────────────────────────
 
-static bool m_start(void) { return true; /* started by ms_client_real_create */ }
-static void m_stop(void)  {
+// Spawn the worker. Split from ms_client_real_create so the picker
+// live-apply path can stop + re-init app_state + start again without
+// reconstructing the iface or re-seeding host/port. Mirrors the
+// firmware's ws_start/ws_stop shape so picker-rebuild bugs reproduce
+// in the sim.
+static bool m_start(void) {
+    if (g_ms.thread) return true;
+    if (!g_ms.outq_mtx) g_ms.outq_mtx = SDL_CreateMutex();
+    g_ms.running    = true;
+    g_ms.state      = APP_MS_STATE_BOOT;
+    g_ms.subscribed = false;
+    g_ms.ws_open    = false;
+    g_ms.ws_conn    = NULL;
+    g_ms.level_fmt  = app_prefs_get_level_format();
+    g_ms.thread     = SDL_CreateThread(worker_thread, "ms_real_ws", NULL);
+    return g_ms.thread != NULL;
+}
+
+static void m_stop(void) {
     g_ms.running = false;
     if (g_ms.thread) {
         SDL_WaitThread(g_ms.thread, NULL);
         g_ms.thread = NULL;
+    }
+    // Drop any queued outbound JSON; it was for the prior session and
+    // a restart against a new channel set would push it on the wrong
+    // subscribe shape. Mutex stays alive across cycles -- cheap, and
+    // keeps push/drain paths stable while threads are spinning down.
+    outq_entry_t *e = outq_drain();
+    while (e) {
+        outq_entry_t *next = e->next;
+        free(e->json);
+        free(e);
+        e = next;
     }
 }
 
@@ -635,14 +663,8 @@ const ms_client_iface_t *ms_client_real_create(const char *host, int port) {
     snprintf(g_ms.ws_url,    sizeof(g_ms.ws_url),    "ws://%s:%d/", host, port);
     snprintf(g_ms.http_base, sizeof(g_ms.http_base), "http://%s:%d", host, port);
 
-    g_ms.outq_mtx = SDL_CreateMutex();
-    g_ms.running  = true;
-    g_ms.state    = APP_MS_STATE_BOOT;
-    // Seed format from prefs -- a sim relaunch with level=db saved in NVS
-    // would otherwise subscribe in "norm" and the UI's sweep reads zeroes
-    // from ch.level_db. Same bug shape we just fixed for the runtime
-    // switch, but triggered at boot.
-    g_ms.level_fmt = app_prefs_get_level_format();
-    g_ms.thread   = SDL_CreateThread(worker_thread, "ms_real_ws", NULL);
+    // Worker is started by m_start, mirroring the firmware. pc_main calls
+    // ms->start() right after create, so existing call sites still work.
+    g_ms.state = APP_MS_STATE_BOOT;
     return &s_iface;
 }
