@@ -758,6 +758,21 @@ static const char *m_get_strip_name(int id) {
 static void m_fetch_channel_routability(int total) { (void)total; }
 static bool m_is_channel_routable      (int id)    { (void)id; return true; }
 static void m_set_meter_enabled(bool on)           { (void)on; }
+// OSC shutdown is asymmetric vs WS: no /unsubscribe path, MS's
+// heartbeat-subscribe entry expires server-side after ~5 s of silence.
+// Drain pending UDP sends so a final SET right before exit isn't
+// dropped. Documented in main/app_ms_client_osc.c::osc_shutdown_graceful.
+static void m_shutdown_graceful(void) {
+    if (!g_osc.thread) return;
+    for (int i = 0; i < 10; ++i) {
+        SDL_LockMutex(g_osc.outq_mtx);
+        bool empty = (g_osc.outq_head == NULL);
+        SDL_UnlockMutex(g_osc.outq_mtx);
+        if (empty) break;
+        SDL_Delay(25);
+    }
+}
+
 static void m_set_level_format(app_level_format_t f) {
     if (g_osc.level_fmt == f) return;
     g_osc.level_fmt = f;
@@ -800,6 +815,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = m_is_channel_routable,
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
+    .shutdown_graceful           = m_shutdown_graceful,
 };
 
 const ms_client_iface_t *ms_client_real_osc_create(const char *host, int http_port, int osc_port) {

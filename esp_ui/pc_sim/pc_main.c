@@ -23,6 +23,7 @@
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -98,6 +99,27 @@ static lv_display_t *g_disp;
 static int           g_last_x;
 static int           g_last_y;
 static const ms_client_iface_t *g_ms;
+
+// All exit paths (SDL_QUIT, SIGINT/SIGTERM, atexit, `quit` script cmd)
+// route through here so MS gets unsubscribes + WS close instead of an
+// abrupt TCP RST. Idempotent via the static flag -- atexit fires after
+// a signal handler already ran, and the script `quit` flow exits via
+// return-from-main which also fires atexit.
+static volatile int g_shutdown_done = 0;
+static void shutdown_ms_once(void) {
+    if (g_shutdown_done) return;
+    g_shutdown_done = 1;
+    if (g_ms && g_ms->shutdown_graceful) g_ms->shutdown_graceful();
+}
+
+// SIGINT/SIGTERM. Print and exit cleanly so atexit + flush run; signal
+// handlers can't safely call into mongoose directly, but exit() from
+// inside a handler is async-signal-safe and triggers our atexit hook.
+static void on_signal(int sig) {
+    fprintf(stderr, "pc_sim: caught signal %d, exiting\n", sig);
+    fflush(stderr);
+    exit(0);
+}
 
 static void inject_motion(int x, int y) {
     g_last_x = x; g_last_y = y;
@@ -271,6 +293,10 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             }
             printf("OK set_mix %d\n", x);
         } else if (strcmp(cmd, "quit") == 0) {
+            // Flush MS before printing the OK marker so test stdout
+            // captures the full unsubscribe sequence; the harness
+            // greps for "OK quit" as the run-completed marker.
+            shutdown_ms_once();
             printf("OK quit\n");
             return 1;
         } else {
@@ -308,6 +334,13 @@ int main(int argc, char **argv) {
         }
     }
     if (do_throttle) throttle_apply();
+
+    // Register exit hooks BEFORE the MS client comes up. atexit covers
+    // normal return-from-main + exit(); the signal handlers turn ^C and
+    // SIGTERM into a clean exit() call so the atexit chain runs.
+    atexit(shutdown_ms_once);
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -415,9 +448,17 @@ int main(int argc, char **argv) {
     // Interactive mode: pump until the SDL window is closed. Same
     // lvgl_port_lock discipline as pump_for -- non-LVGL threads (mongoose
     // worker) take the lock to touch widgets, so the handler must hold
-    // it during render too.
+    // it during render too. SDL_QUIT (window close) exits via the same
+    // atexit path as the script `quit` command, so MS gets unsubscribes
+    // + WS close before we tear down.
     uint32_t prev = SDL_GetTicks();
     for (;;) {
+        SDL_Event ev;
+        while (SDL_PeepEvents(&ev, 1, SDL_PEEKEVENT, SDL_QUIT, SDL_QUIT) > 0) {
+            // PeepEvents leaves it in the queue for LVGL's SDL driver to
+            // consume too; we just observe and break out.
+            return 0;   // atexit -> shutdown_ms_once -> graceful close
+        }
         uint32_t now = SDL_GetTicks();
         lv_tick_inc(now - prev);
         prev = now;
