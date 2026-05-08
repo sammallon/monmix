@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_lvgl_port.h"
 #include "lvgl.h"
 
 #include "app_display.h"
@@ -59,6 +60,11 @@ static bool              s_was_degraded;
 // Saved brightness pref so unblanking restores the user's last
 // chosen value.
 static uint8_t           s_saved_brightness_pct;
+
+// Tracks whether enter_sleep stopped the MS client, so enter_awake
+// knows to bring it back up. The boot path leaves this false because
+// app_main starts MS itself; only the sleep-induced stop sets it.
+static bool              s_ms_stopped_for_sleep;
 
 // Lazily built overlays. All live on the active screen; their
 // foreground ordering is enforced by lv_obj_move_foreground at each
@@ -265,6 +271,18 @@ static void enter_awake(void)
     uint8_t pct = s_saved_brightness_pct;
     if (pct < 5) pct = app_prefs_get_brightness_pct();
     app_display_set_backlight_pct(pct);
+
+    // Bring MS back if sleep stopped it. Drop the lvgl_port_lock
+    // around start so the new worker's on_connect callbacks can
+    // grab it without us holding -- same pattern chpick uses for
+    // its stop/start cycle.
+    if (s_ms_stopped_for_sleep && s_ms && s_ms->start) {
+        ESP_LOGI(TAG, "wake: restarting MS client");
+        lvgl_port_unlock();
+        s_ms->start();
+        lvgl_port_lock(0);
+        s_ms_stopped_for_sleep = false;
+    }
 }
 
 static void enter_warn(void)
@@ -300,6 +318,25 @@ static void enter_sleep(void)
     app_display_set_backlight_off();
     ESP_LOGI(TAG, "entering sleep (effective_timeout=%ums)",
              (unsigned) app_power_get_effective_timeout_ms());
+
+    // Gracefully release the MS connection: send /console/data/
+    // unsubscribe for every subscription, then close the WS with a
+    // proper 1000 NORMAL frame, then join the worker. Saves CPU on
+    // both ends (no broadcasts to a panel that can't show them) and
+    // keeps MS from holding zombie subscriptions overnight. enter_
+    // awake spawns the worker again on the wake-menu pick.
+    //
+    // Drop the LVGL lock around shutdown_graceful + stop -- the
+    // worker may be blocked waiting for the lock to deliver a
+    // broadcast through on_state_change, and holding it here would
+    // deadlock the join. Same pattern chpick_apply_async uses.
+    if (s_ms && !s_ms_stopped_for_sleep) {
+        lvgl_port_unlock();
+        if (s_ms->shutdown_graceful) s_ms->shutdown_graceful();
+        if (s_ms->stop)              s_ms->stop();
+        lvgl_port_lock(0);
+        s_ms_stopped_for_sleep = true;
+    }
 }
 
 static void enter_wake_menu(void)

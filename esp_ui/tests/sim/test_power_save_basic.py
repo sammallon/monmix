@@ -36,13 +36,18 @@ TEST = {
         "stdout_contains": [
             "OK power_phase=AWAKE eff_to_ms=30000",
             "I (app_power) entering sleep",
-            "OK power_phase=SLEEP",
             # Sleep drives backlight all the way off (mock prints
             # "backlight=off"). Real device drops LEDC duty to 0.
-            # On wake the saved brightness % is restored.
             "[mock_display] backlight=off",
+            # Sleep also gracefully closes MS so the server doesn't
+            # hold zombie subscriptions overnight.
+            "[mock_ms] shutdown_graceful",
+            "OK power_phase=SLEEP",
             "OK power_phase=WAKE_MENU",
             "wake-menu pick: 1 h",
+            # Wake restarts MS so the user has a live connection
+            # by the time the new AWAKE phase begins.
+            "I (app_power) wake: restarting MS client",
         ],
         "stdout_not_contains": [
             "LV_ASSERT",
