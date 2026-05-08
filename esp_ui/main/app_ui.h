@@ -56,3 +56,9 @@ void app_ui_force_mix_show(bool force);
 // Persists to NVS, reseeds app_state, rebuilds faders, restarts the MS
 // worker. Caller must hold lvgl_port_lock.
 void app_ui_chpick_apply(const int *ids, size_t count);
+
+// Test hook: print one "settings_tile i=<i> x=<x> y=<y> name_x=<nx> swatch_x=<sx>"
+// line per channel tile in the settings overlay's grid, for asserting
+// column-major ordering and swatch-on-left placement. The settings
+// overlay must be open when called. Caller must hold lvgl_port_lock.
+void app_ui_settings_dump_tiles(void);
