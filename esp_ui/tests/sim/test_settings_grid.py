@@ -95,7 +95,10 @@ TEST = {
     "hw_script": (
         "sleep 2000\n"
         f"tap {GEAR_X} {GEAR_Y}\n"
-        "sleep 800\n"
+        # 1500 ms matches the sim wait. The master tile + drag handler
+        # wiring added on m7-config-panel-overhaul pushes overlay build
+        # past the previous 800 ms budget on the P4.
+        "sleep 1500\n"
         "dump_tiles\n"
         "sleep 200\n"
     ),

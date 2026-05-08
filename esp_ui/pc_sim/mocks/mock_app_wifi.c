@@ -74,7 +74,26 @@ bool app_wifi_wait_connected(void) { return true; }
 void app_wifi_apply_ip_config(void) {}
 bool app_wifi_reconfigure(void) { return true; }
 
-app_wifi_state_t app_wifi_get_state(void) { return APP_WIFI_STATE_CONNECTED; }
+// Test override -- when set non-zero, app_wifi_get_state returns it
+// instead of the always-CONNECTED default. Toggled via a script
+// command in pc_main so M7 + UI status-bar tests can exercise the
+// degraded-WiFi paths without standing up a real radio.
+static bool             s_state_overridden;
+static app_wifi_state_t s_state_value = APP_WIFI_STATE_CONNECTED;
+
+app_wifi_state_t app_wifi_get_state(void) {
+    return s_state_overridden ? s_state_value : APP_WIFI_STATE_CONNECTED;
+}
+
+void mock_app_wifi_set_state(app_wifi_state_t s) {
+    s_state_overridden = true;
+    s_state_value      = s;
+    // Fire observers so registered subscribers (status icon, M7's
+    // degraded-state cap path) run their state-transition logic.
+    for (size_t i = 0; i < s_obs_n; ++i) {
+        if (s_obs[i].cb) s_obs[i].cb(s_obs[i].ctx);
+    }
+}
 const char      *app_wifi_get_ssid(void)  { snapshot_host(); return s_ssid; }
 void              app_wifi_format_ip(char *buf, size_t buflen) {
     snapshot_host();

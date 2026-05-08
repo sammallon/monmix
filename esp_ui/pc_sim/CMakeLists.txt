@@ -115,6 +115,7 @@ set(REUSED_MAIN_SRC
     ${MAIN_DIR}/app_ui.c
     ${MAIN_DIR}/app_state.c
     ${MAIN_DIR}/app_prefs.c
+    ${MAIN_DIR}/app_power.c
     ${MAIN_DIR}/osc_expect.c
     ${MAIN_DIR}/images/splash_logo.c
     ${MAIN_DIR}/fonts/font_monmix_level.c
