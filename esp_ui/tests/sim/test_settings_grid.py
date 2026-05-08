@@ -34,7 +34,11 @@ TEST = {
         "sleep 2000\n"
         # Open the settings overlay.
         f"tap {GEAR_X} {GEAR_Y}\n"
-        "sleep 800\n"
+        # 1500 ms covers the hardware path: lazy build of the settings
+        # overlay (channel grid + swatches + textareas) plus first
+        # paint takes >800 ms on the P4. Sim builds in a few ms but
+        # pays nothing for the longer wait.
+        "sleep 1500\n"
         # Dump the tile coords; settings_tile lines hit stdout.
         "dump_tiles\n"
         "sleep 200\n"

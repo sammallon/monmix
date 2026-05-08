@@ -110,7 +110,23 @@ TEST = {
     # the same way pc_sim does. Mock-MS-only assertions (ms_real: ...) get
     # filtered out via hw_expect. The chpick log lines come from firmware
     # ESP_LOGI so they appear in the REPL stream identically.
+    #
+    # On hw the device's channel selection lives in NVS, not the mock
+    # default. Seed it to 8 ids first so the (current=N) counts in the
+    # subsequent two saves match the sim assertions. The seed save's
+    # own log line is allowed to have any prior count -- only the two
+    # post-seed saves are asserted.
     "hw_compatible": True,
+    "hw_script": (
+        "sleep 3000\n"
+        f"chpick_save {BACK_IDS}\n"
+        "sleep 1500\n"
+        f"chpick_save {NEW_IDS}\n"
+        "sleep 3000\n"
+        f"chpick_save {BACK_IDS}\n"
+        "sleep 3000\n"
+        "quit\n"
+    ),
     "hw_expect": {
         "stdout_contains": [
             "chpick: live-apply start (current=8)",
