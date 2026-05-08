@@ -1153,6 +1153,74 @@ static void ws_set_level_format(app_level_format_t f) {
     if (g.ws_open) subscribe_all();
 }
 
+// Pre-shutdown: walk every active subscription and queue an unsubscribe,
+// then drain the queue with a short pump so the POSTs actually go out
+// before we send the WS CLOSE frame. MS otherwise carries the
+// subscription state forward and accumulates them across reboot/flash
+// cycles. Safe when not connected (early return). Called from the
+// reboot path before esp_restart() and from pc_sim's exit handlers.
+static void ws_shutdown_graceful(void)
+{
+    if (!g.task) return;            // never started
+    if (!g.ws_open || !g.ws_conn) return;  // nothing to inform MS about
+
+    ESP_LOGI(TAG, "graceful shutdown: queuing unsubscribes");
+
+    // Channels (under the active mix).
+    size_t n = app_state_count();
+    for (size_t i = 0; i < n; ++i) {
+        int id = app_state_id_for_idx(i);
+        if (id >= 0) unsubscribe_channel(id, g.mix_idx);
+    }
+    // Master.
+    unsubscribe_master(master_channel_id());
+    // Routable cfg.name set (subscribe_all_routable_names is the parallel
+    // subscribe path; mirror it here so the pairing is 1:1 per OpenAPI).
+    if (g.routability_known) {
+        int max = g.total_channels;
+        if (max > MAX_STRIP_NAMES) max = MAX_STRIP_NAMES;
+        for (int id = 0; id < max; ++id) {
+            if (!g.routable[id]) continue;
+            char dotted[80];
+            snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", id);
+            send_unsubscribe(dotted, "val");
+        }
+    }
+    // Mix names.
+    for (int i = 0; i < g.mix_count && i < MAX_MIX_BUSES; ++i) {
+        char dotted[80];
+        snprintf(dotted, sizeof(dotted), "ch.%d.cfg.name", g.mix_offset + i);
+        send_unsubscribe(dotted, "val");
+    }
+    // Metering, if armed.
+    if (g.meter_subscribed) meter_send_unsubscribe();
+
+    // Wait for the worker to drain the queue. Bounded poll: 25 ms cadence
+    // matches MGR_POLL_MS so each iteration covers one drain pass. ~300 ms
+    // budget is generous for the typical ~30 unsubscribes (each ~250 B).
+    for (int i = 0; i < 12; ++i) {
+        bool empty;
+        xSemaphoreTake(g.outq_mtx, portMAX_DELAY);
+        empty = (g.outq_head == NULL);
+        xSemaphoreGive(g.outq_mtx);
+        if (empty) break;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    // Send WS CLOSE so MS gets a clean handshake instead of a TCP RST.
+    // Mongoose's ws_send with op CLOSE handles the framing; we just need
+    // to ensure it lands before stop() tears the mgr down.
+    if (g.ws_open && g.ws_conn) {
+        mg_ws_send(g.ws_conn, NULL, 0, WEBSOCKET_OP_CLOSE);
+        // Give the close frame a chance to flush + ACK. ws_evt's
+        // MG_EV_CLOSE clears g.ws_open when the server-side close lands.
+        for (int i = 0; i < 20; ++i) {
+            if (!g.ws_open) break;
+            vTaskDelay(pdMS_TO_TICKS(25));
+        }
+    }
+}
+
 static const ms_client_iface_t s_iface = {
     .start                       = ws_start,
     .set_level                   = ws_set_level,
@@ -1181,6 +1249,7 @@ static const ms_client_iface_t s_iface = {
     .set_meter_enabled           = ws_set_meter_enabled,
     .set_level_format            = ws_set_level_format,
     .is_console_attached         = ws_is_console_attached,
+    .shutdown_graceful           = ws_shutdown_graceful,
 };
 
 const ms_client_iface_t *app_ms_client_ws(void) { return &s_iface; }
