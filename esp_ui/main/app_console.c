@@ -891,6 +891,28 @@ static int cmd_ws_status(int argc, char **argv)
     return 0;
 }
 
+// Drive the MS-config Save path from the REPL. Used by the names-on-
+// reconfigure regression test (tests/sim/test_ms_host_change_names.py)
+// in its hw lane: the test toggles the MS host to a bogus value, waits
+// for the strip-name cache to clear, then toggles back to verify
+// re-priming works against the new host. Bypasses the overlay-tap dance
+// the user did manually when first reproducing the bug.
+static int cmd_mcfg_apply(int argc, char **argv)
+{
+    if (argc != 3) {
+        printf("usage: mcfg-apply <host> <port>\n");
+        return 1;
+    }
+    if (!lvgl_port_lock(1000)) {
+        printf("mcfg-apply: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_mcfg_apply(argv[1], argv[2]);
+    lvgl_port_unlock();
+    printf("mcfg-apply: host=%s port=%s\n", argv[1], argv[2]);
+    return 0;
+}
+
 // Live LCD backlight control. Used to A/B-test brownout-vs-storm theory:
 // drop the backlight from the default 80% to a low single-digit percentage,
 // run the stress reproducer, see if the storm still fires. If dimming
@@ -937,6 +959,7 @@ void app_console_init(void)
         { .command = "wifi-reassoc", .help = "force STA disconnect+reconnect via watchdog API", .func = cmd_wifi_reassoc },
         { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
         { .command = "set-bright",   .help = "<0..100> -- set LCD backlight % (default 80)",  .func = cmd_set_bright   },
+        { .command = "mcfg-apply",   .help = "<host> <port> -- drive MS-config Save (test hook)", .func = cmd_mcfg_apply   },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));

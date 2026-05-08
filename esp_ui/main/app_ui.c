@@ -1,6 +1,7 @@
 #include "app_ui.h"
 #include "app_display.h"
 #include "app_logd.h"
+#include "app_ms_setup.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_time.h"
@@ -4602,10 +4603,17 @@ static void on_mcfg_save(lv_event_t *e)
     lv_label_set_text(s_mcfg_status_label,
                       "#40C060 Saved. Reconnecting to MS...#");
 
+    // Drop the boot-setup gate so the next CONNECTED transition re-primes
+    // strip names + routability + mix routing against the new host. If MS
+    // was unreachable at boot the gate is already false and this is a
+    // no-op; if MS came good against the old host the gate latched true
+    // and would otherwise short-circuit the retry.
+    app_ms_setup_reset();
+
     // Live-apply for host/port/osc-port within the same protocol. The
-    // active client recomposes URLs from app_config_* on its next
-    // reconnect cycle -- the iface's reconnect() closes the current
-    // connection and the worker re-opens with whatever NVS now returns.
+    // iface's reconnect() recomposes URLs from app_config_* and drains
+    // the current connection so the worker reopens against the new
+    // target on its next poll cycle.
     if (s_ms && s_ms->reconnect) s_ms->reconnect();
 }
 
@@ -5077,6 +5085,27 @@ void app_ui_settings_dump_tiles(void)
                i, tx, ty, nx, sx);
     }
     fflush(stdout);
+}
+
+// Test hook -- see app_ui.h. Drives the same path on_mcfg_save takes when
+// the user taps Save in the MS-config overlay: seed the textareas (the
+// overlay is built lazily so call mcfg_open if needed), then hand off to
+// on_mcfg_save which validates, persists via app_config_*, drops the
+// s_ms_setup_done gate, and triggers ms->reconnect(). Used by the
+// names-on-reconfigure regression test to flip MS host without faking
+// overlay taps + keyboard typing.
+void app_ui_mcfg_apply(const char *host, const char *port_str)
+{
+    if (!host || !port_str) return;
+    if (!s_mcfg_overlay) build_mcfg_overlay();
+    // mcfg_open snapshots the current app_config_ms_* values into the
+    // textareas + s_mcfg_orig_*; that re-snapshot is needed so the dirty
+    // detector is consistent. Then we overwrite the textareas with the
+    // test's intended values before calling on_mcfg_save.
+    mcfg_open();
+    lv_textarea_set_text(s_mcfg_host_ta, host);
+    lv_textarea_set_text(s_mcfg_port_ta, port_str);
+    on_mcfg_save(NULL);
 }
 
 static void on_chpick_save_yes(lv_event_t *e)

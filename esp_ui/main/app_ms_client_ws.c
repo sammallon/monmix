@@ -990,7 +990,27 @@ static bool ws_is_mix_routed     (int idx)     { (void)idx; return true; }   // 
 static void ws_fetch_mix_routing (void)        {}                            // TODO: P11
 static bool ws_is_mix_list_ready (void)        { return g.mix_list_received; }
 static void ws_resubscribe       (void)        { if (g.ws_open) { g.subscribed = false; subscribe_all(); } }
+// Force the worker onto a new ws_url after a runtime host/port change:
+// recompose first so the next mg_ws_connect picks up the new target,
+// then drain the open connection (if any) so the worker drops to the
+// reconnect branch immediately. compose_urls runs from the LVGL task
+// here while the worker reads g.ws_url inside mg_ws_connect; this is
+// safe because the worker only reaches that read AFTER MG_EV_CLOSE
+// fires for the just-drained connection, which happens after we
+// return. When the host actually changed, drop the per-host caches so
+// the boot-setup retry primes fresh values; on a same-host reconnect
+// (network blip) keep them so the UI doesn't flash placeholders.
 static void ws_reconnect         (void)        {
+    char prev_url[sizeof(g.ws_url)];
+    memcpy(prev_url, g.ws_url, sizeof(prev_url));
+    compose_urls();
+    if (strcmp(prev_url, g.ws_url) != 0) {
+        g.routability_known = false;
+        g.total_channels    = 0;
+        memset(g.strip_names, 0, sizeof(g.strip_names));
+        memset(g.routable,    0, sizeof(g.routable));
+        g.console_attached  = false;
+    }
     if (g.ws_conn) g.ws_conn->is_draining = 1;
 }
 

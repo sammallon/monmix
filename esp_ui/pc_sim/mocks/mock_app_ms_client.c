@@ -113,3 +113,9 @@ const ms_client_iface_t *app_ms_client_ws(void)  { return &s_iface; }
 // app_ms_client_osc symbol if the user toggled the protocol pref. Tablet
 // firmware overrides this with the real OSC implementation.
 const ms_client_iface_t *app_ms_client_osc(void) { return &s_iface; }
+
+// On the tablet this clears esp_ui_main.c's s_ms_setup_done so the
+// boot-time MS-info prime re-runs after a host change. The sim doesn't
+// model that gate (the mock client always reports CONNECTED + skips
+// fetch_all_strip_names anyway), so this is a no-op stub for link parity.
+void app_ms_setup_reset(void) {}
