@@ -4469,6 +4469,8 @@ static lv_obj_t *s_chpick_save_confirm;
 static void chpick_apply_async(void *unused)
 {
     (void) unused;
+    size_t before = app_state_count();
+    ESP_LOGI(TAG, "chpick: live-apply start (current=%u)", (unsigned) before);
 
     // Stop the worker so subscribe state for the old id set is dropped
     // cleanly. ws_stop / osc_stop now join the worker before returning;
@@ -4494,8 +4496,21 @@ static void chpick_apply_async(void *unused)
     // added ids without an extra fetch.
     if (s_ms && s_ms->start) s_ms->start();
 
+    ESP_LOGI(TAG, "chpick: live-apply done (now=%u)", (unsigned) app_state_count());
     hide_applying_overlay();
     chpick_close();
+}
+
+// Test hook -- see app_ui.h. Persists the selection then runs the same
+// stop+rebuild+restart sequence as the picker's Save path. Skips the
+// overlay/close UI since the test driver isn't going through the picker.
+void app_ui_chpick_apply(const int *ids, size_t count)
+{
+    if (!app_config_set_channel_ids(ids, count)) {
+        ESP_LOGE(TAG, "chpick_apply: NVS write failed");
+        return;
+    }
+    chpick_apply_async(NULL);
 }
 
 static void on_chpick_save_yes(lv_event_t *e)

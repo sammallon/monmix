@@ -231,6 +231,32 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_prefs_set_level_format(f);
             if (g_ms && g_ms->set_level_format) g_ms->set_level_format(f);
             printf("OK set_format %s\n", text);
+        } else if (strncmp(cmd, "chpick_save", 11) == 0) {
+            // Comma-separated id list, e.g. "chpick_save 0,2,5". Empty list
+            // means "track no channels"; bare "chpick_save" is the same.
+            // Drives app_ui_chpick_apply directly so the test exercises the
+            // stop+rebuild+restart path without driving the picker UI.
+            int ids[64];
+            int n = 0;
+            const char *p = cmd + 11;
+            while (*p == ' ' || *p == '\t') ++p;
+            while (*p && n < (int)(sizeof(ids)/sizeof(ids[0]))) {
+                int v;
+                int consumed = 0;
+                if (sscanf(p, "%d%n", &v, &consumed) == 1 && consumed > 0) {
+                    ids[n++] = v;
+                    p += consumed;
+                    if (*p == ',') ++p;
+                } else {
+                    break;
+                }
+            }
+            // Hold lvgl_port_lock the same way an LVGL-task event would --
+            // app_ui_chpick_apply documents that requirement.
+            lvgl_port_lock(0);
+            app_ui_chpick_apply(ids, (size_t) n);
+            lvgl_port_unlock();
+            printf("OK chpick_save n=%d\n", n);
         } else if (sscanf(cmd, "set_mix %d", &x) == 1) {
             // Drive the mix-change path the same way the picker does:
             // ms->set_mix() updates the active subscription, AND
