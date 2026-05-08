@@ -160,6 +160,17 @@ static lv_obj_t *s_settings_overlay;
 static lv_obj_t *s_gear_label;  // gear icon — text color flipped on theme change
 EXT_RAM_BSS_ATTR static lv_obj_t *s_color_swatches[APP_CONFIG_MAX_CHANNELS];
 EXT_RAM_BSS_ATTR static lv_obj_t *s_row_name_labels[APP_CONFIG_MAX_CHANNELS];
+// Per-tile box (parent of name + swatch) so drag-to-reorder can hit-test
+// pointer coords against tile bounds in screen space.
+EXT_RAM_BSS_ATTR static lv_obj_t *s_row_tile_objs[APP_CONFIG_MAX_CHANNELS];
+// Master strip's surfaces in the channel grid -- same shape as a channel
+// tile (name label + swatch) but pinned to the bottom-right slot regardless
+// of how many channels are tracked. Tap-to-rename + tap-swatch re-target
+// the existing rename / color-picker popups via the UI_TARGET_MASTER
+// sentinel below.
+static lv_obj_t *s_master_tile_obj;
+static lv_obj_t *s_master_tile_name;
+static lv_obj_t *s_master_tile_swatch;
 static lv_obj_t *s_lvl_norm_btn;
 static lv_obj_t *s_lvl_db_btn;
 static lv_obj_t *s_sig_buttons[3];   // none / signal-present / meter
@@ -254,6 +265,7 @@ static lv_obj_t *s_wcfg_gw_ta;
 static lv_obj_t *s_wcfg_dns_ta;
 static lv_obj_t *s_wcfg_ntp_ta;
 static lv_obj_t *s_wcfg_ntp_dhcp_cb;     // checkbox: honor DHCP-supplied NTP
+static lv_obj_t *s_wcfg_dns_dhcp_cb;     // checkbox: honor DHCP-supplied DNS
 static lv_obj_t *s_wcfg_current_ip_value; // read-only "what IP did we land?"
 static bool     s_wcfg_use_static;       // working state of the radio
 static bool     s_wcfg_orig_use_static;
@@ -263,6 +275,7 @@ static char     s_wcfg_orig_gw [APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_dns[APP_PREFS_IP_STR_MAX];
 static char     s_wcfg_orig_ntp[APP_PREFS_STR_MAX];
 static bool     s_wcfg_orig_ntp_use_dhcp;
+static bool     s_wcfg_orig_dns_use_dhcp;
 
 // MS connection settings panel (entry: MS icon). Save = ws_reconnect()
 // (live), no reboot -- just kicks the WS client to use the new host:port.
@@ -270,6 +283,7 @@ static lv_obj_t *s_mcfg_overlay;
 static lv_obj_t *s_mcfg_host_ta;
 static lv_obj_t *s_mcfg_port_ta;
 static lv_obj_t *s_mcfg_osc_port_ta;
+static lv_obj_t *s_mcfg_osc_port_lbl;   // hidden in WS mode (OSC port unused there)
 static lv_obj_t *s_mcfg_proto_ws_btn;
 static lv_obj_t *s_mcfg_proto_osc_btn;
 static int       s_mcfg_proto_staged;  // staged selection until Save
@@ -289,6 +303,15 @@ static lv_obj_t *s_ssid_list_spinner;        // shown while scan in progress
 static lv_obj_t *s_ssid_list_scanning_label; // "Scanning..."
 static bool      s_ssid_list_scanning;       // popup is in scanning state
 static bool      s_ssid_list_retried_empty;  // already retried once on empty
+
+// Forget-saved-network flow. Long-press on a saved row pops a confirmation
+// modal; tapping Yes drops the entry from the saved-networks ring.
+// s_ssid_long_press_consumed swallows the trailing CLICKED event LVGL fires
+// when a long-press finally releases (otherwise we'd both forget and pick).
+static lv_obj_t *s_ssid_forget_confirm;
+static lv_obj_t *s_ssid_forget_msg_label;
+static char      s_ssid_forget_target[APP_CONFIG_SSID_MAX];
+static bool      s_ssid_long_press_consumed;
 
 // Channel picker overlay (entry: Settings -> Edit Channels...).
 // Shows every channel on the connected console as a row with a checkbox;
@@ -321,6 +344,13 @@ EXT_RAM_BSS_ATTR static bool      s_chpick_orig[APP_UI_MAX_PICKER_ROWS];
 static lv_obj_t *s_spinner;
 static lv_obj_t *s_spinner_label;
 
+// Console-offline page — replaces the fader UI when MS is reachable but
+// /app/state reports the physical mixer isn't attached (mixer powered off
+// at the venue). Distinct from the spinner state above: spinner = "waiting
+// on MS"; offline page = "MS up, but mixer is off". Static graphic + text
+// so the user understands at a glance, not only via the small status icon.
+static lv_obj_t *s_offline_panel;
+
 // Mute Enabled — safety toggle that gates mute-button taps. Resets to
 // FALSE on every boot so a power-cycle never leaves the device able to
 // silence channels by accident. Mute button visuals continue to track
@@ -339,20 +369,35 @@ static void toast_show(const char *text);
 static void apply_controls_enabled(void);
 static void on_mute_en_clicked(lv_event_t *e);
 
-// Drag-to-reorder. Long-press on a strip's name label enters reorder mode;
-// on each pressing event we compare finger X against neighbour-box centres
-// and swap entries when a centre is crossed. Persist + rebuild on release.
-// State below is touched only from LVGL event callbacks, all under the
-// LVGL task -- no extra locking needed.
+// Drag-to-reorder. Long-press on a config-panel tile's name label enters
+// reorder mode; on each pressing event the pointer's screen position is
+// hit-tested against every other channel tile and a hit triggers a swap.
+// Persist + rebuild the live UI on release. The master tile is excluded
+// as both a source and a target.
+//
+// Moved from the live fader UI to the config panel: doing reorder on the
+// live UI conflicted with name-tap-to-rename and made fader drag feel
+// twitchy in stage-light conditions. The settings overlay is the
+// deliberate "configuration mode" surface.
+//
+// State below is touched only from LVGL event callbacks (all under the
+// LVGL task) -- no extra locking needed.
 static bool   s_reorder_active;
-static size_t s_reorder_idx;             // logical slot currently being dragged
-static size_t s_reorder_page;            // confine swap to one page (visual)
+static size_t s_reorder_idx;             // app_state idx currently being dragged
 static int    s_reorder_ids[APP_CONFIG_MAX_CHANNELS];
 static size_t s_reorder_count;
-static void on_strip_long_pressed(lv_event_t *e);
-static void on_strip_pressing(lv_event_t *e);
-static void on_strip_released(lv_event_t *e);
+static void on_tile_long_pressed(lv_event_t *e);
+static void on_tile_pressing(lv_event_t *e);
+static void on_tile_released(lv_event_t *e);
 static void reorder_exit(bool persist_and_rebuild);
+
+// Picker / rename targets — the channel idx for an input strip, or
+// UI_TARGET_MASTER when the master tile was tapped. The master path
+// captures the master's MS channel id at click time so a mix-bus switch
+// mid-edit doesn't retarget the resulting write to a different bus.
+#define UI_TARGET_MASTER ((size_t) -1)
+static int s_picker_master_id;
+static int s_rename_master_id;
 
 // Status-bar icons for WiFi / MS connection state. Tap opens the read-only
 // info panel; the icon color reflects the live state.
@@ -720,6 +765,18 @@ static void apply_pending(void *unused)
             lv_slider_set_value(s_master_widgets.slider, v, LV_ANIM_OFF);
             lv_label_set_text(s_master_widgets.label_val, buf);
             lv_label_set_text(s_master_widgets.label_name, m.name);
+            // Master colour follows the per-id channel-color pref (so
+            // each mix bus carries its own colour). Falls back to the
+            // master accent yellow when no preference is set.
+            int color_idx = (m.id >= 0)
+                                ? app_prefs_get_channel_color(m.id) : -1;
+            uint32_t hex = (color_idx >= 0 && color_idx < 8)
+                               ? COLOR_PALETTE[color_idx]
+                               : 0xE0C040;
+            lv_color_t bar_color  = lv_color_hex(hex);
+            lv_color_t knob_color = lv_color_darken(bar_color, 60);
+            lv_obj_set_style_bg_color(s_master_widgets.slider, bar_color,  LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(s_master_widgets.slider, knob_color, LV_PART_KNOB);
             if (s_master_widgets.btn_mute) {
                 if (m.mute) lv_obj_add_state   (s_master_widgets.btn_mute, LV_STATE_CHECKED);
                 else        lv_obj_remove_state(s_master_widgets.btn_mute, LV_STATE_CHECKED);
@@ -730,6 +787,30 @@ static void apply_pending(void *unused)
                 } else {
                     lv_obj_add_flag(s_master_widgets.meter_bar, LV_OBJ_FLAG_HIDDEN);
                 }
+            }
+            // Mirror name + swatch on the master tile in the settings
+            // overlay so a rename / colour change reflects without
+            // closing-and-reopening the overlay.
+            bool settings_visible = s_settings_overlay &&
+                !lv_obj_has_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+            if (settings_visible && s_master_tile_name) {
+                lv_label_set_text(s_master_tile_name, m.name[0] ? m.name : "Master");
+            }
+            if (settings_visible && s_master_tile_swatch) {
+                if (color_idx < 0) {
+                    lv_obj_set_style_bg_color(s_master_tile_swatch,
+                                              lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
+                } else {
+                    lv_obj_set_style_bg_color(s_master_tile_swatch,
+                                              lv_color_hex(COLOR_PALETTE[color_idx]), 0);
+                }
+            }
+            // Picker title may show "Color: <master name>" -- keep it
+            // current if the popup is open.
+            bool picker_visible = s_picker_popup &&
+                !lv_obj_has_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
+            if (picker_visible && s_picker_target_idx == UI_TARGET_MASTER) {
+                picker_refresh_title();
             }
         }
     }
@@ -1040,128 +1121,121 @@ static void on_tile_changed(lv_event_t *e)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Drag-to-reorder. Long-press on a strip's name label promotes the strip
-// into "reorder mode": outline-highlighted, sliders + mute disabled, tile
-// swipe suppressed. Pressing events compare finger X against the centres
-// of neighbour boxes ON THE SAME PAGE; crossing a centre swaps both the
-// working ids array and the live app_state slot. Release persists +
-// rebuilds.
+// Drag-to-reorder on the settings-overlay channel grid. Long-press on a
+// channel tile enters reorder mode (outline-highlighted, settings-overlay
+// scroll suppressed). Pressing events hit-test the pointer's screen
+// coordinates against every other channel tile's bounds; a hit swaps
+// app_state slots in place plus the working ids buffer. Release persists
+// the new id list and triggers a deferred rebuild of the live fader UI.
+// The master tile is locked at the bottom-right slot and excluded from
+// hit-testing as both source and target.
 // ─────────────────────────────────────────────────────────────────────────
 
 static void reorder_set_highlight(size_t idx, bool on)
 {
     if (idx >= APP_CONFIG_MAX_CHANNELS) return;
-    lv_obj_t *box = s_widgets[idx].box;
-    if (!box) return;
+    lv_obj_t *tile = s_row_tile_objs[idx];
+    if (!tile) return;
     if (on) {
-        // Bright outline -- reads on both dark and light themes. Width of 4
-        // is enough to be unambiguous without crowding the slider.
-        lv_obj_set_style_outline_width(box, 4, 0);
-        lv_obj_set_style_outline_color(box, lv_color_hex(0xE0C040), 0);
-        lv_obj_set_style_outline_pad(box, 2, 0);
-        lv_obj_set_style_outline_opa(box, LV_OPA_COVER, 0);
+        lv_obj_set_style_outline_width(tile, 4, 0);
+        lv_obj_set_style_outline_color(tile, lv_color_hex(0xE0C040), 0);
+        lv_obj_set_style_outline_pad(tile, 2, 0);
+        lv_obj_set_style_outline_opa(tile, LV_OPA_COVER, 0);
     } else {
-        lv_obj_set_style_outline_width(box, 0, 0);
-        lv_obj_set_style_outline_opa(box, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_outline_width(tile, 0, 0);
+        lv_obj_set_style_outline_opa(tile, LV_OPA_TRANSP, 0);
     }
 }
 
-static void on_strip_long_pressed(lv_event_t *e)
+// Refresh the name + swatch on a single tile from current app_state +
+// app_prefs. Called after a swap so the tiles visually reflect the new
+// channel-to-slot mapping without a full overlay rebuild.
+static void tile_repaint(size_t idx)
+{
+    if (idx >= APP_CONFIG_MAX_CHANNELS) return;
+    app_channel_t ch;
+    if (!app_state_get(idx, &ch)) return;
+    if (s_row_name_labels[idx]) {
+        lv_label_set_text(s_row_name_labels[idx], ch.name);
+    }
+    if (s_color_swatches[idx]) {
+        int color = app_prefs_get_channel_color(ch.id);
+        if (color < 0) {
+            lv_obj_set_style_bg_color(s_color_swatches[idx],
+                                      lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
+        } else {
+            lv_obj_set_style_bg_color(s_color_swatches[idx],
+                                      lv_color_hex(COLOR_PALETTE[color]), 0);
+        }
+    }
+}
+
+static void on_tile_long_pressed(lv_event_t *e)
 {
     if (s_reorder_active) return;
     size_t idx = (size_t)(uintptr_t)lv_event_get_user_data(e);
     size_t total = app_state_count();
     if (idx >= total) return;
 
-    // Snapshot current ids into a working buffer; mutated in-place on each
-    // swap. Persisted on release.
     s_reorder_count = total;
     for (size_t i = 0; i < total; ++i) {
         s_reorder_ids[i] = app_state_id_for_idx(i);
     }
     s_reorder_idx    = idx;
-    s_reorder_page   = idx / FADERS_PER_PAGE;
     s_reorder_active = true;
-
     reorder_set_highlight(idx, true);
 
-    // Suppress slider drag and tile swipe so neither competes with the
-    // reorder gesture. Restored on release.
-    for (size_t i = 0; i < total; ++i) {
-        if (s_widgets[i].slider) {
-            lv_obj_remove_flag(s_widgets[i].slider, LV_OBJ_FLAG_CLICKABLE);
-        }
-    }
-    if (s_tileview) {
-        lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_SCROLLABLE);
+    // Suppress overlay scroll so the long-drag doesn't fight the list's
+    // own touch handling.
+    if (s_settings_overlay) {
+        lv_obj_remove_flag(s_settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
     }
 }
 
-static void on_strip_pressing(lv_event_t *e)
+static void on_tile_pressing(lv_event_t *e)
 {
+    (void) e;
     if (!s_reorder_active) return;
-    lv_indev_t *indev = lv_event_get_indev(e);
+    lv_indev_t *indev = lv_indev_active();
     if (!indev) return;
     lv_point_t p;
     lv_indev_get_point(indev, &p);
 
-    // The pointer's x is in screen coordinates. The strip boxes are
-    // children of tile children of the tileview, so their lv_obj_get_x is
-    // tile-relative. Compute screen-x of each candidate neighbour box on
-    // the same page and compare.
+    // Hit-test the pointer against every other channel tile. A hit swaps
+    // that tile with the dragged one. We only consider the FIRST hit so a
+    // diagonal cross doesn't ping-pong on the boundary.
     size_t cur = s_reorder_idx;
-    size_t page_first = s_reorder_page * FADERS_PER_PAGE;
-    size_t page_last  = page_first + FADERS_PER_PAGE - 1;
-    if (page_last >= s_reorder_count) page_last = s_reorder_count - 1;
+    for (size_t i = 0; i < s_reorder_count; ++i) {
+        if (i == cur) continue;
+        lv_obj_t *tile = s_row_tile_objs[i];
+        if (!tile) continue;
+        lv_area_t area;
+        lv_obj_get_coords(tile, &area);
+        if (p.x < area.x1 || p.x > area.x2) continue;
+        if (p.y < area.y1 || p.y > area.y2) continue;
 
-    // Try left neighbour: swap if finger crossed its centre going left.
-    if (cur > page_first) {
-        lv_obj_t *nb = s_widgets[cur - 1].box;
-        if (nb) {
-            int32_t nb_x = lv_obj_get_x(nb);
-            int32_t nb_w = lv_obj_get_width(nb);
-            int32_t nb_cx = nb_x + nb_w / 2;
-            if (p.x < nb_cx) {
-                size_t a = cur, b = cur - 1;
-                int tmp = s_reorder_ids[a];
-                s_reorder_ids[a] = s_reorder_ids[b];
-                s_reorder_ids[b] = tmp;
-                app_state_swap_slots(a, b);
-                reorder_set_highlight(a, false);
-                reorder_set_highlight(b, true);
-                s_reorder_idx = b;
-                on_state_change(a, NULL);
-                on_state_change(b, NULL);
-                return;
-            }
-        }
-    }
-    // Right neighbour.
-    if (cur < page_last) {
-        lv_obj_t *nb = s_widgets[cur + 1].box;
-        if (nb) {
-            int32_t nb_x = lv_obj_get_x(nb);
-            int32_t nb_w = lv_obj_get_width(nb);
-            int32_t nb_cx = nb_x + nb_w / 2;
-            if (p.x > nb_cx) {
-                size_t a = cur, b = cur + 1;
-                int tmp = s_reorder_ids[a];
-                s_reorder_ids[a] = s_reorder_ids[b];
-                s_reorder_ids[b] = tmp;
-                app_state_swap_slots(a, b);
-                reorder_set_highlight(a, false);
-                reorder_set_highlight(b, true);
-                s_reorder_idx = b;
-                on_state_change(a, NULL);
-                on_state_change(b, NULL);
-                return;
-            }
-        }
+        int tmp = s_reorder_ids[cur];
+        s_reorder_ids[cur] = s_reorder_ids[i];
+        s_reorder_ids[i]   = tmp;
+        app_state_swap_slots(cur, i);
+        // Repaint both tiles so name + swatch reflect the swap.
+        tile_repaint(cur);
+        tile_repaint(i);
+        reorder_set_highlight(cur, false);
+        reorder_set_highlight(i, true);
+        s_reorder_idx = i;
+        // Mark the live fader strips dirty so apply_pending refreshes the
+        // labels for the swapped slots in the next sweep.
+        on_state_change(cur, NULL);
+        on_state_change(i, NULL);
+        return;
     }
 }
 
-// Deferred rebuild: present_channels destroys the very label object we
-// were dispatching the event into. Punt it to the next LVGL idle.
+// Deferred rebuild of the live fader UI after a reorder commits. The live
+// tileview must be torn down and rebuilt because the slider widgets bind
+// to slot indices via user_data captured at create time. Settings overlay
+// stays put -- tile_repaint already kept it in sync during the drag.
 static void reorder_persist_and_rebuild(void *unused)
 {
     (void) unused;
@@ -1174,25 +1248,18 @@ static void reorder_exit(bool persist_and_rebuild)
     if (!s_reorder_active) return;
     s_reorder_active = false;
 
-    // Drop the highlight on whichever slot we ended on.
     reorder_set_highlight(s_reorder_idx, false);
 
-    // Restore tile swipe; slider clickability is restored by the rebuild via
-    // apply_controls_enabled, or here directly when we don't rebuild.
-    if (s_tileview) {
-        lv_obj_add_flag(s_tileview, LV_OBJ_FLAG_SCROLLABLE);
+    if (s_settings_overlay) {
+        lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_SCROLLABLE);
     }
 
     if (persist_and_rebuild) {
-        // Defer destroy-and-rebuild until after this event finishes
-        // dispatching -- the name label is the event target.
         lv_async_call(reorder_persist_and_rebuild, NULL);
-    } else {
-        apply_controls_enabled();
     }
 }
 
-static void on_strip_released(lv_event_t *e)
+static void on_tile_released(lv_event_t *e)
 {
     (void) e;
     reorder_exit(true);
@@ -1229,20 +1296,9 @@ static void build_fader(lv_obj_t *parent, size_t idx, int slot_x_in_tile)
     lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 0);
     s_widgets[idx].label_name = name;
 
-    // Drag-to-reorder is bound to the name label only -- the slider has its
-    // own drag (level), the mute button its own click. PRESS_LOCK keeps the
-    // press on this label even when the finger slides off, so PRESSING/
-    // RELEASED keep firing through the swap.
-    lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(name, LV_OBJ_FLAG_PRESS_LOCK);
-    lv_obj_add_event_cb(name, on_strip_long_pressed, LV_EVENT_LONG_PRESSED,
-                        (void *)(uintptr_t) idx);
-    lv_obj_add_event_cb(name, on_strip_pressing, LV_EVENT_PRESSING,
-                        (void *)(uintptr_t) idx);
-    lv_obj_add_event_cb(name, on_strip_released, LV_EVENT_RELEASED,
-                        (void *)(uintptr_t) idx);
-    lv_obj_add_event_cb(name, on_strip_released, LV_EVENT_PRESS_LOST,
-                        (void *)(uintptr_t) idx);
+    // Reorder gesture lives on the settings overlay's channel grid now,
+    // not on the live fader. The live name label is non-interactive --
+    // rename happens from the settings tile, not from the strip itself.
 
     // Signal-present indicator — small round dot sitting just above the
     // slider top so multi-line scribble names (up to 3 lines) don't
@@ -1506,11 +1562,15 @@ static void build_master_strip(lv_obj_t *parent)
     }
     lv_obj_set_size(slider, SLIDER_W, SLIDER_H);
     lv_obj_align(slider, LV_ALIGN_TOP_MID, 0, SLIDER_TOP_Y);
-    // Master always reads as the unity-gain accent color — no per-channel
-    // color tag for the master since there's only one of it visible at a
-    // time. Yellow matches the box outline so the master strip reads as a
-    // single visual group.
-    lv_color_t bar  = lv_color_hex(0xE0C040);
+    // Master colour mirrors the per-id channel-color pref (so each mix
+    // bus can carry its own colour). Default falls back to the
+    // unity-gain accent yellow when no preference is set, matching the
+    // master strip's box outline so it reads as a visual group.
+    int init_color_idx = (m.id >= 0) ? app_prefs_get_channel_color(m.id) : -1;
+    uint32_t init_hex  = (init_color_idx >= 0 && init_color_idx < 8)
+                             ? COLOR_PALETTE[init_color_idx]
+                             : 0xE0C040;
+    lv_color_t bar  = lv_color_hex(init_hex);
     lv_color_t knob = lv_color_darken(bar, 60);
     lv_obj_set_style_bg_color(slider, bar,  LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(slider, knob, LV_PART_KNOB);
@@ -1732,6 +1792,44 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_label_set_text(s_spinner_label, "Connecting to console...");
     lv_obj_align_to(s_spinner_label, s_spinner, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
 
+    // Console-offline panel — shown when MS is up but the physical mixer
+    // is powered off. Hidden by default; ms_apply_async toggles it. Layout:
+    //   [ big LV_SYMBOL_AUDIO ]  (mixer glyph at 48 pt)
+    //          \  /
+    //   [ big LV_SYMBOL_POWER ]  (power glyph at 48 pt, red)
+    //   "Console is turned off"  (default font)
+    //   "Power on the mixer to continue."
+    // Two stacked symbols communicate "mixer + power-off" without animation.
+    s_offline_panel = lv_obj_create(scr);
+    lv_obj_set_size(s_offline_panel, 480, 320);
+    lv_obj_align(s_offline_panel, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_set_style_bg_opa(s_offline_panel, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_offline_panel, 0, 0);
+    lv_obj_set_style_pad_all(s_offline_panel, 0, 0);
+    lv_obj_clear_flag(s_offline_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_offline_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *off_mixer = lv_label_create(s_offline_panel);
+    lv_label_set_text(off_mixer, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_font(off_mixer, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(off_mixer, lv_color_hex(0xA0A0A0), 0);
+    lv_obj_align(off_mixer, LV_ALIGN_TOP_MID, 0, 30);
+
+    lv_obj_t *off_power = lv_label_create(s_offline_panel);
+    lv_label_set_text(off_power, LV_SYMBOL_POWER);
+    lv_obj_set_style_text_font(off_power, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(off_power, lv_color_hex(0xC04040), 0);
+    lv_obj_align(off_power, LV_ALIGN_TOP_MID, 0, 110);
+
+    lv_obj_t *off_title = lv_label_create(s_offline_panel);
+    lv_label_set_text(off_title, "Console is turned off");
+    lv_obj_align(off_title, LV_ALIGN_TOP_MID, 0, 200);
+
+    lv_obj_t *off_sub = lv_label_create(s_offline_panel);
+    lv_label_set_text(off_sub, "Power on the mixer to continue.");
+    lv_obj_set_style_text_color(off_sub, lv_color_hex(0xA0A0A0), 0);
+    lv_obj_align(off_sub, LV_ALIGN_TOP_MID, 0, 230);
+
     app_state_register_on_change(on_state_change, NULL);
     app_state_register_on_meter(on_meter_change, NULL);
     app_state_master_register_on_change(on_master_state_change, NULL);
@@ -1843,16 +1941,19 @@ void app_ui_present_channels(void)
 
     apply_controls_enabled();
 
-    // Sync the spinner ↔ tileview visibility with the current MS state.
-    // Without this, the freshly-built tileview would stay hidden until the
-    // next state-change event, leaving the spinner overlaid on the strips.
+    // Sync visibility with the current MS+console state. Without this, the
+    // freshly-built tileview would stay hidden until the next state-change
+    // event, leaving the spinner overlaid on the strips.
     bool ms_connected = (s_ms && s_ms->get_state &&
                          s_ms->get_state() == APP_MS_STATE_CONNECTED);
-    if (ms_connected) {
+    bool console_ok = ms_connected && s_ms->is_console_attached &&
+                      s_ms->is_console_attached();
+    if (console_ok) {
         if (s_tileview)            lv_obj_remove_flag(s_tileview,      LV_OBJ_FLAG_HIDDEN);
         if (s_master_widgets.box)  lv_obj_remove_flag(s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
         if (s_spinner)             lv_obj_add_flag   (s_spinner,       LV_OBJ_FLAG_HIDDEN);
         if (s_spinner_label)       lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+        if (s_offline_panel)       lv_obj_add_flag   (s_offline_panel, LV_OBJ_FLAG_HIDDEN);
     }
 
     // The fader UI is now mounted; dismiss the boot splash. We leave the
@@ -2092,32 +2193,49 @@ static void on_tz_dropdown_changed(lv_event_t *e)
     app_time_apply_tz();
 }
 
-// Tap a swatch → open the color-picker popup for that channel. The popup
-// applies the choice via app_prefs (which fires the dirty sweep, recolouring
-// the slider in real time) and refreshes the swatch visual on close.
+// Tap a swatch → open the color-picker popup for that channel (or the
+// master strip when idx == UI_TARGET_MASTER). The popup applies the
+// choice via app_prefs (which fires the dirty sweep, recolouring the
+// slider in real time) and refreshes the swatch visual on close.
 static void on_swatch_clicked(lv_event_t *e)
 {
     size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
     picker_open(idx);
 }
 
-// One handler for all picker buttons. user_data carries the selected palette
-// index, with -1 meaning "no color".
+// One handler for all picker buttons. user_data carries the selected
+// palette index, with -1 meaning "no color".
 static void on_picker_choice(lv_event_t *e)
 {
-    int color = (int)(intptr_t) lv_event_get_user_data(e);
-    int ch_id = app_state_id_for_idx(s_picker_target_idx);
+    int color  = (int)(intptr_t) lv_event_get_user_data(e);
+    int ch_id;
+    lv_obj_t *swatch;
+    if (s_picker_target_idx == UI_TARGET_MASTER) {
+        // Master colour persists keyed by the master's MS channel id
+        // captured at picker_open. The id is per-mix-bus so switching
+        // mix in MS picks up its own colour automatically.
+        ch_id  = s_picker_master_id;
+        swatch = s_master_tile_swatch;
+    } else {
+        ch_id  = app_state_id_for_idx(s_picker_target_idx);
+        swatch = s_color_swatches[s_picker_target_idx];
+    }
     if (ch_id >= 0) app_prefs_set_channel_color(ch_id, color);
 
-    // Update the source swatch immediately — apply_pending only repaints the
-    // fader sliders, not anything inside the settings overlay.
-    lv_obj_t *swatch = s_color_swatches[s_picker_target_idx];
+    // Update the source swatch immediately — apply_pending only repaints
+    // the fader sliders, not anything inside the settings overlay.
     if (swatch) {
         if (color < 0) {
             lv_obj_set_style_bg_color(swatch, lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
         } else {
             lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_PALETTE[color]), 0);
         }
+    }
+    // Master slider repaints from the dirty-sweep path since
+    // apply_pending reads the per-id colour pref. Mark dirty + let the
+    // existing observer queue the sweep.
+    if (s_picker_target_idx == UI_TARGET_MASTER) {
+        on_master_state_change(NULL);
     }
     picker_close();
 }
@@ -2291,24 +2409,23 @@ static void build_settings_overlay(void)
     lv_obj_add_event_cb(s_tz_dropdown, on_tz_dropdown_changed,
                         LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Section: Channels — 3 columns × N rows in a scrollable container so
-    // the same layout works at 12 channels (default) and at the Si Expression
-    // 2's full 60-channel count. Row is just [name] + [swatch] for now;
-    // selection checkbox will be added with the channel-selection feature.
+    // Section: Channels — 4 columns x 6 rows. The bottom-right slot is
+    // permanently the master strip's tile (always reachable regardless
+    // of how many input channels are tracked). The remaining 23 slots
+    // fill row-major from top-left with channel tiles. Tile geometry is
+    // a bit taller than before so name + swatch breathe in the larger
+    // cell; LV_LABEL_LONG_DOT truncates with "..." when the name doesn't
+    // fit.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 272);
 
     // Edit-channels entry — opens the picker overlay (#33). Button sits to
-    // the right of the section label so it doesn't push the existing list
-    // layout. The picker is the runtime way to change which channels are
-    // tracked; was previously only doable via channels-reset + reflash.
-    // Hidden if we don't know the connected console's channel count yet
-    // (info fetch hasn't completed or failed) -- the picker would be
-    // empty and tapping it would be confusing.
+    // the right of the section label. Hidden until we know the connected
+    // console's channel count.
     s_edit_channels_btn = lv_button_create(ov);
     lv_obj_set_size(s_edit_channels_btn, 180, 36);
-    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 264);
+    lv_obj_align(s_edit_channels_btn, LV_ALIGN_TOP_RIGHT, 0, 252);
     lv_obj_t *edit_lbl = lv_label_create(s_edit_channels_btn);
     lv_label_set_text(edit_lbl, LV_SYMBOL_LIST " Edit Channels...");
     lv_obj_center(edit_lbl);
@@ -2319,51 +2436,73 @@ static void build_settings_overlay(void)
     }
 
     lv_obj_t *list = lv_obj_create(ov);
-    lv_obj_set_size(list, SCREEN_W - 32, SCREEN_H - 316);
+    const int list_w = SCREEN_W - 32;
+    const int list_h = SCREEN_H - 316;
+    lv_obj_set_size(list, list_w, list_h);
     lv_obj_set_pos(list, 0, 296);
     lv_obj_set_style_pad_all(list, 6, 0);
-    lv_obj_set_style_pad_row(list, 4, 0);
+    lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
 
-    const int cols      = 3;
-    const int row_h     = 32;
-    const int row_gap   = 4;
-    const int col_gap   = 8;
-    const int row_w     = (SCREEN_W - 32 - 2 * 6 - (cols - 1) * col_gap) / cols;
-    const int swatch_sz = 22;
+    const int grid_cols  = 4;
+    const int grid_rows  = 6;
+    const int col_gap    = 8;
+    const int row_gap    = 4;
+    const int swatch_sz  = 28;
+    const int inner_w    = list_w - 2 * 6;
+    const int inner_h    = list_h - 2 * 6;
+    const int tile_w     = (inner_w - (grid_cols - 1) * col_gap) / grid_cols;
+    const int tile_h     = (inner_h - (grid_rows - 1) * row_gap) / grid_rows;
+
     size_t total = app_state_count();
-    // Column-major iteration: fill column 0 top-to-bottom, then column 1,
-    // then column 2. Reads more naturally for a list of channel slots.
-    int rows_per_col = (int)((total + cols - 1) / cols);
-    if (rows_per_col < 1) rows_per_col = 1;
+    // Cap at the slots actually available (4*6 - 1 master = 23).
+    const size_t MAX_TILES = (size_t)(grid_cols * grid_rows - 1);
+    if (total > MAX_TILES) total = MAX_TILES;
+
     for (size_t i = 0; i < total; ++i) {
+        int col = (int)(i % grid_cols);
+        int row = (int)(i / grid_cols);
+        int x = col * (tile_w + col_gap);
+        int y = row * (tile_h + row_gap);
+
+        lv_obj_t *tile = lv_obj_create(list);
+        lv_obj_set_size(tile, tile_w, tile_h);
+        lv_obj_set_pos(tile, x, y);
+        lv_obj_set_style_radius(tile, 4, 0);
+        lv_obj_set_style_pad_all(tile, 6, 0);
+        lv_obj_set_style_border_width(tile, 1, 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0x404040), 0);
+        lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+        s_row_tile_objs[i] = tile;
+
         app_channel_t ch;
-        if (!app_state_get(i, &ch)) continue;
-        int col = (int)(i / rows_per_col);
-        int row = (int)(i % rows_per_col);
-        int x = col * (row_w + col_gap);
-        int y = row * (row_h + row_gap);
-
-        lv_obj_t *row_obj = lv_obj_create(list);
-        lv_obj_set_size(row_obj, row_w, row_h);
-        lv_obj_set_pos(row_obj, x, y);
-        lv_obj_set_style_radius(row_obj, 4, 0);
-        lv_obj_set_style_pad_all(row_obj, 4, 0);
-        lv_obj_clear_flag(row_obj, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *name = lv_label_create(row_obj);
-        lv_label_set_text(name, ch.name);
+        const char *name_text = "";
+        if (app_state_get(i, &ch)) name_text = ch.name;
+        lv_obj_t *name = lv_label_create(tile);
+        lv_label_set_text(name, name_text);
         lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(name, row_w - swatch_sz - 16);
+        lv_obj_set_width(name, tile_w - swatch_sz - 24);
         lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
-        // Tapping the name opens the rename popup. The swatch on the right
-        // already has its own handler for color editing — two distinct
-        // touch zones avoid an ambiguous "what does this row do?" UX.
+        // Drag-to-reorder lives on the name label (LVGL 9 only fires
+        // LONG_PRESSED on CLICKABLE objects; lv_obj_create-style
+        // containers don't get the event without explicit flag-add,
+        // and bubbling muddies short-tap-vs-long-press detection).
+        // PRESS_LOCK keeps PRESSING firing through the swap when the
+        // finger slides off the source label onto a target tile.
         lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(name, LV_OBJ_FLAG_PRESS_LOCK);
         lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) i);
+        lv_obj_add_event_cb(name, on_tile_long_pressed, LV_EVENT_LONG_PRESSED,
+                            (void *)(uintptr_t) i);
+        lv_obj_add_event_cb(name, on_tile_pressing, LV_EVENT_PRESSING,
+                            (void *)(uintptr_t) i);
+        lv_obj_add_event_cb(name, on_tile_released, LV_EVENT_RELEASED,
+                            (void *)(uintptr_t) i);
+        lv_obj_add_event_cb(name, on_tile_released, LV_EVENT_PRESS_LOST,
                             (void *)(uintptr_t) i);
         s_row_name_labels[i] = name;
 
-        lv_obj_t *swatch = lv_obj_create(row_obj);
+        lv_obj_t *swatch = lv_obj_create(tile);
         lv_obj_set_size(swatch, swatch_sz, swatch_sz);
         lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_set_style_radius(swatch, 4, 0);
@@ -2375,6 +2514,49 @@ static void build_settings_overlay(void)
         lv_obj_add_event_cb(swatch, on_swatch_clicked, LV_EVENT_CLICKED,
                             (void *)(uintptr_t) i);
         s_color_swatches[i] = swatch;
+    }
+
+    // Master tile -- always at bottom-right (last column, last row).
+    {
+        int x = (grid_cols - 1) * (tile_w + col_gap);
+        int y = (grid_rows - 1) * (tile_h + row_gap);
+        lv_obj_t *tile = lv_obj_create(list);
+        lv_obj_set_size(tile, tile_w, tile_h);
+        lv_obj_set_pos(tile, x, y);
+        lv_obj_set_style_radius(tile, 4, 0);
+        lv_obj_set_style_pad_all(tile, 6, 0);
+        // Distinct accent border so the master tile reads as a different
+        // visual group from input tiles. Matches the live master strip's
+        // 0xE0C040 yellow outline at half opacity.
+        lv_obj_set_style_border_width(tile, 2, 0);
+        lv_obj_set_style_border_color(tile, lv_color_hex(0xE0C040), 0);
+        lv_obj_set_style_border_opa(tile, LV_OPA_70, 0);
+        lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+        s_master_tile_obj = tile;
+
+        lv_obj_t *name = lv_label_create(tile);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name, tile_w - swatch_sz - 24);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_add_flag(name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) UI_TARGET_MASTER);
+        // Initial label populated by settings_refresh_state.
+        lv_label_set_text(name, "Master");
+        s_master_tile_name = name;
+
+        lv_obj_t *swatch = lv_obj_create(tile);
+        lv_obj_set_size(swatch, swatch_sz, swatch_sz);
+        lv_obj_align(swatch, LV_ALIGN_RIGHT_MID, 0, 0);
+        lv_obj_set_style_radius(swatch, 4, 0);
+        lv_obj_set_style_border_width(swatch, 1, 0);
+        lv_obj_set_style_border_color(swatch, lv_color_hex(0x808080), 0);
+        lv_obj_set_style_pad_all(swatch, 0, 0);
+        lv_obj_clear_flag(swatch, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(swatch, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(swatch, on_swatch_clicked, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t) UI_TARGET_MASTER);
+        s_master_tile_swatch = swatch;
     }
 }
 
@@ -2442,9 +2624,9 @@ static void settings_refresh_state(void)
         lv_dropdown_set_selected(s_tz_dropdown, found);
     }
 
-    // Refresh row names from app_state — they may have changed via MS
-    // scribble-strip broadcasts (or a local rename) since the overlay was
-    // built. Same loop also re-paints the swatches from app_prefs.
+    // Refresh tile names + swatches from app_state / app_prefs. Names may
+    // have changed via MS scribble-strip broadcasts (or a local rename)
+    // since the overlay was built.
     size_t total = app_state_count();
     for (size_t i = 0; i < total; ++i) {
         app_channel_t ch;
@@ -2459,6 +2641,30 @@ static void settings_refresh_state(void)
         } else {
             lv_obj_set_style_bg_color(s_color_swatches[i],
                                       lv_color_hex(COLOR_PALETTE[color]), 0);
+        }
+    }
+
+    // Master tile -- mirror the channel-tile shape against
+    // app_state_master_get + per-id colour pref (per-mix-bus by design).
+    if (s_master_tile_name) {
+        app_channel_t m;
+        const char *name = "Master";
+        int master_id = -1;
+        if (app_state_master_get(&m)) {
+            master_id = m.id;
+            if (m.name[0]) name = m.name;
+        }
+        lv_label_set_text(s_master_tile_name, name);
+        if (s_master_tile_swatch) {
+            int color = (master_id >= 0)
+                            ? app_prefs_get_channel_color(master_id) : -1;
+            if (color < 0) {
+                lv_obj_set_style_bg_color(s_master_tile_swatch,
+                                          lv_color_hex(NO_COLOR_SWATCH_HEX), 0);
+            } else {
+                lv_obj_set_style_bg_color(s_master_tile_swatch,
+                                          lv_color_hex(COLOR_PALETTE[color]), 0);
+            }
         }
     }
 }
@@ -2698,18 +2904,31 @@ static void build_picker_popup(void)
 static void picker_refresh_title(void)
 {
     if (!s_picker_title) return;
-    app_channel_t ch;
-    if (app_state_get(s_picker_target_idx, &ch)) {
-        char buf[48];
+    char buf[48];
+    if (s_picker_target_idx == UI_TARGET_MASTER) {
+        app_channel_t m;
+        const char *name = (app_state_master_get(&m) && m.name[0]) ? m.name : "Master";
+        snprintf(buf, sizeof(buf), "Color: %s", name);
+    } else {
+        app_channel_t ch;
+        if (!app_state_get(s_picker_target_idx, &ch)) return;
         snprintf(buf, sizeof(buf), "Color: %s", ch.name);
-        lv_label_set_text(s_picker_title, buf);
     }
+    lv_label_set_text(s_picker_title, buf);
 }
 
 static void picker_open(size_t channel_idx)
 {
     if (!s_picker_popup) build_picker_popup();
     s_picker_target_idx = channel_idx;
+    if (channel_idx == UI_TARGET_MASTER) {
+        // Capture the master's MS channel id at open time so a mix-bus
+        // change mid-edit doesn't apply the colour to a different bus.
+        // -1 means the master id isn't published yet (mix layout still
+        // pending) -- on_picker_choice no-ops in that case.
+        app_channel_t m;
+        s_picker_master_id = app_state_master_get(&m) ? m.id : -1;
+    }
     picker_refresh_title();
 
     lv_obj_remove_flag(s_picker_popup, LV_OBJ_FLAG_HIDDEN);
@@ -2952,9 +3171,21 @@ static void on_rename_save(lv_event_t *e)
     (void) e;
     const char *text = lv_textarea_get_text(s_rename_textarea);
     if (text && *text) {
-        int ch_id = app_state_id_for_idx(s_rename_target_idx);
+        int ch_id = (s_rename_target_idx == UI_TARGET_MASTER)
+                        ? s_rename_master_id
+                        : app_state_id_for_idx(s_rename_target_idx);
         if (ch_id >= 0 && s_ms && s_ms->set_name) {
+            // Master uses the same `ch.<id>.cfg.name` SET path as input
+            // strips -- the master's id is just the mix-bus channel id,
+            // captured at rename_open so a mix switch mid-edit doesn't
+            // retarget the write.
             s_ms->set_name(ch_id, text);
+        }
+        // Echo into local state too: MS's broadcast back may take a
+        // moment, and renaming "Mix 1" to "Stage Left" should reflect
+        // immediately on the master strip and the master tile.
+        if (s_rename_target_idx == UI_TARGET_MASTER) {
+            app_state_master_set_name(text, true);
         }
     }
     rename_close();
@@ -3030,12 +3261,26 @@ static void rename_open(size_t channel_idx)
     if (!s_rename_popup) build_rename_popup();
     s_rename_target_idx = channel_idx;
 
-    app_channel_t ch;
-    if (app_state_get(channel_idx, &ch)) {
-        char buf[48];
-        snprintf(buf, sizeof(buf), "Rename: %s", ch.name);
+    char buf[48];
+    if (channel_idx == UI_TARGET_MASTER) {
+        app_channel_t m;
+        const char *name = "Master";
+        if (app_state_master_get(&m)) {
+            s_rename_master_id = m.id;
+            if (m.name[0]) name = m.name;
+        } else {
+            s_rename_master_id = -1;
+        }
+        snprintf(buf, sizeof(buf), "Rename: %s", name);
         lv_label_set_text(s_rename_title, buf);
-        lv_textarea_set_text(s_rename_textarea, ch.name);
+        lv_textarea_set_text(s_rename_textarea, name);
+    } else {
+        app_channel_t ch;
+        if (app_state_get(channel_idx, &ch)) {
+            snprintf(buf, sizeof(buf), "Rename: %s", ch.name);
+            lv_label_set_text(s_rename_title, buf);
+            lv_textarea_set_text(s_rename_textarea, ch.name);
+        }
     }
 
     lv_obj_remove_flag(s_rename_popup, LV_OBJ_FLAG_HIDDEN);
@@ -3102,6 +3347,10 @@ static bool wcfg_has_unsaved_changes(void)
     if (s_wcfg_ntp_dhcp_cb) {
         bool checked = lv_obj_has_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
         if (checked != s_wcfg_orig_ntp_use_dhcp) return true;
+    }
+    if (s_wcfg_dns_dhcp_cb) {
+        bool checked = lv_obj_has_state(s_wcfg_dns_dhcp_cb, LV_STATE_CHECKED);
+        if (checked != s_wcfg_orig_dns_use_dhcp) return true;
     }
     return false;
 }
@@ -3214,18 +3463,101 @@ static void on_wcfg_keyboard_event(lv_event_t *e)
     }
 }
 
-// Cheap dotted-IPv4 sanity check. We don't need full RFC validation -- the
-// platform's ipaddr_addr() rejects garbage at apply time. But "empty when
-// static is on" is a UI bug we should catch before the save.
+// SSID textarea content changed (typing or programmatic). Re-evaluate the
+// password field: a saved entry for the new SSID prefills, otherwise clear
+// so a previous network's password doesn't accidentally land on a different
+// AP. Fires for both keyboard input and lv_textarea_set_text.
+static void on_wcfg_ssid_changed(lv_event_t *e)
+{
+    (void)e;
+    if (!s_wcfg_ssid_ta || !s_wcfg_pass_ta) return;
+    const char *ssid = lv_textarea_get_text(s_wcfg_ssid_ta);
+    char pass[APP_CONFIG_PASS_MAX];
+    if (ssid && ssid[0] != '\0' &&
+        app_config_wifi_saved_lookup(ssid, pass, sizeof(pass))) {
+        lv_textarea_set_text(s_wcfg_pass_ta, pass);
+    } else {
+        lv_textarea_set_text(s_wcfg_pass_ta, "");
+    }
+}
+
+// Dotted-IPv4 sanity check. Each octet must be 0..255, exactly four octets
+// separated by dots, no leading garbage. The platform's ipaddr_addr() also
+// rejects garbage at apply time, but pre-validating gives the user a
+// readable per-field error instead of a silent fall-through to DHCP.
 static bool wcfg_ipv4_looks_ok(const char *s)
 {
     if (!s || !*s) return false;
     int dots = 0;
-    for (const char *p = s; *p; ++p) {
-        if (*p == '.')      dots++;
-        else if (*p < '0' || *p > '9') return false;
+    int octet_digits = 0;
+    int octet_value = 0;
+    for (const char *p = s; ; ++p) {
+        if (*p == '\0' || *p == '.') {
+            if (octet_digits == 0)        return false;
+            if (octet_value > 255)        return false;
+            if (*p == '\0') break;
+            dots++;
+            octet_digits = 0;
+            octet_value  = 0;
+            continue;
+        }
+        if (*p < '0' || *p > '9') return false;
+        octet_value = octet_value * 10 + (*p - '0');
+        octet_digits++;
+        if (octet_digits > 3) return false;
     }
     return dots == 3;
+}
+
+// Validation-error dialog -- single instance, reused. Lets the save path
+// surface a per-field error without inflating the inline status label
+// beyond one line. Called from on_wcfg_save when a static-IP field fails
+// the IPv4 check.
+static lv_obj_t *s_wcfg_validation_dialog;
+static lv_obj_t *s_wcfg_validation_msg;
+
+static void on_wcfg_validation_ok(lv_event_t *e)
+{
+    (void)e;
+    if (s_wcfg_validation_dialog)
+        lv_obj_add_flag(s_wcfg_validation_dialog, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_wcfg_validation_dialog(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 480, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_wcfg_validation_dialog = p;
+
+    s_wcfg_validation_msg = lv_label_create(p);
+    lv_label_set_text(s_wcfg_validation_msg, "Validation error");
+    lv_obj_set_width(s_wcfg_validation_msg, 440);
+    lv_label_set_long_mode(s_wcfg_validation_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_wcfg_validation_msg, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *ok = lv_button_create(p);
+    lv_obj_set_size(ok, 160, 50);
+    lv_obj_align(ok, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_t *ok_lbl = lv_label_create(ok);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_center(ok_lbl);
+    lv_obj_add_event_cb(ok, on_wcfg_validation_ok, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wcfg_show_validation_error(const char *msg)
+{
+    if (!s_wcfg_validation_dialog) build_wcfg_validation_dialog();
+    lv_label_set_text(s_wcfg_validation_msg, msg);
+    lv_obj_remove_flag(s_wcfg_validation_dialog, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_wcfg_validation_dialog);
 }
 
 static void on_wcfg_save_yes(lv_event_t *e);
@@ -3239,19 +3571,31 @@ static void on_wcfg_save(lv_event_t *e)
     const char *ssid = lv_textarea_get_text(s_wcfg_ssid_ta);
 
     if (strlen(ssid) == 0) {
-        lv_label_set_text(s_wcfg_status_label,
-                          "#FF6060 SSID cannot be empty.#");
+        wcfg_show_validation_error("SSID cannot be empty.");
         return;
     }
     if (s_wcfg_use_static) {
-        const char *ip = lv_textarea_get_text(s_wcfg_ip_ta);
-        const char *nm = lv_textarea_get_text(s_wcfg_nm_ta);
-        const char *gw = lv_textarea_get_text(s_wcfg_gw_ta);
-        if (!wcfg_ipv4_looks_ok(ip) || !wcfg_ipv4_looks_ok(nm) ||
-            !wcfg_ipv4_looks_ok(gw)) {
-            lv_label_set_text(s_wcfg_status_label,
-                              "#FF6060 IP / Netmask / Gateway must be dotted IPv4.#");
-            return;
+        // Static IP requires every networking field to be a syntactically
+        // valid dotted IPv4 -- including DNS, since hostname resolution
+        // (ms_host, NTP) breaks without it and there's no DHCP fallback.
+        struct { const char *label; lv_obj_t *ta; } fields[] = {
+            { "IP address",     s_wcfg_ip_ta  },
+            { "Subnet mask",    s_wcfg_nm_ta  },
+            { "Gateway",        s_wcfg_gw_ta  },
+            { "DNS",            s_wcfg_dns_ta },
+        };
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+            const char *v = lv_textarea_get_text(fields[i].ta);
+            if (!wcfg_ipv4_looks_ok(v)) {
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "%s is not a valid IPv4 address: \"%s\"\n\n"
+                         "Static IP requires IP address, Subnet mask, "
+                         "Gateway and DNS as dotted IPv4 (e.g. 192.168.1.1).",
+                         fields[i].label, (v && *v) ? v : "(empty)");
+                wcfg_show_validation_error(msg);
+                return;
+            }
         }
     }
 
@@ -3292,7 +3636,15 @@ static void on_wcfg_save_yes(lv_event_t *e)
         app_prefs_set_wifi_static_ip     (lv_textarea_get_text(s_wcfg_ip_ta));
         app_prefs_set_wifi_static_netmask(lv_textarea_get_text(s_wcfg_nm_ta));
         app_prefs_set_wifi_static_gateway(lv_textarea_get_text(s_wcfg_gw_ta));
-        app_prefs_set_wifi_static_dns    (lv_textarea_get_text(s_wcfg_dns_ta));
+    }
+    // DNS is configurable in both modes: in static mode the manual value is
+    // applied directly; in DHCP mode it's the fallback (or override per the
+    // dns_use_dhcp checkbox).
+    if (s_wcfg_dns_ta) {
+        app_prefs_set_wifi_static_dns(lv_textarea_get_text(s_wcfg_dns_ta));
+    }
+    if (s_wcfg_dns_dhcp_cb) {
+        app_prefs_set_dns_use_dhcp(lv_obj_has_state(s_wcfg_dns_dhcp_cb, LV_STATE_CHECKED));
     }
     if (s_wcfg_ntp_ta) {
         app_prefs_set_ntp_server(lv_textarea_get_text(s_wcfg_ntp_ta));
@@ -3396,6 +3748,94 @@ static void ssid_list_set_scanning(bool scanning)
     if (s_ssid_list) lv_obj_remove_flag(s_ssid_list, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void build_ssid_forget_confirm(void);
+static void ssid_list_repopulate(void);
+static void ssid_list_render(const char (*scanned)[33], size_t scanned_n,
+                             bool scanning);
+
+static void on_saved_row_long_pressed(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target_obj(e);
+    const char *txt = lv_list_get_button_text(s_ssid_list, btn);
+    if (!txt || txt[0] == '\0') return;
+    s_ssid_long_press_consumed = true;
+    strncpy(s_ssid_forget_target, txt, sizeof(s_ssid_forget_target) - 1);
+    s_ssid_forget_target[sizeof(s_ssid_forget_target) - 1] = '\0';
+    if (!s_ssid_forget_confirm) build_ssid_forget_confirm();
+    if (s_ssid_forget_msg_label) {
+        char buf[APP_CONFIG_SSID_MAX + 32];
+        snprintf(buf, sizeof(buf), "Forget \"%s\"?", s_ssid_forget_target);
+        lv_label_set_text(s_ssid_forget_msg_label, buf);
+    }
+    lv_obj_remove_flag(s_ssid_forget_confirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ssid_forget_confirm);
+}
+
+static void on_ssid_forget_yes(lv_event_t *e)
+{
+    (void)e;
+    if (s_ssid_forget_confirm) lv_obj_add_flag(s_ssid_forget_confirm, LV_OBJ_FLAG_HIDDEN);
+    if (s_ssid_forget_target[0] == '\0') return;
+    app_config_wifi_saved_remove(s_ssid_forget_target);
+    s_ssid_forget_target[0] = '\0';
+    // Re-render with the latest saved + scan state. Scanned-only entries that
+    // matched the forgotten saved row come back into view automatically.
+    ssid_list_repopulate();
+}
+
+static void on_ssid_forget_no(lv_event_t *e)
+{
+    (void)e;
+    if (s_ssid_forget_confirm) lv_obj_add_flag(s_ssid_forget_confirm, LV_OBJ_FLAG_HIDDEN);
+    s_ssid_forget_target[0] = '\0';
+}
+
+static void build_ssid_forget_confirm(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *p = lv_obj_create(scr);
+    lv_obj_set_size(p, 460, 200);
+    lv_obj_center(p);
+    lv_obj_set_style_pad_all(p, 20, 0);
+    lv_obj_set_style_radius(p, 12, 0);
+    lv_obj_set_style_border_width(p, 2, 0);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    s_ssid_forget_confirm = p;
+
+    s_ssid_forget_msg_label = lv_label_create(p);
+    lv_label_set_text(s_ssid_forget_msg_label,
+                      "Forget this network?\nThe saved password will be deleted.");
+    lv_obj_align(s_ssid_forget_msg_label, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *cancel = lv_button_create(p);
+    lv_obj_set_size(cancel, 160, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel, on_ssid_forget_no, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *yes = lv_button_create(p);
+    lv_obj_set_size(yes, 160, 50);
+    lv_obj_align(yes, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_style_bg_color(yes, lv_color_hex(0xC04040), 0);
+    lv_obj_t *yes_lbl = lv_label_create(yes);
+    lv_label_set_text(yes_lbl, "Forget");
+    lv_obj_center(yes_lbl);
+    lv_obj_add_event_cb(yes, on_ssid_forget_yes, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Re-render with cached scan results. Used after a forget so the UI updates
+// without re-running a wifi scan.
+static void ssid_list_repopulate(void)
+{
+    char results[APP_WIFI_SCAN_MAX_RESULTS][33];
+    size_t n = app_wifi_scan_results(results, APP_WIFI_SCAN_MAX_RESULTS);
+    ssid_list_render(results, n, false);
+}
+
 // Render the picker list: saved networks first (LV_SYMBOL_OK -- "we have the
 // password, tap to fill both"), then scanned APs that aren't already saved
 // (LV_SYMBOL_WIFI -- "tap to fill SSID, password still required"), then an
@@ -3415,6 +3855,10 @@ static void ssid_list_render(const char (*scanned)[33], size_t scanned_n,
         if (!app_config_wifi_saved_get(i, ssid, sizeof(ssid), pass, sizeof(pass))) continue;
         lv_obj_t *btn = lv_list_add_button(s_ssid_list, LV_SYMBOL_OK, ssid);
         lv_obj_add_event_cb(btn, on_ssid_row_clicked, LV_EVENT_CLICKED, NULL);
+        // Long-press on a saved entry opens the forget-confirmation modal.
+        // Scanned-only rows don't get this -- there's nothing to forget.
+        lv_obj_add_event_cb(btn, on_saved_row_long_pressed,
+                            LV_EVENT_LONG_PRESSED, NULL);
     }
 
     size_t shown_scanned = 0;
@@ -3459,6 +3903,14 @@ static void build_ssid_list_popup(void)
     lv_label_set_text(title, "Pick a network");
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
 
+    // Hint sits under the title to advertise the long-press affordance.
+    // Bare "saved row -> tap to use" doesn't tell the user they can also
+    // delete the credential, so without this the forget action is hidden.
+    lv_obj_t *hint = lv_label_create(p);
+    lv_label_set_text(hint, "Long-press a saved network to forget it");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x808080), 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 18);
+
     lv_obj_t *close_btn = lv_button_create(p);
     lv_obj_set_size(close_btn, 36, 36);
     lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, 0, -4);
@@ -3468,7 +3920,8 @@ static void build_ssid_list_popup(void)
     lv_obj_add_event_cb(close_btn, on_ssid_list_close, LV_EVENT_CLICKED, NULL);
 
     s_ssid_list = lv_list_create(p);
-    lv_obj_set_size(s_ssid_list, 436, 290);
+    // Shrink by the hint row's vertical footprint (was 290 pre-hint).
+    lv_obj_set_size(s_ssid_list, 436, 274);
     lv_obj_align(s_ssid_list, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     // Scanning-state widgets occupy the same area; toggled by
@@ -3503,8 +3956,13 @@ static void ssid_list_populate_async(void *arg)
         ssid_list_set_scanning(true);
         lv_obj_remove_flag(s_ssid_list_popup, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(s_ssid_list_popup);
-        (void) app_wifi_scan_start(on_wifi_scan_done, NULL);
-        return;
+        // If the retry can't dispatch (wifi mid-disconnect, e.g. the
+        // auto-switch path re-running set_config), fall through to the
+        // normal re-enable instead of stranding the Scan button at
+        // "Scanning..." waiting for a SCAN_DONE that never arrives.
+        app_wifi_scan_result_t r =
+            app_wifi_scan_start(on_wifi_scan_done, NULL);
+        if (r != APP_WIFI_SCAN_FAILED) return;
     }
 
     ssid_list_render(results, n, false);
@@ -3521,6 +3979,13 @@ static void ssid_list_populate_async(void *arg)
 
 static void on_ssid_row_clicked(lv_event_t *e)
 {
+    // After a long-press, LVGL still fires CLICKED on release. The
+    // long-press handler already opened the forget modal -- swallow this
+    // click so the SSID doesn't also get filled into the wcfg form.
+    if (s_ssid_long_press_consumed) {
+        s_ssid_long_press_consumed = false;
+        return;
+    }
     lv_obj_t *btn = lv_event_get_target_obj(e);
     const char *txt = lv_list_get_button_text(s_ssid_list, btn);
     if (txt && s_wcfg_ssid_ta) {
@@ -3575,10 +4040,18 @@ static void on_wcfg_scan_clicked(lv_event_t *e)
 static void wcfg_refresh_current_ip(void)
 {
     if (!s_wcfg_current_ip_value) return;
+    if (app_wifi_get_state() != APP_WIFI_STATE_CONNECTED) {
+        // No association = no IP, no auth mode. Showing "0.0.0.0  (—)"
+        // looked like a malformed value rather than a state; the explicit
+        // sentence reads better.
+        lv_label_set_text(s_wcfg_current_ip_value, "Not currently connected");
+        return;
+    }
     char ip[16];
     app_wifi_format_ip(ip, sizeof(ip));
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Current: %s", ip);
+    const char *sec = app_wifi_get_security_str();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Current: %s  (%s)", ip, sec);
     lv_label_set_text(s_wcfg_current_ip_value, buf);
 }
 
@@ -3673,6 +4146,13 @@ static void build_wcfg_overlay(void)
     lv_textarea_set_max_length(s_wcfg_ssid_ta, APP_CONFIG_SSID_MAX - 1);
     lv_obj_add_event_cb(s_wcfg_ssid_ta, on_wcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
+    // Re-target the password field whenever the SSID changes: prefill from
+    // the saved-networks ring if the new SSID is known, otherwise clear so
+    // the previous network's password isn't accidentally re-applied to a
+    // different SSID. wcfg_open's explicit set_text on the password runs
+    // AFTER the SSID set_text, so the boot-time prefill still wins.
+    lv_obj_add_event_cb(s_wcfg_ssid_ta, on_wcfg_ssid_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
 
     s_wcfg_scan_btn = lv_button_create(ov);
     lv_obj_set_size(s_wcfg_scan_btn, scan_btn_w, field_h);
@@ -3686,7 +4166,7 @@ static void build_wcfg_overlay(void)
 
     // Row 2: Pass + show-password checkbox inline on the right.
     lv_obj_t *pass_lbl = lv_label_create(ov);
-    lv_label_set_text(pass_lbl, "Pass");
+    lv_label_set_text(pass_lbl, "Password");
     lv_obj_align(pass_lbl, LV_ALIGN_TOP_LEFT, 0, y + 4);
 
     s_wcfg_pass_ta = lv_textarea_create(ov);
@@ -3732,7 +4212,9 @@ static void build_wcfg_overlay(void)
     y += row_dy;
 
     // Static IP group -- one container so we can hide/show as a unit. Two
-    // rows of two textareas each: IP / Netmask, then Gateway / DNS.
+    // rows of two textareas each: IP / Netmask, then Gateway alone (DNS
+    // moved outside since it applies in DHCP mode too -- the
+    // dns_use_dhcp pref governs which side wins).
     s_wcfg_static_group = lv_obj_create(ov);
     lv_obj_set_size(s_wcfg_static_group, form_w, row_dy * 2 + 8);
     lv_obj_set_pos(s_wcfg_static_group, 0, y);
@@ -3776,18 +4258,32 @@ static void build_wcfg_overlay(void)
     lv_obj_add_event_cb(s_wcfg_gw_ta, on_wcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
 
-    lv_obj_t *dns_lbl = lv_label_create(s_wcfg_static_group);
+    y += row_dy * 2 + 8;
+
+    // DNS row -- visible in both DHCP and static modes. The accompanying
+    // "Use DHCP-provided DNS" checkbox below decides priority: when
+    // checked (default), DHCP supplies DNS and the manual value here is
+    // the fallback if DHCP didn't provide one. When unchecked, the
+    // manual value overrides DHCP. In static IP mode this manual value
+    // is always used (DHCP isn't running) -- without it, hostname
+    // resolution breaks for ms_host / NTP.
+    lv_obj_t *dns_lbl = lv_label_create(ov);
     lv_label_set_text(dns_lbl, "DNS");
-    lv_obj_align(dns_lbl, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12, row_dy + 4);
-    s_wcfg_dns_ta = lv_textarea_create(s_wcfg_static_group);
+    lv_obj_align(dns_lbl, LV_ALIGN_TOP_LEFT, 0, y + 4);
+    s_wcfg_dns_ta = lv_textarea_create(ov);
     lv_obj_set_size(s_wcfg_dns_ta, ip_field_w, field_h);
-    lv_obj_align(s_wcfg_dns_ta, LV_ALIGN_TOP_LEFT, 80 + ip_field_w + 12 + 64, row_dy);
+    lv_obj_align(s_wcfg_dns_ta, LV_ALIGN_TOP_LEFT, 80, y);
     lv_textarea_set_one_line(s_wcfg_dns_ta, true);
     lv_textarea_set_max_length(s_wcfg_dns_ta, APP_PREFS_IP_STR_MAX - 1);
     lv_obj_add_event_cb(s_wcfg_dns_ta, on_wcfg_textarea_focused,
                         LV_EVENT_FOCUSED, NULL);
+    y += row_dy;
 
-    y += row_dy * 2 + 8;
+    s_wcfg_dns_dhcp_cb = lv_checkbox_create(ov);
+    lv_checkbox_set_text(s_wcfg_dns_dhcp_cb,
+                         "Use DHCP-provided DNS when available");
+    lv_obj_align(s_wcfg_dns_dhcp_cb, LV_ALIGN_TOP_LEFT, 80, y);
+    y += row_dy;
 
     // NTP server row -- hostname or dotted IPv4. Lives outside the static
     // group so it's visible regardless of DHCP/Static. Keyboard defaults to
@@ -3861,6 +4357,11 @@ static void wcfg_open(void)
     if (s_wcfg_ntp_dhcp_cb) {
         if (s_wcfg_orig_ntp_use_dhcp) lv_obj_add_state   (s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
         else                          lv_obj_remove_state(s_wcfg_ntp_dhcp_cb, LV_STATE_CHECKED);
+    }
+    s_wcfg_orig_dns_use_dhcp = app_prefs_get_dns_use_dhcp();
+    if (s_wcfg_dns_dhcp_cb) {
+        if (s_wcfg_orig_dns_use_dhcp) lv_obj_add_state   (s_wcfg_dns_dhcp_cb, LV_STATE_CHECKED);
+        else                          lv_obj_remove_state(s_wcfg_dns_dhcp_cb, LV_STATE_CHECKED);
     }
     wcfg_refresh_current_ip();
     wcfg_apply_static_visibility();
@@ -4000,9 +4501,12 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
         // which already includes '.').
         bool port_only = (ta == s_mcfg_port_ta || ta == s_mcfg_osc_port_ta);
         lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
+        // USER_1 holds the host's single-screen alphanum layout (see
+        // build_mcfg_overlay). Don't use TEXT_LOWER here -- that's the
+        // shared LVGL default and used by the wifi-config keyboard.
         lv_keyboard_set_mode(s_mcfg_keyboard,
                              port_only ? LV_KEYBOARD_MODE_NUMBER
-                                       : LV_KEYBOARD_MODE_TEXT_LOWER);
+                                       : LV_KEYBOARD_MODE_USER_1);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
         // Keyboard is a sibling of the overlay; promote to foreground so it
         // isn't drawn behind the overlay.
@@ -4163,12 +4667,33 @@ static void build_mcfg_reboot_confirm(void)
     lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 
+// OSC port is only used when the OSC backend is selected. The HTTP backend
+// uses just the regular port (REST + WS share it), so hide the OSC field in
+// HTTP mode to avoid implying the user has to set it. Boot init for OSC
+// still talks HTTP for /console/information + /app/mixers/offline -- that's
+// why a single shared port box doesn't work; we keep both, but only one is
+// visible at a time.
+static void mcfg_apply_proto_visibility(int proto)
+{
+    if (s_mcfg_osc_port_lbl && s_mcfg_osc_port_ta) {
+        bool show = (proto == APP_MS_PROTOCOL_OSC);
+        if (show) {
+            lv_obj_remove_flag(s_mcfg_osc_port_lbl, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_mcfg_osc_port_ta,  LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_mcfg_osc_port_lbl, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_mcfg_osc_port_ta,  LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 static void on_mcfg_proto_clicked(lv_event_t *e)
 {
     int which = (int)(uintptr_t) lv_event_get_user_data(e);
     s_mcfg_proto_staged = which;
     lv_obj_t *btns[2] = { s_mcfg_proto_ws_btn, s_mcfg_proto_osc_btn };
     update_radio_visuals(btns, 2, (size_t) which);
+    mcfg_apply_proto_visibility(which);
 }
 
 static void build_mcfg_overlay(void)
@@ -4242,7 +4767,7 @@ static void build_mcfg_overlay(void)
     lv_label_set_text(proto_lbl, "Protocol");
     lv_obj_align(proto_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 2 + 4);
 
-    s_mcfg_proto_ws_btn = make_radio_button(ov, "WS");
+    s_mcfg_proto_ws_btn = make_radio_button(ov, "HTTP");
     lv_obj_set_size(s_mcfg_proto_ws_btn, 80, field_h);
     lv_obj_align(s_mcfg_proto_ws_btn, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 2);
     lv_obj_add_event_cb(s_mcfg_proto_ws_btn, on_mcfg_proto_clicked,
@@ -4254,9 +4779,9 @@ static void build_mcfg_overlay(void)
     lv_obj_add_event_cb(s_mcfg_proto_osc_btn, on_mcfg_proto_clicked,
                         LV_EVENT_CLICKED, (void *)(uintptr_t) APP_MS_PROTOCOL_OSC);
 
-    lv_obj_t *osc_port_lbl = lv_label_create(ov);
-    lv_label_set_text(osc_port_lbl, "OSC Port");
-    lv_obj_align(osc_port_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 3 + 4);
+    s_mcfg_osc_port_lbl = lv_label_create(ov);
+    lv_label_set_text(s_mcfg_osc_port_lbl, "OSC Port");
+    lv_obj_align(s_mcfg_osc_port_lbl, LV_ALIGN_TOP_LEFT, 0, 56 + row_dy * 3 + 4);
     s_mcfg_osc_port_ta = lv_textarea_create(ov);
     lv_obj_set_size(s_mcfg_osc_port_ta, 140, field_h);
     lv_obj_align(s_mcfg_osc_port_ta, LV_ALIGN_TOP_LEFT, 80, 56 + row_dy * 3);
@@ -4275,9 +4800,13 @@ static void build_mcfg_overlay(void)
     lv_obj_align(s_mcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_mcfg_keyboard, on_mcfg_keyboard_event, LV_EVENT_ALL, NULL);
-    // Override TEXT_LOWER with a single-screen alpha+digits+'.' layout for
-    // the host field. Other modes (NUMBER for ports) keep LVGL defaults.
-    lv_keyboard_set_map(s_mcfg_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER,
+    // Bind the single-screen alpha+digits+'.' layout to USER_1 rather than
+    // overriding TEXT_LOWER. lv_keyboard_set_map mutates a global kb_map
+    // table, so overriding TEXT_LOWER here also stripped the "ABC"/"1#"
+    // mode-switch buttons from the wifi-config keyboard, leaving WPA passwords
+    // with special characters or capitals untypeable. USER_1 is private to
+    // this keyboard.
+    lv_keyboard_set_map(s_mcfg_keyboard, LV_KEYBOARD_MODE_USER_1,
                         mcfg_alphanum_map, mcfg_alphanum_ctrl);
 }
 
@@ -4305,6 +4834,7 @@ static void mcfg_open(void)
         lv_obj_t *btns[2] = { s_mcfg_proto_ws_btn, s_mcfg_proto_osc_btn };
         update_radio_visuals(btns, 2, (size_t) s_mcfg_orig_proto);
     }
+    mcfg_apply_proto_visibility(s_mcfg_orig_proto);
 
     lv_label_set_text(s_mcfg_status_label, "");
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -5310,26 +5840,40 @@ static void ms_apply_async(void *unused)
     // void during an outage.
     apply_controls_enabled();
 
-    // Toggle the spinner ↔ fader tileview based on MS connection. Hidden
-    // strips during an outage prevent the user from interacting with stale
-    // values; the spinner makes the waiting state explicit.
+    // Three-way visibility: faders / "console offline" page / spinner.
+    //   ms_connected + console_attached -> faders
+    //   ms_connected + !console_attached -> offline page (mixer powered off)
+    //   !ms_connected                    -> spinner ("connecting...")
+    // Pre-MS-connect, hiding the fader UI prevents interactions with stale
+    // values; a yellow MS icon alone wasn't loud enough -- the user
+    // experienced "console turns off, faders still respond" before this
+    // page existed.
     bool ms_connected = (s_ms && s_ms->get_state &&
                          s_ms->get_state() == APP_MS_STATE_CONNECTED);
+    bool console_ok = ms_connected && s_ms->is_console_attached &&
+                      s_ms->is_console_attached();
+    bool show_offline = ms_connected && !console_ok;
+    bool show_spinner = !ms_connected;
+
     if (s_tileview) {
-        if (ms_connected) lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);
-        else              lv_obj_add_flag   (s_tileview, LV_OBJ_FLAG_HIDDEN);
+        if (console_ok) lv_obj_remove_flag(s_tileview, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_add_flag   (s_tileview, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_master_widgets.box) {
-        if (ms_connected) lv_obj_remove_flag(s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
-        else              lv_obj_add_flag   (s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
+        if (console_ok) lv_obj_remove_flag(s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
+        else            lv_obj_add_flag   (s_master_widgets.box, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_spinner) {
-        if (ms_connected) lv_obj_add_flag   (s_spinner, LV_OBJ_FLAG_HIDDEN);
-        else              lv_obj_remove_flag(s_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (show_spinner) lv_obj_remove_flag(s_spinner, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag   (s_spinner, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_spinner_label) {
-        if (ms_connected) lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
-        else              lv_obj_remove_flag(s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+        if (show_spinner) lv_obj_remove_flag(s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag   (s_spinner_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_offline_panel) {
+        if (show_offline) lv_obj_remove_flag(s_offline_panel, LV_OBJ_FLAG_HIDDEN);
+        else              lv_obj_add_flag   (s_offline_panel, LV_OBJ_FLAG_HIDDEN);
     }
 }
 

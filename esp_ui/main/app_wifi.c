@@ -53,6 +53,16 @@ static TaskHandle_t       s_reconnect_task;
 // the system event task.
 static volatile bool      s_reconnect_immediate;
 
+// Saved-network auto-switch. on_scan_done populates these when it finds a
+// higher-priority saved SSID in scan results that isn't the current config;
+// reconnect_task picks them up, persists to NVS, and runs the disconnect/
+// set_config/connect dance off the event task so the SDIO RPCs don't starve
+// IDLE0. Read/written under the assumption that the wifi event task is the
+// only producer.
+static volatile bool      s_saved_switch_pending;
+static char               s_saved_switch_ssid[33];
+static char               s_saved_switch_pass[65];
+
 #define MAX_SUBSCRIBERS 4
 static struct {
     app_wifi_on_change_t cb;
@@ -75,6 +85,8 @@ static void set_state(app_wifi_state_t s)
 }
 
 static void on_scan_done(void);
+static esp_netif_t *sta_netif(void);
+static void apply_dns_pref(esp_netif_t *netif);
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -128,6 +140,10 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         APP_LOGD_I("app_wifi", "got ip " IPSTR, IP2STR(&evt->ip_info.ip));
         s_ip = evt->ip_info.ip;
         s_retry = 0;
+        // Re-run DNS pref now that DHCP has handed us a lease; if the DHCP
+        // server didn't include option 6 the manual fallback gets installed
+        // here so subsequent hostname resolves work.
+        apply_dns_pref(sta_netif());
         set_state(APP_WIFI_STATE_CONNECTED);
         xEventGroupSetBits(s_evt, BIT_CONNECTED | BIT_GOT_IP_SINCE_REASSOC);
     }
@@ -141,6 +157,20 @@ static void reconnect_task(void *arg)
         // exactly what we want: multiple disconnects between sleeps just
         // become "one more reconnect attempt".
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // Saved-network auto-switch takes priority over a plain reconnect.
+        // The event task wrote ssid/pass into the staging buffers; persist
+        // them to NVS and run the full reconfigure off the event task.
+        if (s_saved_switch_pending) {
+            s_saved_switch_pending = false;
+            ESP_LOGI(TAG, "saved-network auto-switch -> '%s'", s_saved_switch_ssid);
+            APP_LOGD_I("app_wifi", "auto-switch to saved '%s'", s_saved_switch_ssid);
+            app_config_set_wifi_ssid(s_saved_switch_ssid);
+            app_config_set_wifi_pass(s_saved_switch_pass);
+            app_wifi_reconfigure();
+            continue;
+        }
+
         bool immediate = s_reconnect_immediate;
         s_reconnect_immediate = false;
         if (!immediate) {
@@ -253,6 +283,52 @@ static esp_netif_t *sta_netif(void)
     return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 }
 
+// Apply the manual DNS pref to the netif if appropriate. Three cases:
+//   * Static IP mode      -> install manual DNS unconditionally (DHCP isn't
+//                            running so there's no other source). Hostname
+//                            resolution otherwise breaks: ms_host or NTP
+//                            server given as a hostname has nowhere to go.
+//   * DHCP + override on  -> install manual DNS (overrides whatever DHCP
+//                            handed us; takes effect on next resolve).
+//   * DHCP + override off -> only install manual when the netif's current
+//                            DNS slot is unset (DHCP didn't supply one).
+// Called both from apply_ip_config (initial pass) and IP_EVENT_STA_GOT_IP
+// (re-evaluate once DHCP has had its chance).
+static void apply_dns_pref(esp_netif_t *netif)
+{
+    if (!netif) return;
+    char dns[APP_PREFS_IP_STR_MAX];
+    app_prefs_get_wifi_static_dns(dns, sizeof(dns));
+    bool use_dhcp = app_prefs_get_dns_use_dhcp();
+    bool is_static = app_prefs_get_wifi_use_static();
+
+    if (use_dhcp && !is_static) {
+        // Don't override DHCP-supplied DNS unless it's missing.
+        esp_netif_dns_info_t cur = {0};
+        if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &cur) == ESP_OK &&
+            cur.ip.u_addr.ip4.addr != 0) {
+            ESP_LOGI(TAG, "dns: keeping DHCP-supplied " IPSTR,
+                     IP2STR(&cur.ip.u_addr.ip4));
+            return;
+        }
+    }
+
+    if (dns[0] == '\0') {
+        if (!use_dhcp || is_static) {
+            ESP_LOGW(TAG, "dns: manual override requested but no DNS configured");
+        }
+        return;
+    }
+
+    esp_netif_dns_info_t d = {0};
+    d.ip.type = ESP_IPADDR_TYPE_V4;
+    d.ip.u_addr.ip4.addr = ipaddr_addr(dns);
+    if (d.ip.u_addr.ip4.addr == IPADDR_NONE) return;
+    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &d);
+    ESP_LOGI(TAG, "dns: applied manual %s (use_dhcp=%d static=%d)",
+             dns, use_dhcp, is_static);
+}
+
 void app_wifi_apply_ip_config(void)
 {
     esp_netif_t *netif = sta_netif();
@@ -265,17 +341,20 @@ void app_wifi_apply_ip_config(void)
         // Default path -- DHCP. Calling start on an already-running client is
         // a no-op + ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED, which is fine.
         esp_netif_dhcpc_start(netif);
+        // DNS handling deferred to GOT_IP for DHCP mode (DHCP option 6 may
+        // arrive before or after the lease, depending on server). Override
+        // mode still applies its manual value pre-emptively so subsequent
+        // resolves don't briefly hit DHCP's pick.
+        apply_dns_pref(netif);
         return;
     }
 
     char ip[APP_PREFS_IP_STR_MAX];
     char nm[APP_PREFS_IP_STR_MAX];
     char gw[APP_PREFS_IP_STR_MAX];
-    char dns[APP_PREFS_IP_STR_MAX];
     app_prefs_get_wifi_static_ip     (ip,  sizeof(ip));
     app_prefs_get_wifi_static_netmask(nm,  sizeof(nm));
     app_prefs_get_wifi_static_gateway(gw,  sizeof(gw));
-    app_prefs_get_wifi_static_dns    (dns, sizeof(dns));
 
     esp_netif_ip_info_t info = {0};
     info.ip.addr      = ipaddr_addr(ip);
@@ -285,6 +364,7 @@ void app_wifi_apply_ip_config(void)
         ESP_LOGW(TAG, "static-ip prefs incomplete (ip='%s' nm='%s'); falling back to DHCP",
                  ip, nm);
         esp_netif_dhcpc_start(netif);
+        apply_dns_pref(netif);
         return;
     }
     // Stop DHCP before set_ip_info -- esp_netif refuses to overwrite the
@@ -295,17 +375,11 @@ void app_wifi_apply_ip_config(void)
         ESP_LOGW(TAG, "set_ip_info failed: %s; falling back to DHCP",
                  esp_err_to_name(err));
         esp_netif_dhcpc_start(netif);
+        apply_dns_pref(netif);
         return;
     }
-    if (dns[0] != '\0') {
-        esp_netif_dns_info_t d = {0};
-        d.ip.type = ESP_IPADDR_TYPE_V4;
-        d.ip.u_addr.ip4.addr = ipaddr_addr(dns);
-        if (d.ip.u_addr.ip4.addr != IPADDR_NONE) {
-            esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &d);
-        }
-    }
-    ESP_LOGI(TAG, "static ip applied: %s/%s gw=%s dns=%s", ip, nm, gw, dns);
+    apply_dns_pref(netif);
+    ESP_LOGI(TAG, "static ip applied: %s/%s gw=%s", ip, nm, gw);
 }
 
 bool app_wifi_reconfigure(void)
@@ -357,6 +431,27 @@ void app_wifi_format_ip(char *buf, size_t buflen)
     snprintf(buf, buflen, IPSTR, IP2STR(&s_ip));
 }
 
+const char *app_wifi_get_security_str(void)
+{
+    if (s_state != APP_WIFI_STATE_CONNECTED) return "—";
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return "—";
+    switch (ap.authmode) {
+        case WIFI_AUTH_OPEN:                 return "Open";
+        case WIFI_AUTH_WEP:                  return "WEP";
+        case WIFI_AUTH_WPA_PSK:              return "WPA-PSK";
+        case WIFI_AUTH_WPA2_PSK:             return "WPA2-PSK";
+        case WIFI_AUTH_WPA_WPA2_PSK:         return "WPA/WPA2-PSK";
+        case WIFI_AUTH_WPA2_ENTERPRISE:      return "WPA2-Enterprise";
+        case WIFI_AUTH_WPA3_PSK:             return "WPA3-PSK";
+        case WIFI_AUTH_WPA2_WPA3_PSK:        return "WPA2/WPA3-PSK";
+        case WIFI_AUTH_WAPI_PSK:             return "WAPI-PSK";
+        case WIFI_AUTH_OWE:                  return "OWE";
+        case WIFI_AUTH_WPA3_ENT_192:         return "WPA3-Ent-192";
+        default:                             return "Unknown";
+    }
+}
+
 void app_wifi_register_on_change(app_wifi_on_change_t cb, void *ctx)
 {
     if (!cb || s_subscriber_count >= MAX_SUBSCRIBERS) return;
@@ -377,6 +472,47 @@ static app_wifi_scan_done_t   s_scan_done_cb;
 static void                  *s_scan_done_ctx;
 static char                   s_scan_results[APP_WIFI_SCAN_MAX_RESULTS][33];
 static size_t                 s_scan_result_count;
+
+// Called from the wifi event task once a scan completes. If we've actually
+// given up on the configured network (FAILED) and a saved SSID is in range,
+// stage a switch for reconnect_task to run. MRU order is implicit in the
+// saved list (most-recent first), so the first saved-and-in-scan match wins.
+//
+// Restricted to FAILED (not CONNECTING) deliberately: a user-initiated scan
+// from the wcfg picker would otherwise race with a still-running connect/
+// retry cycle, and the resulting esp_wifi_disconnect+set_config could land
+// while a follow-up scan_start was about to dispatch -- which returns
+// ESP_ERR_WIFI_STATE and leaves the popup's "Scan" button stuck at
+// "Scanning...". CONNECTING means the radio still has a plan; let it run.
+static void maybe_switch_saved_network(void)
+{
+    if (s_state != APP_WIFI_STATE_FAILED) return;
+    if (s_saved_switch_pending) return;  // one in flight already
+
+    const char *current = app_config_wifi_ssid();
+    char ssid[APP_CONFIG_SSID_MAX];
+    char pass[APP_CONFIG_PASS_MAX];
+    size_t saved_n = app_config_wifi_saved_count();
+    for (size_t i = 0; i < saved_n; ++i) {
+        if (!app_config_wifi_saved_get(i, ssid, sizeof(ssid),
+                                       pass, sizeof(pass))) continue;
+
+        bool in_scan = false;
+        for (size_t j = 0; j < s_scan_result_count; ++j) {
+            if (strcmp(s_scan_results[j], ssid) == 0) { in_scan = true; break; }
+        }
+        if (!in_scan) continue;
+
+        if (strcmp(current, ssid) == 0) return;  // current is the priority pick
+
+        // First saved-and-in-range match that isn't current -> switch.
+        snprintf(s_saved_switch_ssid, sizeof(s_saved_switch_ssid), "%s", ssid);
+        snprintf(s_saved_switch_pass, sizeof(s_saved_switch_pass), "%s", pass);
+        s_saved_switch_pending = true;
+        if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
+        return;
+    }
+}
 
 static void on_scan_done(void)
 {
@@ -404,6 +540,11 @@ static void on_scan_done(void)
     }
     ESP_LOGI(TAG, "scan done: %u SSIDs", (unsigned) s_scan_result_count);
     s_scan_in_progress = false;
+    // Auto-switch logic runs before the UI cb so a still-disconnected wifi
+    // panel doesn't show a stale saved-network selection. No-op when
+    // currently CONNECTED -- the user's working connection is never broken
+    // automatically.
+    maybe_switch_saved_network();
     if (s_scan_done_cb) s_scan_done_cb(s_scan_done_ctx);
 }
 

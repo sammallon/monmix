@@ -104,6 +104,12 @@ CONFIG_LV_USE_CLIB_SPRINTF=y
 # (~1.2 MB at 1024×600 RGB565) which is freed after the b64 stream.
 CONFIG_LV_USE_SNAPSHOT=y
 
+# Montserrat 48 backs the large icon glyph on the console-offline screen
+# (LV_SYMBOL_POWER over LV_SYMBOL_AUDIO). ~25 KB of flash for a font that
+# carries the symbol range; without it the offline page reads as 14 pt and
+# doesn't communicate at a glance from a few feet away.
+CONFIG_LV_FONT_MONTSERRAT_48=y
+
 # Bump console UART to 921600 — at 115200 a full-screen screenshot takes
 # ~140 s to base64-stream off-device, which kills the dev-loop. 921600 is
 # rock-solid on the CH340K bridge and brings it to ~18 s (or ~2 s with

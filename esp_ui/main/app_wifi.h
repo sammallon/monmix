@@ -45,6 +45,11 @@ app_wifi_state_t app_wifi_get_state(void);
 const char      *app_wifi_get_ssid(void);
 void             app_wifi_format_ip(char *buf, size_t buflen);
 
+// Human-readable security mode of the current association (e.g. "Open",
+// "WPA2-PSK", "WPA2/WPA3-PSK"). Returns "—" when not connected. Polls
+// esp_wifi_sta_get_ap_info on demand; cheap.
+const char      *app_wifi_get_security_str(void);
+
 // Subscribe to state changes (transitions between the enum values above).
 // Each callback fires from the WiFi/IP event task — keep it short, defer
 // LVGL work via lv_async_call.

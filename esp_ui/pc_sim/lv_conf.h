@@ -61,6 +61,7 @@
 #define LV_FONT_MONTSERRAT_24   1
 #define LV_FONT_MONTSERRAT_28   1
 #define LV_FONT_MONTSERRAT_32   1
+#define LV_FONT_MONTSERRAT_48   1
 
 // Themes — dark default (matches device), keep simple too in case prefs
 // flip at runtime.

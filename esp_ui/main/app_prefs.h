@@ -120,6 +120,13 @@ void        app_prefs_set_display_tz     (const char *s);
 bool app_prefs_get_ntp_use_dhcp(void);
 void app_prefs_set_ntp_use_dhcp(bool on);
 
+// When true (default), DHCP-supplied DNS is used and the manual
+// wifi_static_dns value is only the fallback when DHCP didn't supply one.
+// When false, the manual DNS overrides DHCP. Applies in both DHCP and
+// static-IP modes. Default true.
+bool app_prefs_get_dns_use_dhcp(void);
+void app_prefs_set_dns_use_dhcp(bool on);
+
 // Subscribe to pref changes -- typically the UI registers once at init
 // time and re-reads whatever it cares about on each notification.
 void app_prefs_register_on_change(app_prefs_on_change_t cb, void *ctx);
