@@ -1160,6 +1160,19 @@ static void osc_resubscribe       (void)        {
     g.prime_idx = 0;
 }
 static void osc_reconnect         (void)        {
+    // Pick up any host/port change made via the MS-config save path. The
+    // worker keeps the cached g.udp_host / g.info_url so without this
+    // recompose a host-change reconnect targets the OLD host. On a same-
+    // host reconnect (network blip) compose_urls is a no-op rewrite of
+    // the same strings. When the host actually changed, drop info_fetched
+    // so the next /console/information GET re-runs against the new host.
+    char prev_host[sizeof(g.udp_host)];
+    memcpy(prev_host, g.udp_host, sizeof(prev_host));
+    int  prev_port = g.udp_port;
+    compose_urls();
+    if (strcmp(prev_host, g.udp_host) != 0 || prev_port != g.udp_port) {
+        g.info_fetched = false;
+    }
     udp_pcb_down();
     // PCB will come back up on the next loop iteration via udp_pcb_up.
 }

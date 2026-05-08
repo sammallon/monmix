@@ -1,6 +1,7 @@
 #include "app_ui.h"
 #include "app_display.h"
 #include "app_logd.h"
+#include "app_ms_setup.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_time.h"
@@ -4600,10 +4601,17 @@ static void on_mcfg_save(lv_event_t *e)
     lv_label_set_text(s_mcfg_status_label,
                       "#40C060 Saved. Reconnecting to MS...#");
 
+    // Drop the boot-setup gate so the next CONNECTED transition re-primes
+    // strip names + routability + mix routing against the new host. If MS
+    // was unreachable at boot the gate is already false and this is a
+    // no-op; if MS came good against the old host the gate latched true
+    // and would otherwise short-circuit the retry.
+    app_ms_setup_reset();
+
     // Live-apply for host/port/osc-port within the same protocol. The
-    // active client recomposes URLs from app_config_* on its next
-    // reconnect cycle -- the iface's reconnect() closes the current
-    // connection and the worker re-opens with whatever NVS now returns.
+    // iface's reconnect() recomposes URLs from app_config_* and drains
+    // the current connection so the worker reopens against the new
+    // target on its next poll cycle.
     if (s_ms && s_ms->reconnect) s_ms->reconnect();
 }
 
