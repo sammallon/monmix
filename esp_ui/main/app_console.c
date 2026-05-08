@@ -892,6 +892,56 @@ static int cmd_ws_status(int argc, char **argv)
     return 0;
 }
 
+// `chpick-save <id1,id2,...>` -- mirror pc_sim's chpick_save script command.
+// Drives app_ui_chpick_apply directly so the chpick_live_apply regression
+// can run on hw without coordinating with the picker's checkbox grid.
+// Comma-separated id list, capped at APP_UI_MAX_TRACKED_CHANNELS.
+static int cmd_chpick_save(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("usage: chpick-save <id1,id2,...>\n");
+        return 1;
+    }
+    int ids[APP_UI_MAX_TRACKED_CHANNELS];
+    int  n   = 0;
+    char *p  = argv[1];
+    while (*p && n < (int)(sizeof(ids)/sizeof(ids[0]))) {
+        int v;
+        int consumed = 0;
+        if (sscanf(p, "%d%n", &v, &consumed) == 1 && consumed > 0) {
+            ids[n++] = v;
+            p += consumed;
+            if (*p == ',') ++p;
+        } else {
+            break;
+        }
+    }
+    if (!lvgl_port_lock(1000)) {
+        printf("chpick-save: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_chpick_apply(ids, (size_t) n);
+    lvgl_port_unlock();
+    printf("OK chpick_save n=%d\n", n);
+    return 0;
+}
+
+// `dump-tiles` -- mirror pc_sim's dump_tiles script command. Settings overlay
+// must already be open (the test taps the gear icon + waits before issuing
+// this). Holds lvgl_port_lock for the dump.
+static int cmd_dump_tiles(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    if (!lvgl_port_lock(1000)) {
+        printf("dump-tiles: lvgl_port_lock failed\n");
+        return 1;
+    }
+    app_ui_settings_dump_tiles();
+    lvgl_port_unlock();
+    printf("OK dump_tiles\n");
+    return 0;
+}
+
 // Drive the MS-config Save path from the REPL. Used by the names-on-
 // reconfigure regression test (tests/sim/test_ms_host_change_names.py)
 // in its hw lane: the test toggles the MS host to a bogus value, waits
@@ -1003,6 +1053,8 @@ void app_console_init(void)
         { .command = "ws-status",    .help = "print MS client state + endpoint",              .func = cmd_ws_status    },
         { .command = "set-bright",   .help = "<0..100> -- set LCD backlight % (default 80)",  .func = cmd_set_bright   },
         { .command = "mcfg-apply",   .help = "<host> <port> -- drive MS-config Save (test hook)", .func = cmd_mcfg_apply   },
+        { .command = "chpick-save",  .help = "<id1,id2,...> -- drive picker live-apply (test hook)", .func = cmd_chpick_save },
+        { .command = "dump-tiles",   .help = "dump settings-overlay tile coords (overlay must be open)", .func = cmd_dump_tiles  },
         { .command = "pre-flash",    .help = "graceful MS shutdown + print READY-TO-FLASH",   .func = cmd_pre_flash    },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); ++i) {

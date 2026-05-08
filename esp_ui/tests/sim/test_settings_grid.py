@@ -82,8 +82,36 @@ TEST = {
             "settings_tile i=1 x=250",
         ],
     },
-    # The dump_tiles hook is sim-only; the device has no equivalent
-    # console command, and the bug is a pure-layout regression that
-    # the sim catches reliably.
-    "hw_compatible": False,
+    # Hardware variant: dump-tiles REPL command exposes the same hook on
+    # device. The hw script taps the gear icon to open the overlay, waits,
+    # dumps tiles, then taps it again to close (visual cleanup -- not
+    # required for the assertions). Same column-major / swatch-on-left
+    # invariants apply.
+    "hw_compatible": True,
+    "hw_script": (
+        "sleep 2000\n"
+        f"tap {GEAR_X} {GEAR_Y}\n"
+        "sleep 800\n"
+        "dump_tiles\n"
+        "sleep 200\n"
+    ),
+    "hw_expect": {
+        "exit_code": 0,
+        "stdout_contains": [
+            "OK dump_tiles",
+            "settings_tile i=0 x=0 y=0",
+            "settings_tile i=1 x=0",
+            "settings_tile i=2 x=0",
+            "settings_tile i=3 x=0",
+            "settings_tile i=4 x=0",
+            "settings_tile i=5 x=0",
+            "swatch_x=0",
+        ],
+        "stdout_not_contains": [
+            "LV_ASSERT",
+            "panic",
+            "abort",
+            "settings_tile i=1 x=250",
+        ],
+    },
 }

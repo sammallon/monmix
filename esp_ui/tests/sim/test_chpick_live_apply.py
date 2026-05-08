@@ -106,9 +106,25 @@ TEST = {
             "abort",
         ],
     },
-    # Hardware variant: same shape but driven through the REPL would
-    # need a chpick-save console command on the device which doesn't
-    # exist. Sim coverage is sufficient -- the firmware path is the
-    # same code (chpick_apply_async).
-    "hw_compatible": False,
+    # Hardware variant: chpick-save REPL command drives app_ui_chpick_apply
+    # the same way pc_sim does. Mock-MS-only assertions (ms_real: ...) get
+    # filtered out via hw_expect. The chpick log lines come from firmware
+    # ESP_LOGI so they appear in the REPL stream identically.
+    "hw_compatible": True,
+    "hw_expect": {
+        "stdout_contains": [
+            "chpick: live-apply start (current=8)",
+            "chpick: live-apply done (now=4)",
+            "OK chpick_save n=4",
+            "chpick: live-apply start (current=4)",
+            "chpick: live-apply done (now=8)",
+            "OK chpick_save n=8",
+        ],
+        "stdout_not_contains": [
+            "Rebooting...",
+            "LV_ASSERT",
+            "panic",
+            "abort",
+        ],
+    },
 }
