@@ -30,6 +30,22 @@ LIVE_ARGS = (
     ["--ms-host", MS_HOST, "--ms-port", MS_PORT] if MS_HOST else []
 )
 
+# When MS is reachable, demand empirical evidence the post-save
+# subscribe targets the NEW id list. Without MS the mock client doesn't
+# emit ms_real: lines; the chpick: log lines alone prove the lifecycle.
+EXTRA_CONTAINS = (
+    [
+        # WS lifecycle visible across saves.
+        "ms_real: WS open",
+        "ms_real: WS closed",
+        # After the first save, broadcasts arrive for ch.9 -- which
+        # wasn't in the default {0..7} set. Empirical proof that the
+        # post-save subscribe sweep targets the NEW id list.
+        "ms_real: lvl ch=9",
+    ]
+    if MS_HOST else []
+)
+
 # Default seed has 8 ids {0..7}. Swap to 4 different ids, then back
 # to 8 -- different counts on each transition so the chpick log lines
 # carry distinct (current=N now=M) pairs.
@@ -80,7 +96,7 @@ TEST = {
             # Post-save markers reached without abort.
             "OK echo POST_SAVE_1",
             "OK echo POST_SAVE_2",
-        ],
+        ] + EXTRA_CONTAINS,
         # Critical: the live-apply path doesn't reboot the device, the
         # rebuild doesn't trigger an LVGL invariant, and nothing panics.
         "stdout_not_contains": [
