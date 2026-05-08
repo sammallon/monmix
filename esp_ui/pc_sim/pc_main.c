@@ -22,6 +22,7 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include <SDL_syswm.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -309,6 +310,12 @@ int main(int argc, char **argv) {
     }
     if (do_throttle) throttle_apply();
 
+    // Suppress focus-stealing on every internal SDL_RaiseWindow. Helps
+    // interactive runs too -- without this hint the window grabs focus on
+    // each event-loop pump and steals keyboard focus from whatever the
+    // user is typing into.
+    SDL_SetHint(SDL_HINT_FORCE_RAISEWINDOW, "0");
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -323,7 +330,22 @@ int main(int argc, char **argv) {
     // Headless: hide the SDL window after creation so scripted runs don't
     // pop a window onto the user's screen. Rendering still happens to the
     // off-screen renderer, so screenshot commands work normally.
+    //
+    // On Windows, lv_sdl_window_create shows + raises the window before we
+    // get a chance to call SDL_HideWindow, so for a moment the window
+    // appears and grabs focus from whatever the user is typing into. Set
+    // WS_EX_NOACTIVATE so the OS won't activate the window even on that
+    // brief flash, then hide it permanently.
     if (headless && g_sdl_window) {
+#ifdef _WIN32
+        SDL_SysWMinfo wmi;
+        SDL_VERSION(&wmi.version);
+        if (SDL_GetWindowWMInfo(g_sdl_window, &wmi)) {
+            HWND hwnd = wmi.info.win.window;
+            LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+        }
+#endif
         SDL_HideWindow(g_sdl_window);
     }
 
