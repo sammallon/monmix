@@ -3955,9 +3955,12 @@ static void on_mcfg_textarea_focused(lv_event_t *e)
         // which already includes '.').
         bool port_only = (ta == s_mcfg_port_ta || ta == s_mcfg_osc_port_ta);
         lv_keyboard_set_textarea(s_mcfg_keyboard, ta);
+        // USER_1 holds the host's single-screen alphanum layout (see
+        // build_mcfg_overlay). Don't use TEXT_LOWER here -- that's the
+        // shared LVGL default and used by the wifi-config keyboard.
         lv_keyboard_set_mode(s_mcfg_keyboard,
                              port_only ? LV_KEYBOARD_MODE_NUMBER
-                                       : LV_KEYBOARD_MODE_TEXT_LOWER);
+                                       : LV_KEYBOARD_MODE_USER_1);
         lv_obj_remove_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
         // Keyboard is a sibling of the overlay; promote to foreground so it
         // isn't drawn behind the overlay.
@@ -4230,9 +4233,13 @@ static void build_mcfg_overlay(void)
     lv_obj_align(s_mcfg_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(s_mcfg_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_mcfg_keyboard, on_mcfg_keyboard_event, LV_EVENT_ALL, NULL);
-    // Override TEXT_LOWER with a single-screen alpha+digits+'.' layout for
-    // the host field. Other modes (NUMBER for ports) keep LVGL defaults.
-    lv_keyboard_set_map(s_mcfg_keyboard, LV_KEYBOARD_MODE_TEXT_LOWER,
+    // Bind the single-screen alpha+digits+'.' layout to USER_1 rather than
+    // overriding TEXT_LOWER. lv_keyboard_set_map mutates a global kb_map
+    // table, so overriding TEXT_LOWER here also stripped the "ABC"/"1#"
+    // mode-switch buttons from the wifi-config keyboard, leaving WPA passwords
+    // with special characters or capitals untypeable. USER_1 is private to
+    // this keyboard.
+    lv_keyboard_set_map(s_mcfg_keyboard, LV_KEYBOARD_MODE_USER_1,
                         mcfg_alphanum_map, mcfg_alphanum_ctrl);
 }
 
