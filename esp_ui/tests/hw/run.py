@@ -82,6 +82,11 @@ def translate(script, test_name):
             steps.append(f"cmd:level-format {parts[1]}")
         elif op == "set_mix":
             steps.append(f"cmd:set-mix {parts[1]}")
+        elif op.startswith("cmd:"):
+            # Already in hw form (e.g. from a test's hw_script). Pass through
+            # verbatim so hw-only tests can target REPL commands that don't
+            # have a sim-side translation.
+            steps.append(line)
         elif op in ("quit", "echo", "press", "release", "move"):
             # quit: REPL session naturally ends when run_steps.py finishes.
             # echo: no on-device equivalent, drop.
@@ -101,7 +106,11 @@ def run_one(test, port):
     out_dir = ARTIFACTS / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    steps = translate(test["script"], name)
+    # `hw_script`, if present, overrides `script` for the hw lane. Lets a
+    # hw-only test (e.g. one that exercises REPL commands with no sim
+    # equivalent) define a clean script without the sim path having to
+    # carry filler ops.
+    steps = translate(test.get("hw_script", test["script"]), name)
     if not steps:
         return False, "translation produced no steps"
 

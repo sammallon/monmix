@@ -159,7 +159,12 @@ def main():
             elif step.startswith("shot:"):
                 screenshot(ser, step[5:])
             elif step.startswith("cmd:"):
-                send_and_drain(ser, step[4:], idle_grace=0.4, max_wait=8)
+                # Echo the captured serial output so test runners (and humans
+                # debugging by hand) can see ESP_LOG lines fired during the
+                # command. decode("replace") handles non-UTF-8 bytes that
+                # appear when WS broadcasts interleave with the prompt.
+                raw = send_and_drain(ser, step[4:], idle_grace=0.4, max_wait=8)
+                print(raw.decode("utf-8", "replace"), end="", flush=True)
             elif step.startswith("wait:"):
                 ms = int(step[5:])
                 time.sleep(ms / 1000.0)
