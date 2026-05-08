@@ -2412,10 +2412,12 @@ static void build_settings_overlay(void)
     // Section: Channels — 4 columns x 6 rows. The bottom-right slot is
     // permanently the master strip's tile (always reachable regardless
     // of how many input channels are tracked). The remaining 23 slots
-    // fill row-major from top-left with channel tiles. Tile geometry is
-    // a bit taller than before so name + swatch breathe in the larger
-    // cell; LV_LABEL_LONG_DOT truncates with "..." when the name doesn't
-    // fit.
+    // hold channel tiles. Tile geometry is a bit taller than before so
+    // name + swatch breathe in the larger cell; LV_LABEL_LONG_DOT
+    // truncates with "..." when the name doesn't fit.
+    //
+    // Column-major iteration: fill column 0 top-to-bottom, then column 1,
+    // then column 2. Reads more naturally for a list of channel slots.
     lv_obj_t *col_label = lv_label_create(ov);
     lv_label_set_text(col_label, "Channels");
     lv_obj_align(col_label, LV_ALIGN_TOP_LEFT, 0, 272);
@@ -2459,8 +2461,8 @@ static void build_settings_overlay(void)
     if (total > MAX_TILES) total = MAX_TILES;
 
     for (size_t i = 0; i < total; ++i) {
-        int col = (int)(i % grid_cols);
-        int row = (int)(i / grid_cols);
+        int col = (int)(i / grid_rows);
+        int row = (int)(i % grid_rows);
         int x = col * (tile_w + col_gap);
         int y = row * (tile_h + row_gap);
 
