@@ -78,12 +78,14 @@ static void silence_windows_crash_popups(void) {
 
 #include "app_config.h"
 #include "app_ms_client.h"
+#include "app_power.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_storage.h"
 #include "app_ui.h"
 
 #include "app_display.h"
+#include "app_wifi.h"
 #include "esp_lvgl_port.h"
 #include "ms_client_real.h"
 #include "throttle.h"
@@ -244,6 +246,61 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
                 app_prefs_set_selected_mix_index((uint8_t) x);
             }
             printf("OK set_mix %d\n", x);
+        } else if (strcmp(cmd, "power_phase") == 0) {
+            // Emit current M7 phase + effective timeout so test scripts
+            // can grep for transitions instead of inferring from
+            // screenshots.
+            const char *names[] = {
+                "AWAKE", "WARNING", "SLEEP", "WAKE_MENU"
+            };
+            app_power_phase_t ph = app_power_get_phase();
+            const char *n = (ph >= 0 && (size_t)ph < sizeof(names)/sizeof(names[0]))
+                                ? names[ph] : "?";
+            printf("OK power_phase=%s eff_to_ms=%u\n",
+                   n, (unsigned) app_power_get_effective_timeout_ms());
+        } else if (strcmp(cmd, "power_kick") == 0) {
+            app_power_kick();
+            printf("OK power_kick\n");
+        } else if (strcmp(cmd, "power_force_sleep") == 0) {
+            app_power_force_sleep();
+            printf("OK power_force_sleep\n");
+        } else if (sscanf(cmd, "power_set_user_timeout_ms %d", &x) == 1) {
+            app_power_set_user_timeout_ms((uint32_t) x);
+            printf("OK power_set_user_timeout_ms %d\n", x);
+        } else if (sscanf(cmd, "chan_id %d", &x) == 1) {
+            // Print the MS channel id at app_state slot x. Used by
+            // drag-to-reorder tests so they can assert the swap
+            // landed without a screenshot.
+            int id = app_state_id_for_idx((size_t) x);
+            printf("OK chan_id idx=%d ms_id=%d\n", x, id);
+        } else if (sscanf(cmd, "prefs_get_color %d", &x) == 1) {
+            // Print the saved color-palette index for MS channel id x.
+            // Used by master-color tests to verify on_picker_choice
+            // wrote through to app_prefs (per-mix-bus, since master id
+            // = mix_offset + mix_idx).
+            int color = app_prefs_get_channel_color(x);
+            printf("OK prefs_get_color id=%d color=%d\n", x, color);
+        } else if (sscanf(cmd, "master_state %1023[^\n]", text) == 1
+                   && strcmp(text, "get") == 0) {
+            // Print the master strip's MS channel id + current name.
+            // Drives the master-rename + master-color tests.
+            app_channel_t m;
+            if (app_state_master_get(&m)) {
+                printf("OK master_state id=%d name=\"%s\"\n", m.id, m.name);
+            } else {
+                printf("ERR master_state: get failed\n");
+            }
+        } else if (sscanf(cmd, "power_degraded %15s", text) == 1) {
+            // Flip the mock wifi state to drive M7's degraded-cap
+            // path. The corresponding observer fires, M7's tick_cb
+            // recomputes effective_timeout, and the user gets the
+            // 60 s scaled cap instead of the chosen duration.
+            extern void mock_app_wifi_set_state(app_wifi_state_t);
+            app_wifi_state_t s = (strcmp(text, "on") == 0)
+                                     ? APP_WIFI_STATE_FAILED
+                                     : APP_WIFI_STATE_CONNECTED;
+            mock_app_wifi_set_state(s);
+            printf("OK power_degraded %s\n", text);
         } else if (strcmp(cmd, "quit") == 0) {
             printf("OK quit\n");
             return 1;
@@ -264,6 +321,10 @@ int main(int argc, char **argv) {
     const char *protocol    = NULL;       // "ws" | "osc"; NULL -> follow app_config
     bool        do_throttle = false;
     bool        headless    = false;
+    // M7 power-save time scale. Default 1/1 (real time); tests pass
+    // --power-scale N to make 1 h equal (3600/N) s -- e.g. N=120 makes
+    // 1 h = 30 s, the 30 s warn = 250 ms.
+    int         power_scale_den = 1;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--script") && i + 1 < argc) {
             script_path = argv[++i];
@@ -279,6 +340,9 @@ int main(int argc, char **argv) {
             do_throttle = true;
         } else if (!strcmp(argv[i], "--headless")) {
             headless = true;
+        } else if (!strcmp(argv[i], "--power-scale") && i + 1 < argc) {
+            power_scale_den = atoi(argv[++i]);
+            if (power_scale_den <= 0) power_scale_den = 1;
         }
     }
     if (do_throttle) throttle_apply();
@@ -343,6 +407,11 @@ int main(int argc, char **argv) {
     }
     g_ms = ms;
     app_ui_init(ms);
+    // M7 power save -- apply scale BEFORE init so the first tick honours
+    // the requested timeout. With --power-scale 120, 1 h becomes 30 s
+    // and the 30 s warn becomes 250 ms.
+    app_power_set_time_scale(1, (uint32_t) power_scale_den);
+    app_power_init(ms);
     app_ui_set_channel_total(80);
     app_ui_set_mix_count(14);
     if (!ms_host) {
