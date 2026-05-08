@@ -60,9 +60,26 @@ TEST = {
             "ms_real: connection error",
         ],
     },
-    # Hardware: not directly applicable -- the firmware-side equivalent
-    # is the `pre-flash` REPL command (which prints READY-TO-FLASH after
-    # running shutdown_graceful). That's covered by the REPL handshake
-    # the user wires into their flash workflow separately.
-    "hw_compatible": False,
+    # Hardware: drive the same shutdown via `cmd:pre-flash`, which calls
+    # ms->shutdown_graceful() and prints READY-TO-FLASH. The firmware logs
+    # "graceful shutdown: queuing unsubscribes" + "ws closed" via ESP_LOGI
+    # in the same path the sim asserts on. Doesn't reset the device --
+    # idf.py's DTR/RTS pulse handles the reboot at next flash.
+    "hw_compatible": True,
+    "hw_script": (
+        "sleep 4000\n"
+        "cmd:pre-flash\n"
+        "sleep 1500\n"
+    ),
+    "hw_expect": {
+        "stdout_contains": [
+            "graceful shutdown: queuing unsubscribes",
+            "READY-TO-FLASH",
+        ],
+        "stdout_not_contains": [
+            "LV_ASSERT",
+            "panic",
+            "abort",
+        ],
+    },
 }
