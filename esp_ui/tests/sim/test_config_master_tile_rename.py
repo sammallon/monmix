@@ -10,20 +10,21 @@ TEST = {
     "name": "config_master_tile_rename",
     "description": "Tapping master tile name + Save writes cfg.name for master id.",
     "args": [],
-    # Layout (column-major + swatch-on-left after fix-settings-grid):
-    #   overlay pad 16, list pos (0, 296), list pad 6 -> list content (22, 318)
-    #   tile_w=239, tile_h=42, col_gap=8, row_gap=4, swatch_sz=28
-    # Master tile [3][5] (col=3, row=5): list-content (741, 230)
-    #   -> screen (763, 548)-(1002, 590); inner mid-y = 569
-    # Inside tile (pad 6): swatch LEFT_MID at offset (0,0) screen (783, 569);
-    #   name LEFT_MID at offset (swatch_sz+8, 0) -> name x_left = 805,
-    #   width 187 -> name center ~ (898, 569).
+    # Layout (after the 2026-05-09 list-shrink for bottom-row touch margin):
+    #   overlay pad 16, list pos (0, 296) -> list screen (16, 312)
+    #   list pad 6, tile_w=239, tile_h=36, col_gap=8, row_gap=4, swatch_sz=28
+    #   tile pad 4 (was 6, reduced so swatch fits at smaller tile_h)
+    # Master tile [col=3, row=5]: list-content (741, 200)
+    #   -> screen (763, 518)-(1002, 554); inner mid-y = 536
+    # Inside tile (pad 4): swatch LEFT_MID at offset (0,0); name LEFT_MID
+    #   with offset (swatch_sz+8, 0) -> name x_left = 763+4+28+8 = 803,
+    #   width 199 -> name center x ~ 902.
     # Rename popup Save: TOP_RIGHT 110x36 inside popup with pad 12 ->
     #   rect (902, 12)-(1012, 48), tap (957, 30).
     "script": (
         "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
-        "tap 898 569\n"           # master tile name -> rename popup
+        "tap 900 536\n"           # master tile name -> rename popup
         "sleep 300\n"
         "tap 957 30\n"            # Save -- prefilled "Mix 1" carries
         "sleep 200\n"
@@ -54,7 +55,7 @@ TEST = {
         "sleep 3500\n"
         "tap 1002 16\n"          # gear -> settings overlay
         "sleep 1500\n"           # overlay build (matches settings_grid)
-        "tap 898 569\n"          # master tile name -> rename popup
+        "tap 900 536\n"          # master tile name -> rename popup
         "sleep 600\n"
         "tap 957 30\n"           # Save -- prefilled name carries
         "sleep 800\n"            # popup closes + MS round-trip

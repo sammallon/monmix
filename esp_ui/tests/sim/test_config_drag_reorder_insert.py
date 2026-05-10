@@ -28,11 +28,9 @@ TEST = {
     "name": "config_drag_reorder_insert",
     "description": "Drag from row 0 to row 4 inserts (shifts intermediate tiles by 1).",
     "args": [],
-    # Tile geometry (from the existing config_drag_reorder test):
-    # tile_w=239, tile_h=42, col_gap=8, row_gap=4, list at (16, 312)
-    # with pad 6 -> first tile content at (22, 318). Column 0 rows
-    # 0..5 mid-y values: 339, 385, 431, 477, 523, 569.
-    # name label x range with swatch-on-left: 64..251.
+    # Tile geometry (after the 2026-05-09 list-shrink for bottom-row
+    # touch margin): list at (16, 312), list pad 6, tile_h=36, gap=4.
+    # Row mid-y values (col 0): 336, 376, 416, 456, 496, 536.
     "script": (
         "echo before-drag\n"
         "chan_id 0\n"
@@ -43,12 +41,12 @@ TEST = {
         "chan_id 5\n"
         "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
-        "press 100 339\n"         # press tile [0]'s name (col 0, row 0)
+        "press 100 336\n"         # press tile [0]'s name (col 0, row 0)
         "sleep 600\n"             # > LVGL's 400 ms long-press default
         # One large move directly to row 4 mid-y. The pressing event
         # hits tile [4] in a single shot, so the multi-step shift
         # path inside on_tile_pressing has to handle |i-cur|=4.
-        "move 100 523\n"          # drag onto tile [4] (col 0, row 4)
+        "move 100 496\n"          # drag onto tile [4] (col 0, row 4)
         "sleep 200\n"
         "release\n"
         "sleep 500\n"
@@ -100,9 +98,9 @@ TEST = {
         "chan_id 4\n"
         "tap 1002 16\n"
         "sleep 1500\n"
-        "press 100 339\n"
+        "press 100 336\n"
         "sleep 600\n"
-        "move 100 523\n"
+        "move 100 496\n"
         "sleep 200\n"
         "release\n"
         "sleep 800\n"

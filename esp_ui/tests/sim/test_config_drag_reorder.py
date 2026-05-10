@@ -12,24 +12,21 @@ TEST = {
     "name": "config_drag_reorder",
     "description": "Long-press + drag tile A onto tile B swaps channel order.",
     "args": [],
-    # 4-col x 6-row grid (column-major) inside overlay pad 16. List screen
-    # pos: (16, 312); list pad 6 -> list content (22, 318).
-    # tile_w=239, tile_h=42, col_gap=8, row_gap=4.
-    # Tile [0] (col=0, row=0): screen (22, 318)-(261, 360); inner mid-y 339.
-    # Tile [1] (col=0, row=1): screen (22, 364)-(261, 406); inner mid-y 385.
-    # With swatch-on-left, name label is at LEFT_MID with offset
-    # (swatch_sz+8, 0) = (36, 0); name x_left = inner_x + 36 = 64.
-    # Press at x=100 (inside name rect 64..251) hits tile [0]'s name.
-    # Move to (100, 385) puts the pointer over tile [1]'s bounds.
+    # Tile geometry (after the 2026-05-09 list-shrink for bottom-row
+    # touch margin): list at (16, 312) on screen, list pad 6 -> first
+    # tile at (22, 318). tile_h=36, row_gap=4 -> row pitch 40.
+    # Tile [0] (col=0, row=0): screen y 318..354; inner mid-y 336.
+    # Tile [1] (col=0, row=1): screen y 358..394; inner mid-y 376.
+    # name x_left = 64 (swatch on left), name center ~ 100.
     "script": (
         "echo before-drag\n"
         "chan_id 0\n"
         "chan_id 1\n"
         "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
-        "press 100 339\n"         # press on tile [0]'s name (col 0, row 0)
+        "press 100 336\n"         # press on tile [0]'s name (col 0, row 0)
         "sleep 600\n"             # > LVGL's 400 ms long-press default
-        "move 100 385\n"          # drag down onto tile [1] (col 0, row 1)
+        "move 100 376\n"          # drag down onto tile [1] (col 0, row 1)
         "sleep 200\n"
         "release\n"
         "sleep 500\n"             # let async rebuild settle
@@ -66,9 +63,9 @@ TEST = {
         "chan_id 1\n"
         "tap 1002 16\n"          # gear -> settings overlay
         "sleep 1500\n"           # overlay build
-        "press 100 339\n"        # press tile [0]'s name
+        "press 100 336\n"        # press tile [0]'s name
         "sleep 600\n"            # > 400 ms long-press threshold
-        "move 100 385\n"         # drag onto tile [1] (col 0, row 1)
+        "move 100 376\n"         # drag onto tile [1] (col 0, row 1)
         "sleep 200\n"
         "release\n"              # commits + queues async rebuild
         "sleep 800\n"            # async rebuild + repaint

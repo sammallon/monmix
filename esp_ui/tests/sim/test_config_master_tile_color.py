@@ -8,10 +8,10 @@ TEST = {
     "name": "config_master_tile_color",
     "description": "Tap master tile swatch + pick red; pref persists for master id.",
     "args": [],
-    # Layout (column-major + swatch-on-left after fix-settings-grid):
-    #   master tile [3][5]: screen (763, 548)-(1002, 590), inner mid-y 569
-    #   swatch LEFT_MID, sz 28 inside tile pad 6 -> screen (769, 555)-(797, 583)
-    #   tap (783, 569) hits.
+    # Layout (after the 2026-05-09 list-shrink for bottom-row touch margin):
+    #   master tile [3][5]: screen (763, 518)-(1002, 554), inner mid-y 536
+    #   swatch LEFT_MID, sz 28 inside tile pad 4 -> screen (767, 522)-(795, 550)
+    #   tap (781, 536) hits.
     # Color picker (300x340, centered on 1024x600): popup at
     # (362, 130)-(662, 470), pad 20 -> content (382, 150).
     # Button 0 (red): pos (0, 40) -> screen rect (382, 190)-(462, 270).
@@ -21,7 +21,7 @@ TEST = {
         "prefs_get_color 60\n"
         "tap 1002 16\n"          # gear -> settings overlay
         "sleep 200\n"
-        "tap 783 569\n"          # master swatch -> color picker
+        "tap 781 536\n"          # master swatch -> color picker
         "sleep 300\n"
         "tap 422 230\n"          # red (palette index 0)
         "sleep 200\n"
@@ -53,7 +53,7 @@ TEST = {
         "cmd:master-state\n"     # capture id pre-pick (any color OK)
         "tap 1002 16\n"          # gear -> settings overlay
         "sleep 1500\n"
-        "tap 783 569\n"          # master swatch -> color picker
+        "tap 781 536\n"          # master swatch -> color picker
         "sleep 600\n"
         "tap 422 230\n"          # red (palette index 0)
         "sleep 400\n"

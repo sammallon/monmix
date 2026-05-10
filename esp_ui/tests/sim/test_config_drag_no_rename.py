@@ -23,9 +23,9 @@ TEST = {
         # Long-press + drag + release. Whether LVGL fires CLICKED
         # on release depends on drag distance vs scroll threshold;
         # the suppression flag handles both cases.
-        "press 100 339\n"
+        "press 100 336\n"
         "sleep 600\n"             # > 400 ms long-press threshold
-        "move 100 385\n"
+        "move 100 376\n"
         "sleep 200\n"
         "release\n"
         "sleep 300\n"
@@ -55,9 +55,9 @@ TEST = {
         "sleep 3500\n"
         "tap 1002 16\n"
         "sleep 1500\n"
-        "press 100 339\n"
+        "press 100 336\n"
         "sleep 600\n"
-        "move 100 385\n"
+        "move 100 376\n"
         "sleep 200\n"
         "release\n"
         "sleep 800\n"

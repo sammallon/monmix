@@ -2531,10 +2531,13 @@ static void build_settings_overlay(void)
 
     lv_obj_t *list = lv_obj_create(ov);
     const int list_w = SCREEN_W - 32;
-    // Shrunk from SCREEN_H-316 because tile_h=42 + master tile + screen
-    // margin spilled the bottom row off the panel; SCREEN_H-328 drops
-    // tile_h to ~40 which keeps all six rows + master comfortably inside.
-    const int list_h = SCREEN_H - 328;
+    // List bottom needs ~46 px of margin to the screen edge so the
+    // bottom-row tiles have a touch zone the GT911 can register
+    // cleanly + room for finger drift during a drag-to-reorder. With
+    // overlay pad 16 + list pad 4 the previous SCREEN_H-328 left only
+    // 22 px of margin, which the pilot called out as "bottom row hard
+    // to drag and drop". SCREEN_H-352 gives 46 px instead.
+    const int list_h = SCREEN_H - 352;
     lv_obj_set_size(list, list_w, list_h);
     lv_obj_set_pos(list, 0, 296);
     lv_obj_set_style_pad_all(list, 6, 0);
@@ -2565,7 +2568,9 @@ static void build_settings_overlay(void)
         lv_obj_set_size(tile, tile_w, tile_h);
         lv_obj_set_pos(tile, x, y);
         lv_obj_set_style_radius(tile, 4, 0);
-        lv_obj_set_style_pad_all(tile, 6, 0);
+        // Pad reduced from 6 to 4 so the 28 px swatch still fits at
+        // the smaller tile_h=36 (was 40); see list_h comment above.
+        lv_obj_set_style_pad_all(tile, 4, 0);
         lv_obj_set_style_border_width(tile, 1, 0);
         lv_obj_set_style_border_color(tile, lv_color_hex(0x404040), 0);
         lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
@@ -2623,7 +2628,9 @@ static void build_settings_overlay(void)
         lv_obj_set_size(tile, tile_w, tile_h);
         lv_obj_set_pos(tile, x, y);
         lv_obj_set_style_radius(tile, 4, 0);
-        lv_obj_set_style_pad_all(tile, 6, 0);
+        // Match the input tile's reduced pad so the swatch fits at
+        // tile_h=36; see input-tile pad comment above.
+        lv_obj_set_style_pad_all(tile, 4, 0);
         // Distinct accent border so the master tile reads as a different
         // visual group from input tiles. Matches the live master strip's
         // 0xE0C040 yellow outline at half opacity.
