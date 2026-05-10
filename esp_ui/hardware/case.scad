@@ -9,6 +9,8 @@
 // Render with (one command per part):
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o front.stl --export-format binstl \
 //       -D 'part="front"' case.scad
+//   & "C:\Program Files\OpenSCAD\openscad.exe" -o front_flush.stl --export-format binstl \
+//       -D 'part="front_flush"' case.scad
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o back.stl --export-format binstl \
 //       -D 'part="back"'  case.scad
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o back_plain.stl --export-format binstl \
@@ -35,7 +37,7 @@ $fn = 64;
 // ---------------------------------------------------------------------------
 // PART SELECTOR
 // ---------------------------------------------------------------------------
-part = "assembly";        // "front" | "back" | "assembly"
+part = "assembly";        // "front" | "front_flush" | "back" | "assembly"
 
 // ---------------------------------------------------------------------------
 // MEASURED PARAMETERS (2026-05-01).
@@ -188,6 +190,67 @@ front_opening_extend_right = 0.5;
 // SD-card cutout: shift toward back; back-edge-only extension.
 sd_cutout_shift_back  = 0.4;
 sd_cutout_extend_back = 0.4;
+
+// ---------------------------------------------------------------------------
+// FLUSH-BEZEL VARIANT (alternate front shell).
+//
+// Sits flush with the cover-glass front instead of wrapping over it. The
+// existing `front` part is unchanged; this is an additional `front_flush`
+// option to print and evaluate side-by-side.
+//
+// Geometry: the case wall steps inward at the glass plane to a tight
+// perimeter pocket sized to the cover glass + assembly clearance. Below
+// the step, the cavity is the full PCB-clearance footprint (so the PCB
+// has room); above the step, the wall is flush against the glass edge
+// (so there's no visible gap around the glass). The LCD assembly slides
+// up through the pocket from below during back-cover-off assembly — same
+// procedure as the wrap-around.
+//
+// Trade-offs vs `front`:
+//   + Cleaner look; glass is at the same plane as the case top edge.
+//   + Simpler print: open-mouth-down, no front-face-down bridging.
+//   - Less drop protection; no plastic above glass top.
+//   - Tighter assembly tolerance: the LCD frame must fit through the
+//     pocket (0.5 mm per-side clearance default).
+//   - Wall is much thicker around the glass perimeter (8.5 mm long-edge,
+//     4.5 mm short-edge) to fill what the wrap-around lip otherwise
+//     covered. This is unavoidable — same plastic mass, just inverted.
+// ---------------------------------------------------------------------------
+
+// Round-over of the new exposed top edge of the sidewall (the edge at z = 0
+// where the front face used to start). Small radius keeps it finger-friendly
+// without violating "flush".
+flush_top_fillet               = 1.0;
+
+// Cover-glass dimensions (measured against the actual CrowPanel Advanced
+// 10.1" V1.0 panel: glass perimeter equals metal-frame perimeter — 6 mm in
+// from each long PCB edge, 2 mm in from each short PCB edge). Adjust if
+// fitting a different display revision.
+flush_glass_W                  = 235.0;
+flush_glass_H                  = 143.0;
+
+// Glass-pocket clearance (per side). Loose enough that the LCD frame
+// slides up through the pocket during back-cover-off assembly without
+// scraping; tight enough that the visible gap around the glass reads as
+// a hairline rather than a moat.
+flush_glass_pocket_clearance   = 0.5;
+
+// Glass pocket Z extent. The pocket sits between the metal-frame top
+// plane and the glass top plane; nothing else lives in this Z range
+// except the cover glass itself.
+flush_surround_bot_z           = -glass_proud;   // = -2.5 = frame top
+flush_surround_top_z           =  0;             // = glass top
+
+// Corner-block top truncation for the flush variant. The shared
+// corner_blocks() module raises blocks to z=0 to support the wrap-around
+// front face. With no front face, the top of the block would project
+// into the glass-pocket Z range; truncate so the blocks live entirely
+// below the metal-frame top plane.
+//
+// post_bot_z = -post_length = -8; insert occupies z=-8..-3 (m3_insert_h=5).
+// Default -3.5 keeps 0.5 mm of plastic over the insert top and parks the
+// block top 1 mm below the metal-frame top plane (z=-2.5).
+flush_block_top_z              = -3.5;
 
 // ---------------------------------------------------------------------------
 // DERIVED.
@@ -409,6 +472,92 @@ module front_shell() {
 }
 
 // ---------------------------------------------------------------------------
+// FRONT SHELL — FLUSH VARIANT
+// ---------------------------------------------------------------------------
+
+module shell_solid_flush() {
+    // Outer envelope of the flush variant: same X/Y footprint as the
+    // wrap-around shell, but truncated at z = 0 (no front_face_t cap).
+    // Sphere-fillets are placed at the new top edge so the exposed
+    // sidewall lip is rounded over rather than left as a sharp corner.
+    flush_d  = stack_thk;
+    flush_cz = -stack_thk / 2;
+    translate([0, 0, flush_cz])
+        rounded_box(shell_W, shell_H, flush_d, corner_r,
+                    fillet_top = true);
+}
+
+module glass_surround() {
+    // Perimeter ring that closes the gap between the cover-glass edge and
+    // the case sidewall. Without it the flush variant would expose a
+    // 6.4 mm trough on long edges and a 2.4 mm trough on short edges
+    // (cavity is sized for the PCB; glass is smaller than the PCB).
+    //
+    // Sits in the Z range between the metal-frame top plane and the glass
+    // top plane (z = -glass_proud .. 0). The inner pocket is sized to the
+    // glass + flush_glass_pocket_clearance per side, so the LCD frame
+    // slides up through the pocket during back-cover-off assembly.
+    //
+    // Doubles as the forward-push stop for the panel: the frame top
+    // bears against the ring's lower face if the assembly is pushed
+    // toward the screen.
+    pocket_W = flush_glass_W + 2 * flush_glass_pocket_clearance;
+    pocket_H = flush_glass_H + 2 * flush_glass_pocket_clearance;
+    h        = abs(flush_surround_top_z - flush_surround_bot_z);
+    cz       = (flush_surround_top_z + flush_surround_bot_z) / 2;
+
+    difference() {
+        translate([0, 0, cz])
+            cube([inner_W, inner_H, h], center = true);
+        translate([0, 0, cz])
+            cube([pocket_W, pocket_H, h + 0.02], center = true);
+    }
+}
+
+module shell_body_flush() {
+    // Like shell_body() but no front-face cutouts (the whole front is open).
+    // Side cutouts (SD, USB-C, USB-C2 recess) survive verbatim.
+    difference() {
+        shell_solid_flush();
+        pcb_cavity();
+        sd_cutout_tapered();
+        usbc_cutout_tapered();
+        usbc2_recess();
+    }
+}
+
+module corner_blocks_flush() {
+    // Same plan-view footprint as corner_blocks(), but truncated in Z so
+    // the block tops sit at flush_block_top_z (well below the cover-glass
+    // plane). Used only by the flush variant — the wrap-around design
+    // still relies on corner_blocks() rising to z=0.
+    block_x_in = inner_W / 2 - frame_W / 2 - block_x_clearance;
+    block_y_in = block_y_extent;
+
+    block_h = abs(flush_block_top_z - post_bot_z);
+    cz      = (flush_block_top_z + post_bot_z) / 2;
+
+    for (sx = [-1, 1])
+        for (sy = [-1, 1]) {
+            cx = sx * (inner_W / 2 - block_x_in / 2);
+            cy = sy * (inner_H / 2 - block_y_in / 2);
+            translate([cx, cy, cz])
+                cube([block_x_in, block_y_in, block_h], center = true);
+        }
+}
+
+module front_shell_flush() {
+    difference() {
+        union() {
+            shell_body_flush();
+            corner_blocks_flush();
+            glass_surround();
+        }
+        post_inserts();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BACK COVER
 // ---------------------------------------------------------------------------
 
@@ -543,10 +692,11 @@ module back_cover(engrave = true) {
 // TOP-LEVEL DISPATCH
 // ---------------------------------------------------------------------------
 
-if      (part == "front")      front_shell();
-else if (part == "back")       back_cover();
-else if (part == "back_plain") back_cover(engrave = false);
-else if (part == "logo")       back_cover_logo_solid();
+if      (part == "front")       front_shell();
+else if (part == "front_flush") front_shell_flush();
+else if (part == "back")        back_cover();
+else if (part == "back_plain")  back_cover(engrave = false);
+else if (part == "logo")        back_cover_logo_solid();
 else {                                  // "assembly"
     front_shell();
     back_cover();
