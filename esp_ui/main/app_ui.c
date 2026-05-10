@@ -2546,6 +2546,14 @@ static void build_settings_overlay(void)
     lv_obj_set_size(list, list_w, list_h);
     lv_obj_set_pos(list, 0, 296);
     lv_obj_set_style_pad_all(list, 6, 0);
+    // Drag-mode highlight outline draws 4 px outside the tile bounds.
+    // The bottom row sits flush with the list's content rect, so the
+    // outline gets clipped at the list's bottom edge by default. Top
+    // row has the same problem but it's visually masked by the dark
+    // theme background. OVERFLOW_VISIBLE lets the outline draw past
+    // the list's content area; there's 24 px of empty overlay space
+    // above and below the list so the 4 px overflow has room.
+    lv_obj_add_flag(list, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_clear_flag(list, LV_OBJ_FLAG_SCROLLABLE);
 
     const int grid_cols  = 4;
