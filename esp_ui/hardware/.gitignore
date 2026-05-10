@@ -1,0 +1,6 @@
+# Vendor device model — large binary, regenerate locally from the upstream
+# STEP file in elecrow-ref (see preview_assembly.scad header for command).
+elecrow_device.stl
+
+# Local design-reference photos (e.g. side-profile stackup shots).
+stackup_photo*.jpg
