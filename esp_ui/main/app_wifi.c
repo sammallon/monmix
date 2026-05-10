@@ -25,6 +25,15 @@ static const char *TAG = "app_wifi";
 #define BIT_GOT_IP_SINCE_REASSOC (1 << 2)
 #define MAX_RETRIES         20
 #define RETRY_BACKOFF_MS    1000
+// After this many consecutive WIFI_REASON_NO_AP_FOUND failures, kick off
+// an explicit scan instead of another connect retry. The reasoning: a
+// not-in-range SSID fails fast (~3 s per attempt), and 20 retries x 3 s
+// is a 60 s window where a perfectly reachable saved-but-not-current
+// network gets ignored. Two failures is enough signal that the AP isn't
+// just briefly off-air. ESP-IDF doesn't truly support concurrent scan +
+// connect on the same radio, so we briefly stop the connect cycle to
+// scan, then resume with whichever saved SSID the scan revealed.
+#define EARLY_SCAN_THRESHOLD     2
 
 static EventGroupHandle_t s_evt;
 static int                s_retry;
@@ -62,6 +71,36 @@ static volatile bool      s_reconnect_immediate;
 static volatile bool      s_saved_switch_pending;
 static char               s_saved_switch_ssid[33];
 static char               s_saved_switch_pass[65];
+
+// Auto-scan state. s_no_ap_retries counts consecutive disconnects with
+// reason==WIFI_REASON_NO_AP_FOUND (the configured SSID isn't broadcasting
+// on any channel we just probed). Reset on any non-NO_AP_FOUND disconnect
+// reason or on a successful connect. When it crosses EARLY_SCAN_THRESHOLD
+// the reconnect_task starts a scan instead of another connect retry --
+// scan_done -> maybe_switch_saved_network then promotes a saved-and-in-
+// range SSID without waiting for the full retry budget. s_early_scan_in_flight
+// gates maybe_switch_saved_network so a system-initiated scan can fire the
+// switch while CONNECTING (a UI-initiated scan during CONNECTING is held
+// back to avoid racing the user's manual reconfigure).
+static volatile int       s_no_ap_retries;
+static volatile bool      s_early_scan_pending;
+static volatile bool      s_early_scan_in_flight;
+
+// Blind round-robin through saved SSIDs. Triggered when we exhaust
+// MAX_RETRIES on the current SSID without the early-scan path finding
+// anything in range. Walks each saved network in turn (different from
+// current) and tries to connect blind. Hidden APs don't appear in scan
+// results, so this is the only way to find them when the user roams.
+// s_blind_index is the next saved-list index to try; s_blind_attempts is
+// the number of distinct saved networks tried so far in this round.
+static volatile bool      s_blind_round_pending;
+static size_t             s_blind_index;
+static size_t             s_blind_attempts;
+
+// Forward declared so reconnect_task can piggy-back early scans onto an
+// in-flight UI scan. Defined further down with the rest of the scan
+// state so the UI scan API stays grouped.
+static volatile bool      s_scan_in_progress;
 
 #define MAX_SUBSCRIBERS 4
 static struct {
@@ -111,26 +150,71 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                        e ? e->reason : -1);
             set_state(APP_WIFI_STATE_CONNECTING);
             s_reconnect_immediate = true;
+            s_no_ap_retries = 0;
             if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
             return;
+        }
+
+        // NO_AP_FOUND (reason 201) is the radio saying "I scanned every
+        // channel and didn't see this SSID". A saved-but-not-current SSID
+        // may be reachable here, so after a couple of these in a row we
+        // schedule a scan in the reconnect_task instead of yet another
+        // futile connect. Other reasons (auth fail, beacon timeout, etc.)
+        // shouldn't bias us toward switching networks.
+        int reason = e ? e->reason : -1;
+        if (reason == WIFI_REASON_NO_AP_FOUND) {
+            s_no_ap_retries++;
+        } else {
+            s_no_ap_retries = 0;
         }
 
         if (s_retry < MAX_RETRIES) {
             ++s_retry;
             ESP_LOGW(TAG, "disconnect (reason=%d), retry %d/%d in %d ms",
-                     e ? e->reason : -1, s_retry, MAX_RETRIES, RETRY_BACKOFF_MS);
+                     reason, s_retry, MAX_RETRIES, RETRY_BACKOFF_MS);
             APP_LOGD_W("app_wifi", "disconnect reason=%d retry=%d/%d",
-                       e ? e->reason : -1, s_retry, MAX_RETRIES);
+                       reason, s_retry, MAX_RETRIES);
             set_state(APP_WIFI_STATE_CONNECTING);
+
+            // Auto-scan trigger. Only worth scanning if there's more than
+            // one saved network -- with just the current SSID in the ring
+            // a scan can't find a different option to switch to.
+            if (s_no_ap_retries == EARLY_SCAN_THRESHOLD &&
+                app_config_wifi_saved_count() > 1 &&
+                !s_early_scan_pending && !s_early_scan_in_flight) {
+                ESP_LOGI(TAG,
+                         "current SSID not found after %d tries; scanning for saved alternatives",
+                         s_no_ap_retries);
+                APP_LOGD_I("app_wifi", "early-scan: %d NO_AP_FOUND, %u saved",
+                           s_no_ap_retries,
+                           (unsigned) app_config_wifi_saved_count());
+                s_early_scan_pending = true;
+            }
+
             // Hand the backoff off to s_reconnect_task. Blocking the event
             // task would queue any subsequent WIFI_EVENT/IP_EVENT — most
             // notably GOT_IP, which is what resets s_retry.
             if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
+        } else if (!s_blind_round_pending && app_config_wifi_saved_count() > 1) {
+            // Retries exhausted on the current SSID and the early-scan
+            // path didn't switch us. Fall back to round-robin: walk the
+            // saved list and try each blind. This is the only way to
+            // find a hidden saved AP -- those don't appear in scans and
+            // need a directed probe-request.
+            ESP_LOGW(TAG,
+                     "retries exhausted on current SSID; trying saved networks blind");
+            APP_LOGD_W("app_wifi", "blind round-robin start, %u saved",
+                       (unsigned) app_config_wifi_saved_count());
+            s_blind_round_pending = true;
+            s_blind_index    = 0;
+            s_blind_attempts = 0;
+            set_state(APP_WIFI_STATE_CONNECTING);
+            if (s_reconnect_task) xTaskNotifyGive(s_reconnect_task);
         } else {
             ESP_LOGE(TAG, "wifi connect exhausted retries (last reason=%d)",
-                     e ? e->reason : -1);
+                     reason);
             APP_LOGD_E("app_wifi", "retries exhausted, last reason=%d",
-                       e ? e->reason : -1);
+                       reason);
             set_state(APP_WIFI_STATE_FAILED);
             xEventGroupSetBits(s_evt, BIT_FAILED);
         }
@@ -140,6 +224,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         APP_LOGD_I("app_wifi", "got ip " IPSTR, IP2STR(&evt->ip_info.ip));
         s_ip = evt->ip_info.ip;
         s_retry = 0;
+        s_no_ap_retries = 0;
+        s_blind_round_pending = false;
+        s_blind_attempts = 0;
         // Re-run DNS pref now that DHCP has handed us a lease; if the DHCP
         // server didn't include option 6 the manual fallback gets installed
         // here so subsequent hostname resolves work.
@@ -158,16 +245,105 @@ static void reconnect_task(void *arg)
         // become "one more reconnect attempt".
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        // Saved-network auto-switch takes priority over a plain reconnect.
-        // The event task wrote ssid/pass into the staging buffers; persist
-        // them to NVS and run the full reconfigure off the event task.
+        // Saved-network auto-switch (post-scan) takes priority. The event
+        // task wrote ssid/pass into the staging buffers; persist them to
+        // NVS and run the full reconfigure off the event task.
         if (s_saved_switch_pending) {
             s_saved_switch_pending = false;
             ESP_LOGI(TAG, "saved-network auto-switch -> '%s'", s_saved_switch_ssid);
             APP_LOGD_I("app_wifi", "auto-switch to saved '%s'", s_saved_switch_ssid);
             app_config_set_wifi_ssid(s_saved_switch_ssid);
             app_config_set_wifi_pass(s_saved_switch_pass);
+            // Reset retry budgets so the new SSID gets the full window.
+            s_retry = 0;
+            s_no_ap_retries = 0;
+            s_blind_round_pending = false;
+            s_blind_attempts = 0;
             app_wifi_reconfigure();
+            continue;
+        }
+
+        // Early-scan request from the event task. Trigger a scan instead
+        // of another connect retry; on_scan_done's maybe_switch_saved_
+        // network will set s_saved_switch_pending if it finds one.
+        // Piggyback on s_scan_in_progress so a UI scan running concurrently
+        // doesn't trip ESP_ERR_WIFI_STATE -- the in-flight scan's SCAN_DONE
+        // serves the same purpose.
+        if (s_early_scan_pending && !s_early_scan_in_flight) {
+            s_early_scan_pending  = false;
+            s_early_scan_in_flight = true;
+            if (s_scan_in_progress) {
+                ESP_LOGI(TAG, "early-scan: piggyback on in-flight UI scan");
+                continue;
+            }
+            s_scan_in_progress = true;
+            wifi_scan_config_t cfg = {0};
+            esp_err_t err = esp_wifi_scan_start(&cfg, false);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "early-scan started");
+                continue;
+            }
+            // Driver said no -- radio's mid-association. Fall through to
+            // a normal retry; the disconnect counter keeps climbing and
+            // we'll try again on the next tick.
+            s_scan_in_progress     = false;
+            s_early_scan_in_flight = false;
+            ESP_LOGW(TAG, "early-scan start failed: %s", esp_err_to_name(err));
+        }
+
+        // Round-robin through saved networks blind. Used after MAX_RETRIES
+        // on the current SSID + the early-scan path didn't help. This is
+        // the only path that finds hidden saved APs (which never appear
+        // in scan results -- you have to probe them by name).
+        if (s_blind_round_pending) {
+            size_t saved_n = app_config_wifi_saved_count();
+            const char *current = app_config_wifi_ssid();
+            char ssid[APP_CONFIG_SSID_MAX];
+            char pass[APP_CONFIG_PASS_MAX];
+            bool picked = false;
+            // Walk the list once per wake-up, skipping the current SSID
+            // (already failed) and any we've already tried this round.
+            // If we exhaust the list without picking, give up and let
+            // the s_state -> FAILED transition happen naturally on the
+            // last connect's STA_DISCONNECTED.
+            while (s_blind_index < saved_n &&
+                   s_blind_attempts < saved_n) {
+                size_t idx = s_blind_index++;
+                if (!app_config_wifi_saved_get(idx, ssid, sizeof(ssid),
+                                               pass, sizeof(pass))) {
+                    continue;
+                }
+                if (strcmp(ssid, current) == 0) continue;  // already tried
+                picked = true;
+                s_blind_attempts++;
+                break;
+            }
+            if (picked) {
+                ESP_LOGI(TAG, "blind try saved [%u]: '%s'",
+                         (unsigned)(s_blind_index - 1), ssid);
+                APP_LOGD_I("app_wifi", "blind '%s' attempt=%u",
+                           ssid, (unsigned) s_blind_attempts);
+                app_config_set_wifi_ssid(ssid);
+                app_config_set_wifi_pass(pass);
+                // Reset the per-SSID retry counter; we want the new SSID
+                // to get a fresh budget. Don't clear s_blind_round_pending
+                // -- if THIS saved fails too, the next STA_DISCONNECTED's
+                // retries-exhausted branch will notify us again to keep
+                // walking. Once we run out of saved networks the loop
+                // above no-ops and we drop out of round-robin.
+                s_retry = 0;
+                s_no_ap_retries = 0;
+                app_wifi_reconfigure();
+                continue;
+            }
+            // Exhausted. Stop the round, let the next STA_DISCONNECTED
+            // drop us into FAILED.
+            ESP_LOGW(TAG, "blind round-robin exhausted; entering FAILED");
+            APP_LOGD_W("app_wifi", "blind exhausted after %u attempts",
+                       (unsigned) s_blind_attempts);
+            s_blind_round_pending = false;
+            set_state(APP_WIFI_STATE_FAILED);
+            xEventGroupSetBits(s_evt, BIT_FAILED);
             continue;
         }
 
@@ -220,6 +396,14 @@ void app_wifi_init_radio(void)
     // NB: app_wifi_apply_ip_config() runs from app_main AFTER app_prefs_init.
     // We can't call it here -- this function runs before prefs are loaded
     // (the SDMMC singleton forces this order, see CLAUDE.md).
+
+    // Log how many saved networks the auto-switch path will be able to
+    // pick from. Don't log the SSID itself (privacy + possible whitespace);
+    // count alone gives enough boot-time signal to diagnose "device just
+    // sat there because the saved list was empty / had only the wrong AP".
+    ESP_LOGI(TAG, "wifi init: target ssid len=%u, %u saved network(s)",
+             (unsigned) strlen(ssid),
+             (unsigned) app_config_wifi_saved_count());
 
     // Reconnect-backoff task before esp_wifi_start so it's ready by the
     // time the first STA_DISCONNECTED could fire. Stack 3072 is plenty --
@@ -387,6 +571,10 @@ bool app_wifi_reconfigure(void)
     // Re-pick the latest creds + IP config. Disconnect first so the driver
     // isn't sitting on a half-applied state when we push the new config.
     s_retry = 0;
+    s_no_ap_retries = 0;
+    s_blind_round_pending = false;
+    s_blind_attempts = 0;
+    s_early_scan_pending = false;
     set_state(APP_WIFI_STATE_CONNECTING);
 
     wifi_config_t cfg = {0};
@@ -467,26 +655,32 @@ void app_wifi_register_on_change(app_wifi_on_change_t cb, void *ctx)
 // pull them later without races. Hidden APs (empty SSID) are dropped: the
 // user will type those manually if they need them.
 
-static volatile bool          s_scan_in_progress;
+// s_scan_in_progress declared at the top of the file (reconnect_task
+// piggy-backs early scans on UI scans).
 static app_wifi_scan_done_t   s_scan_done_cb;
 static void                  *s_scan_done_ctx;
 static char                   s_scan_results[APP_WIFI_SCAN_MAX_RESULTS][33];
 static size_t                 s_scan_result_count;
 
-// Called from the wifi event task once a scan completes. If we've actually
-// given up on the configured network (FAILED) and a saved SSID is in range,
-// stage a switch for reconnect_task to run. MRU order is implicit in the
-// saved list (most-recent first), so the first saved-and-in-scan match wins.
-//
-// Restricted to FAILED (not CONNECTING) deliberately: a user-initiated scan
-// from the wcfg picker would otherwise race with a still-running connect/
-// retry cycle, and the resulting esp_wifi_disconnect+set_config could land
-// while a follow-up scan_start was about to dispatch -- which returns
-// ESP_ERR_WIFI_STATE and leaves the popup's "Scan" button stuck at
-// "Scanning...". CONNECTING means the radio still has a plan; let it run.
+// Called from the wifi event task once a scan completes. Switches the
+// active SSID to a saved-and-in-range network if one isn't already
+// connected. Two-mode gating:
+//   * UI-initiated rescan: only switch when in FAILED state. A still-
+//     running connect/retry cycle would race a user-driven reconfigure
+//     and the resulting esp_wifi_disconnect+set_config could land while
+//     a follow-up scan_start was about to dispatch (returns ESP_ERR_
+//     WIFI_STATE, leaves the popup's "Scan" button stuck).
+//   * System-initiated early scan (s_early_scan_in_flight): also fire
+//     during CONNECTING. The whole point of the early scan is to switch
+//     fast without waiting for the 20-retry exhaustion.
+// MRU order is implicit in the saved list (most-recent first); the first
+// saved-and-in-scan match wins.
 static void maybe_switch_saved_network(void)
 {
-    if (s_state != APP_WIFI_STATE_FAILED) return;
+    if (!(s_state == APP_WIFI_STATE_FAILED ||
+          (s_state == APP_WIFI_STATE_CONNECTING && s_early_scan_in_flight))) {
+        return;
+    }
     if (s_saved_switch_pending) return;  // one in flight already
 
     const char *current = app_config_wifi_ssid();
@@ -545,6 +739,16 @@ static void on_scan_done(void)
     // currently CONNECTED -- the user's working connection is never broken
     // automatically.
     maybe_switch_saved_network();
+    // Clear the system-initiated flag AFTER maybe_switch so the gate sees
+    // the "early scan" mode. If the scan didn't yield a switch we just
+    // resume the normal retry loop (notify the reconnect_task in case it's
+    // sitting waiting for nothing -- esp_wifi_connect on the current SSID
+    // will get its next shot).
+    bool was_early = s_early_scan_in_flight;
+    s_early_scan_in_flight = false;
+    if (was_early && !s_saved_switch_pending && s_reconnect_task) {
+        xTaskNotifyGive(s_reconnect_task);
+    }
     if (s_scan_done_cb) s_scan_done_cb(s_scan_done_ctx);
 }
 
