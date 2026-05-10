@@ -387,6 +387,15 @@ static bool   s_reorder_active;
 static size_t s_reorder_idx;             // app_state idx currently being dragged
 static int    s_reorder_ids[APP_CONFIG_MAX_CHANNELS];
 static size_t s_reorder_count;
+// Gesture-scoped: set on LV_EVENT_LONG_PRESSED (when reorder mode
+// engages), cleared on LV_EVENT_PRESSED (start of next gesture). The
+// CLICKED handler that opens the rename popup is fired on the same
+// dispatch as RELEASED for short gestures, so we suppress the popup
+// for any tap that completed a reorder. Same flag suppresses the
+// swatch popup defensively even though PRESS_LOCK normally keeps the
+// swatch from receiving CLICKED at all during a name-label drag.
+static bool   s_reorder_was_active;
+static void on_tile_pressed(lv_event_t *e);
 static void on_tile_long_pressed(lv_event_t *e);
 static void on_tile_pressing(lv_event_t *e);
 static void on_tile_released(lv_event_t *e);
@@ -1171,6 +1180,17 @@ static void tile_repaint(size_t idx)
     }
 }
 
+static void on_tile_pressed(lv_event_t *e)
+{
+    // Start of a new gesture -- clear the just-completed-reorder flag
+    // so a fresh tap can open the rename popup. The flag persists from
+    // a prior LONG_PRESSED until the NEXT PRESSED so that any CLICKED
+    // event fired during the interim (the same dispatch as RELEASED
+    // when the press wasn't drag-suppressed) gets correctly skipped.
+    (void) e;
+    s_reorder_was_active = false;
+}
+
 static void on_tile_long_pressed(lv_event_t *e)
 {
     if (s_reorder_active) return;
@@ -1182,8 +1202,9 @@ static void on_tile_long_pressed(lv_event_t *e)
     for (size_t i = 0; i < total; ++i) {
         s_reorder_ids[i] = app_state_id_for_idx(i);
     }
-    s_reorder_idx    = idx;
-    s_reorder_active = true;
+    s_reorder_idx        = idx;
+    s_reorder_active     = true;
+    s_reorder_was_active = true;
     reorder_set_highlight(idx, true);
 
     // Suppress overlay scroll so the long-drag doesn't fight the list's
@@ -1202,8 +1223,12 @@ static void on_tile_pressing(lv_event_t *e)
     lv_point_t p;
     lv_indev_get_point(indev, &p);
 
-    // Hit-test the pointer against every other channel tile. A hit swaps
-    // that tile with the dragged one. We only consider the FIRST hit so a
+    // Hit-test the pointer against every other channel tile. A hit
+    // INSERTS the dragged item at the target slot: items between
+    // source and target shift by 1, all other slots keep their
+    // relative order. Implemented as a sequence of adjacent swaps so
+    // app_state and the local s_reorder_ids stay in lockstep without
+    // adding a new state API. We only consider the FIRST hit so a
     // diagonal cross doesn't ping-pong on the boundary.
     size_t cur = s_reorder_idx;
     for (size_t i = 0; i < s_reorder_count; ++i) {
@@ -1215,20 +1240,36 @@ static void on_tile_pressing(lv_event_t *e)
         if (p.x < area.x1 || p.x > area.x2) continue;
         if (p.y < area.y1 || p.y > area.y2) continue;
 
-        int tmp = s_reorder_ids[cur];
-        s_reorder_ids[cur] = s_reorder_ids[i];
-        s_reorder_ids[i]   = tmp;
-        app_state_swap_slots(cur, i);
-        // Repaint both tiles so name + swatch reflect the swap.
-        tile_repaint(cur);
+        // Walk from cur toward i one slot at a time, swapping the
+        // dragged item with its neighbour each step. The dragged item
+        // ends up at position i; intermediate items shift by 1 in the
+        // direction OPPOSITE the drag (e.g. dragging slot 0 down to
+        // slot 4 leaves [0]->[1], [1]->[2], [2]->[3], [3]->[4], with
+        // the original [0] item at [4]).
+        if (i > cur) {
+            for (size_t k = cur; k < i; ++k) {
+                int tmp = s_reorder_ids[k];
+                s_reorder_ids[k] = s_reorder_ids[k + 1];
+                s_reorder_ids[k + 1] = tmp;
+                app_state_swap_slots(k, k + 1);
+                tile_repaint(k);
+                on_state_change(k, NULL);
+            }
+        } else {
+            for (size_t k = cur; k > i; --k) {
+                int tmp = s_reorder_ids[k];
+                s_reorder_ids[k] = s_reorder_ids[k - 1];
+                s_reorder_ids[k - 1] = tmp;
+                app_state_swap_slots(k, k - 1);
+                tile_repaint(k);
+                on_state_change(k, NULL);
+            }
+        }
         tile_repaint(i);
+        on_state_change(i, NULL);
         reorder_set_highlight(cur, false);
         reorder_set_highlight(i, true);
         s_reorder_idx = i;
-        // Mark the live fader strips dirty so apply_pending refreshes the
-        // labels for the swapped slots in the next sweep.
-        on_state_change(cur, NULL);
-        on_state_change(i, NULL);
         return;
     }
 }
@@ -2200,6 +2241,16 @@ static void on_tz_dropdown_changed(lv_event_t *e)
 // slider in real time) and refreshes the swatch visual on close.
 static void on_swatch_clicked(lv_event_t *e)
 {
+    // Defensive: if a reorder gesture just finished, skip the picker.
+    // PRESS_LOCK on the dragged name label normally prevents the
+    // swatch from receiving CLICKED during a drag, but bubbling or
+    // edge-cases (release exactly on a swatch corner) could route
+    // the click here. The flag clears on the next PRESSED so genuine
+    // swatch taps still work.
+    if (s_reorder_was_active) {
+        s_reorder_was_active = false;
+        return;
+    }
     size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
     picker_open(idx);
 }
@@ -2498,6 +2549,8 @@ static void build_settings_overlay(void)
         lv_obj_add_flag(name, LV_OBJ_FLAG_PRESS_LOCK);
         lv_obj_add_event_cb(name, on_name_clicked, LV_EVENT_CLICKED,
                             (void *)(uintptr_t) i);
+        lv_obj_add_event_cb(name, on_tile_pressed, LV_EVENT_PRESSED,
+                            (void *)(uintptr_t) i);
         lv_obj_add_event_cb(name, on_tile_long_pressed, LV_EVENT_LONG_PRESSED,
                             (void *)(uintptr_t) i);
         lv_obj_add_event_cb(name, on_tile_pressing, LV_EVENT_PRESSING,
@@ -2689,6 +2742,45 @@ static void settings_close(void)
 {
     if (s_settings_overlay) {
         lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// After a chpick save, the channel grid in the settings overlay has
+// stale tile-count + ids cached from build time. Tear down the overlay
+// so the next settings_open() rebuilds it against the new app_state.
+// All overlay widgets are children of s_settings_overlay (LVGL deletes
+// children when the parent is deleted), so we just nullify the pointers
+// the build function sets. Picker / rename / rotation-confirm popups
+// live on the screen root, not inside the overlay -- they survive.
+//
+// If the overlay was visible when invalidated (chpick was opened from
+// it), rebuild + reopen so the user's flow continues in settings with
+// the fresh tile grid -- otherwise the rebuild defers to the next
+// gear-tap.
+static void settings_invalidate(void)
+{
+    if (!s_settings_overlay) return;
+    bool was_visible = !lv_obj_has_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_delete(s_settings_overlay);
+    s_settings_overlay = NULL;
+    for (size_t i = 0; i < APP_CONFIG_MAX_CHANNELS; ++i) {
+        s_row_tile_objs[i]   = NULL;
+        s_row_name_labels[i] = NULL;
+        s_color_swatches[i]  = NULL;
+    }
+    s_master_tile_obj    = NULL;
+    s_master_tile_name   = NULL;
+    s_master_tile_swatch = NULL;
+    s_lvl_norm_btn       = NULL;
+    s_lvl_db_btn         = NULL;
+    s_bright_slider      = NULL;
+    s_bright_value_label = NULL;
+    s_tz_dropdown        = NULL;
+    for (size_t i = 0; i < 3; ++i) s_sig_buttons[i]   = NULL;
+    for (size_t i = 0; i < 2; ++i) s_theme_buttons[i] = NULL;
+    for (size_t i = 0; i < 2; ++i) s_rot_buttons[i]   = NULL;
+    if (was_visible) {
+        settings_open();
     }
 }
 
@@ -2927,6 +3019,11 @@ static void picker_open(size_t channel_idx)
 {
     if (!s_picker_popup) build_picker_popup();
     s_picker_target_idx = channel_idx;
+    if (channel_idx == UI_TARGET_MASTER) {
+        ESP_LOGI(TAG, "picker: open idx=master");
+    } else {
+        ESP_LOGI(TAG, "picker: open idx=%u", (unsigned) channel_idx);
+    }
     if (channel_idx == UI_TARGET_MASTER) {
         // Capture the master's MS channel id at open time so a mix-bus
         // change mid-edit doesn't apply the colour to a different bus.
@@ -3266,6 +3363,11 @@ static void rename_open(size_t channel_idx)
 {
     if (!s_rename_popup) build_rename_popup();
     s_rename_target_idx = channel_idx;
+    if (channel_idx == UI_TARGET_MASTER) {
+        ESP_LOGI(TAG, "rename: open idx=master");
+    } else {
+        ESP_LOGI(TAG, "rename: open idx=%u", (unsigned) channel_idx);
+    }
 
     char buf[48];
     if (channel_idx == UI_TARGET_MASTER) {
@@ -3302,6 +3404,15 @@ static void rename_close(void)
 
 static void on_name_clicked(lv_event_t *e)
 {
+    // If a long-press just engaged reorder mode, the LVGL event chain
+    // for this gesture (PRESSED -> LONG_PRESSED -> ... -> RELEASED ->
+    // optionally CLICKED) ends here. Skip rename so the user lifting
+    // the finger after a drag doesn't slap them with an IME popup.
+    // Flag clears on the next PRESSED so a fresh tap still renames.
+    if (s_reorder_was_active) {
+        s_reorder_was_active = false;
+        return;
+    }
     size_t idx = (size_t)(uintptr_t) lv_event_get_user_data(e);
     rename_open(idx);
 }
@@ -5041,6 +5152,12 @@ static void chpick_apply_async(void *unused)
     // app_state. Master strip is built once and survives the clean.
     app_ui_present_channels();
 
+    // Settings overlay's channel grid was built once and never refreshed
+    // on count/id changes. Tear it down here so the next gear-tap
+    // rebuilds against the new app_state -- otherwise the user sees
+    // stale tiles in the config panel until reboot.
+    settings_invalidate();
+
     // Start the worker again. The on-connect handler in subscribe_all
     // reads fresh app_state_count() so the new id set is what gets
     // subscribed. The strip-name cache primed at boot covers any newly
@@ -5072,10 +5189,17 @@ void app_ui_chpick_apply(const int *ids, size_t count)
 // the sim's settings-grid regression test to assert column-major fill
 // (tile y increases for adjacent indices within a column) and swatch-
 // on-left placement (swatch_x < name_x in every tile).
+//
+// Iterates ALL slots in s_row_tile_objs (not app_state_count()) so a
+// post-chpick stale-tile bug shows up: a 4-channel selection that
+// retained 8 tiles in the overlay would print 8 lines, while a fresh
+// rebuild would print 4. Slots with NULL tile pointers are skipped.
+// Trailing "settings_tile_count=<N>" line lets tests assert the
+// total without ordering tricks.
 void app_ui_settings_dump_tiles(void)
 {
-    size_t total = app_state_count();
-    for (size_t i = 0; i < total; ++i) {
+    size_t n_tiles = 0;
+    for (size_t i = 0; i < APP_CONFIG_MAX_CHANNELS; ++i) {
         lv_obj_t *tile = s_row_tile_objs[i];
         if (!tile) continue;
         lv_obj_t *name   = s_row_name_labels[i];
@@ -5086,7 +5210,9 @@ void app_ui_settings_dump_tiles(void)
         int sx = swatch ? (int) lv_obj_get_x(swatch) : -1;
         printf("settings_tile i=%zu x=%d y=%d name_x=%d swatch_x=%d\n",
                i, tx, ty, nx, sx);
+        n_tiles++;
     }
+    printf("settings_tile_count=%zu\n", n_tiles);
     fflush(stdout);
 }
 

@@ -18,8 +18,11 @@
 // Connectivity-degraded states (no WiFi, MS not connected, MS up but
 // the physical console isn't attached) cap the effective timeout at
 // 60 s -- if the device can't drive a mix there's no reason to keep
-// the panel lit. Transitions INTO a degraded state reset inactivity
-// so a transient drop doesn't blank the screen mid-mix.
+// the panel lit. Crucially the degraded clock is RELATIVE to last
+// touch, not absolute from awake-start: while the user is actively
+// typing in the WiFi panel trying to recover the link, the screen
+// must not blank under them. Healthy AWAKE remains absolute-from-pick
+// (the user said "stay awake for X" and means it).
 //
 // PC sim / scripted tests can scale all M7 times via
 // app_power_set_time_scale to avoid waiting real minutes/hours per
