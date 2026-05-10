@@ -19,6 +19,9 @@ TEST = {
     "description": "Tapping in degraded state keeps the screen awake (relative timeout).",
     "args": ["--power-scale", "120"],
     "script": (
+        # Boot lands in WAKE_MENU; commit 1h to dismiss it, then
+        # exercise the degraded-relative timeout.
+        "power_set_user_timeout_ms 3600000\n"
         "echo flip-degraded\n"
         "power_degraded on\n"
         "sleep 50\n"

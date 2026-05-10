@@ -18,6 +18,10 @@ TEST = {
     "description": "Tapping the top-bar power icon forces SLEEP phase immediately.",
     "args": ["--power-scale", "120"],
     "script": (
+        # Dismiss the boot wake menu by committing 1h. Boot now starts
+        # in WAKE_MENU rather than AWAKE so the test's first phase
+        # assertion needs an explicit pick first.
+        "power_set_user_timeout_ms 3600000\n"
         "echo before-tap\n"
         "power_phase\n"
         # Tap the sleep icon. Should land in SLEEP without going through

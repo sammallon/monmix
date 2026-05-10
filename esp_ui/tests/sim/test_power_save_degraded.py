@@ -13,6 +13,9 @@ TEST = {
     "description": "Degraded wifi caps the effective timeout to 60 s scaled.",
     "args": ["--power-scale", "120"],
     "script": (
+        # Boot lands in WAKE_MENU now; commit 1h up front so the test
+        # exercises the post-pick AWAKE state.
+        "power_set_user_timeout_ms 3600000\n"
         "echo healthy-eff\n"
         "power_phase\n"
         "echo flip-degraded\n"

@@ -394,6 +394,14 @@ void app_power_set_user_timeout_ms(uint32_t ms)
 {
     if (ms == 0) ms = DEFAULT_TIMEOUT_MS;
     s_user_timeout_ms = ms;
+    // Semantically equivalent to a wake-menu pick: the user has chosen
+    // a duration. If we're currently in the boot wake-menu (or post-
+    // sleep wake-menu), commit the choice and transition to AWAKE so
+    // the panel goes live. Tests use this hook to dismiss the boot
+    // menu without faking a tap on a duration button.
+    if (s_phase == APP_POWER_PHASE_WAKE_MENU) {
+        enter_awake();
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -558,4 +566,14 @@ void app_power_init(const ms_client_iface_t *ms)
     ESP_LOGI(TAG, "init: default_timeout=%ums scale=%u/%u",
              (unsigned) DEFAULT_TIMEOUT_MS,
              (unsigned) s_scale_num, (unsigned) s_scale_den);
+
+    // Surface the wake menu on every boot so the user explicitly picks
+    // a "stay awake for X" duration up front -- there's no boot-time
+    // persistence (user explicitly opted out), and the silent 1 h
+    // default surprised the pilot tester. The auto-revert in tick_cb
+    // routes back to SLEEP if the user doesn't pick within
+    // WAKE_MENU_TIMEOUT_MS, which means a powered-on-and-left device
+    // doesn't sit lit forever. Test path: app_power_set_user_timeout_ms
+    // commits a duration the same way a button tap would.
+    enter_wake_menu();
 }
