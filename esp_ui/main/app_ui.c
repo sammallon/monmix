@@ -1156,7 +1156,12 @@ static void reorder_set_highlight(size_t idx, bool on)
     if (on) {
         lv_obj_set_style_outline_width(tile, 4, 0);
         lv_obj_set_style_outline_color(tile, lv_color_hex(0xE0C040), 0);
-        lv_obj_set_style_outline_pad(tile, 2, 0);
+        // Pad 0 (was 2): the bottom-row tile sits exactly at the list's
+        // 6 px bottom pad, and a 2+4=6 px outline gets clipped by the
+        // list's content rect. With pad 0 the outline only extends 4 px
+        // past the tile, leaving 2 px clearance from the clip edge so
+        // the highlight stays fully visible on the bottom row.
+        lv_obj_set_style_outline_pad(tile, 0, 0);
         lv_obj_set_style_outline_opa(tile, LV_OPA_COVER, 0);
     } else {
         lv_obj_set_style_outline_width(tile, 0, 0);
