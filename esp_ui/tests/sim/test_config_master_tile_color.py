@@ -17,6 +17,9 @@ TEST = {
     # Button 0 (red): pos (0, 40) -> screen rect (382, 190)-(462, 270).
     # Tap (422, 230) hits.
     "script": (
+        # Dismiss the modal boot wake-menu so the gear tap reaches
+        # the settings overlay.
+        "power_set_user_timeout_ms 3600000\n"
         "echo before-pick\n"
         "prefs_get_color 60\n"
         "tap 1002 16\n"          # gear -> settings overlay

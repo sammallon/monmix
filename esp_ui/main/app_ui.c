@@ -2796,6 +2796,7 @@ static void settings_open(void)
     settings_refresh_state();
     lv_obj_remove_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_settings_overlay);
+    ESP_LOGI(TAG, "settings overlay opened");
 }
 
 static void settings_close(void)

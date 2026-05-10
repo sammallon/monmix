@@ -223,19 +223,44 @@ static void build_wake_menu(void)
 {
     if (s_wake_menu) return;
     lv_obj_t *scr = lv_screen_active();
-    lv_obj_t *ov  = lv_obj_create(scr);
-    // Panel grew from 280 to 360 to fit the Sleep cancel row at the bottom.
-    // 6 duration buttons (3 x 2) end at y=196 inside; the cancel sits at
-    // y=216 with 50 px height -> y=266. With pad 20 and outer height 360,
-    // usable inner is 320 so 266 leaves comfortable room.
+
+    // Full-screen scrim that absorbs every tap not landing on the
+    // duration card. Without this the centered card was non-modal --
+    // taps anywhere outside the buttons leaked through to the gear,
+    // top-bar sleep button, faders, etc., letting the user dodge the
+    // picker entirely. The whole point of the boot picker is that
+    // the user always knows their awake duration because they
+    // actively chose it. Semi-transparent dark background dims the
+    // underlying UI so the user reads "modal: pick something".
+    lv_obj_t *scrim = lv_obj_create(scr);
+    int32_t sw = lv_obj_get_width(scr);
+    int32_t sh = lv_obj_get_height(scr);
+    lv_obj_set_size(scrim, sw, sh);
+    lv_obj_set_pos(scrim, 0, 0);
+    lv_obj_set_style_radius(scrim, 0, 0);
+    lv_obj_set_style_border_width(scrim, 0, 0);
+    lv_obj_set_style_pad_all(scrim, 0, 0);
+    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(scrim, LV_OPA_70, 0);
+    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+    // lv_obj_create defaults already set CLICKABLE, but call it
+    // explicitly so the modal contract is documented in source: this
+    // scrim catches every tap that misses the duration card.
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+    s_wake_menu = scrim;
+
+    // Visible card carrying the title + duration buttons + Sleep cancel.
+    // Created as a child of the scrim so the foreground/hidden flags
+    // toggled on s_wake_menu drag the card with them. Panel grew from
+    // 280 to 360 to fit the Sleep cancel row at the bottom.
+    lv_obj_t *ov = lv_obj_create(scrim);
     lv_obj_set_size(ov, 540, 360);
     lv_obj_center(ov);
     lv_obj_set_style_radius(ov, 12, 0);
     lv_obj_set_style_border_width(ov, 2, 0);
     lv_obj_set_style_pad_all(ov, 20, 0);
     lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ov, LV_OBJ_FLAG_HIDDEN);
-    s_wake_menu = ov;
 
     lv_obj_t *title = lv_label_create(ov);
     lv_label_set_text(title, "Stay awake for:");

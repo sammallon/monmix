@@ -22,6 +22,9 @@ TEST = {
     # Rename popup Save: TOP_RIGHT 110x36 inside popup with pad 12 ->
     #   rect (902, 12)-(1012, 48), tap (957, 30).
     "script": (
+        # Dismiss the modal boot wake-menu so subsequent taps reach
+        # the settings overlay.
+        "power_set_user_timeout_ms 3600000\n"
         "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
         "tap 900 536\n"           # master tile name -> rename popup

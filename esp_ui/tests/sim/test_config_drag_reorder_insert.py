@@ -32,6 +32,10 @@ TEST = {
     # touch margin): list at (16, 312), list pad 6, tile_h=36, gap=4.
     # Row mid-y values (col 0): 336, 376, 416, 456, 496, 536.
     "script": (
+        # Boot now lands in the modal wake-menu picker which blocks
+        # all taps. Commit a duration to dismiss the menu so the
+        # gear tap reaches the settings overlay.
+        "power_set_user_timeout_ms 3600000\n"
         "echo before-drag\n"
         "chan_id 0\n"
         "chan_id 1\n"

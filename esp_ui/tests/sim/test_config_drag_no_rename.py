@@ -17,6 +17,9 @@ TEST = {
     "description": "Drag gesture suppresses rename + color picker popups.",
     "args": [],
     "script": (
+        # Dismiss the modal boot wake-menu so the gear tap reaches
+        # the settings overlay.
+        "power_set_user_timeout_ms 3600000\n"
         "tap 1002 16\n"           # gear -> settings overlay
         "sleep 200\n"
         "echo drag-start\n"

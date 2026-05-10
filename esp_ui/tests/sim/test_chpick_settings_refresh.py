@@ -25,6 +25,9 @@ TEST = {
     "description": "Settings overlay rebuilds tile grid after chpick save.",
     "args": [],
     "script": (
+        # Dismiss the modal boot wake-menu so subsequent taps reach
+        # the settings overlay / gear icon.
+        "power_set_user_timeout_ms 3600000\n"
         "echo before-chpick\n"
         # Phase 1: open settings, dump tiles (default 8 channels).
         "tap 1002 16\n"           # gear -> settings overlay

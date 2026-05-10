@@ -30,7 +30,9 @@ TEST = {
     "args": [],
     "timeout_s": 30,
     "script": (
-        # Boot + initial fader render.
+        # Boot + initial fader render. Dismiss the modal boot wake
+        # menu so the gear tap reaches the settings overlay.
+        "power_set_user_timeout_ms 3600000\n"
         "sleep 2000\n"
         # Open the settings overlay.
         f"tap {GEAR_X} {GEAR_Y}\n"

@@ -19,6 +19,10 @@ TEST = {
     # Tile [1] (col=0, row=1): screen y 358..394; inner mid-y 376.
     # name x_left = 64 (swatch on left), name center ~ 100.
     "script": (
+        # Boot now lands in the modal wake-menu picker which blocks
+        # all taps. Commit a duration to dismiss the menu and let
+        # the test interact with the rest of the UI.
+        "power_set_user_timeout_ms 3600000\n"
         "echo before-drag\n"
         "chan_id 0\n"
         "chan_id 1\n"
