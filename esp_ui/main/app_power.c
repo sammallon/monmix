@@ -207,12 +207,28 @@ static void on_wake_menu_pick(lv_event_t *e)
     enter_awake();
 }
 
+// "Sleep" cancel option in the wake menu -- when the panel woke
+// accidentally (touched in a bag, brushed by a guitar strap during
+// teardown) the user wants a one-tap return to dark, not a 30 s
+// auto-revert wait. Routes back to enter_sleep, which re-mounts the
+// blank overlay and drops the backlight.
+static void on_wake_menu_sleep(lv_event_t *e)
+{
+    (void) e;
+    ESP_LOGI(TAG, "wake-menu cancel: returning to sleep");
+    enter_sleep();
+}
+
 static void build_wake_menu(void)
 {
     if (s_wake_menu) return;
     lv_obj_t *scr = lv_screen_active();
     lv_obj_t *ov  = lv_obj_create(scr);
-    lv_obj_set_size(ov, 540, 280);
+    // Panel grew from 280 to 360 to fit the Sleep cancel row at the bottom.
+    // 6 duration buttons (3 x 2) end at y=196 inside; the cancel sits at
+    // y=216 with 50 px height -> y=266. With pad 20 and outer height 360,
+    // usable inner is 320 so 266 leaves comfortable room.
+    lv_obj_set_size(ov, 540, 360);
     lv_obj_center(ov);
     lv_obj_set_style_radius(ov, 12, 0);
     lv_obj_set_style_border_width(ov, 2, 0);
@@ -246,6 +262,21 @@ static void build_wake_menu(void)
         // Note: tag the user_data with the hour count, NOT a button
         // index, so the picker doesn't break if rows/cols ever change.
     }
+
+    // Sleep cancel row at the bottom, full-width minus the panel pad.
+    // Distinct dark-grey background so it doesn't look like another
+    // duration option, and the LV_SYMBOL_POWER glyph mirrors the
+    // top-bar sleep button so the user reads "this puts it back to
+    // sleep" at a glance.
+    int cancel_y = 40 + ((n + cols - 1) / cols) * (btn_h + gap);
+    lv_obj_t *cancel_btn = lv_button_create(ov);
+    lv_obj_set_size(cancel_btn, 460, 50);
+    lv_obj_align(cancel_btn, LV_ALIGN_TOP_MID, 0, cancel_y);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x303030), 0);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_POWER " Sleep");
+    lv_obj_center(cancel_lbl);
+    lv_obj_add_event_cb(cancel_btn, on_wake_menu_sleep, LV_EVENT_CLICKED, NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────

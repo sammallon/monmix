@@ -2,6 +2,7 @@
 #include "app_display.h"
 #include "app_logd.h"
 #include "app_ms_setup.h"
+#include "app_power.h"
 #include "app_prefs.h"
 #include "app_state.h"
 #include "app_time.h"
@@ -423,10 +424,17 @@ static lv_obj_t *s_ms_state_value;
 static lv_obj_t *s_ms_host_value;
 static lv_obj_t *s_ms_port_value;
 
+// Sleep button: forces the display to blank immediately. Skips the warning
+// countdown intentionally -- when the user taps it, the intent is "off
+// now", not "remind me in 30 s". Tapping the resulting blank panel routes
+// through the existing wake-menu so it's reversible.
+static lv_obj_t *s_sleep_icon_label;    // the LV_SYMBOL_POWER label inside the button
+
 static void settings_open(void);
 static void settings_close(void);
 static void on_gear_clicked(lv_event_t *e);
 static void on_reboot_clicked(lv_event_t *e);
+static void on_sleep_clicked(lv_event_t *e);
 static void picker_open(size_t channel_idx);
 static void picker_close(void);
 static void picker_refresh_title(void);
@@ -1051,11 +1059,10 @@ static void apply_theme_async(void *unused)
 {
     (void)unused;
     app_display_apply_theme(app_prefs_get_theme());
-    if (s_gear_label) {
-        bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
-        lv_obj_set_style_text_color(s_gear_label,
-                                    dark ? lv_color_white() : lv_color_black(), 0);
-    }
+    bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
+    lv_color_t fg = dark ? lv_color_white() : lv_color_black();
+    if (s_gear_label)        lv_obj_set_style_text_color(s_gear_label,        fg, 0);
+    if (s_sleep_icon_label)  lv_obj_set_style_text_color(s_sleep_icon_label,  fg, 0);
 }
 
 static void on_prefs_change(void *ctx)
@@ -1774,15 +1781,37 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_center(s_ms_icon_label);
     lv_obj_add_event_cb(ms_btn, on_ms_clicked, LV_EVENT_CLICKED, NULL);
 
-    // Mix-bus indicator — left of the MS icon. Shows the active mix label
-    // ("Mix N"); tap opens the selector popup. Hidden until app_main tells
-    // us how many mixes the connected console exposes. Width is content-
-    // sized with a 90 px floor so long names ("STAGE LEFT MONITOR MIX")
-    // don't overflow; right edge is anchored, growth pushes left.
+    // Sleep icon -- LV_SYMBOL_POWER reads as "screen off / sleep" on every
+    // tablet OS, and the LVGL Montserrat default doesn't carry a moon or Z
+    // glyph. Tapping forces APP_POWER_PHASE_SLEEP immediately (skips warning),
+    // which is the deliberate behaviour: the user intent is "blank now".
+    // The blank overlay still consumes touches and routes the next tap to
+    // the wake menu, so it's reversible. Sits left of the MS icon.
+    lv_obj_t *sleep_btn = lv_button_create(scr);
+    lv_obj_set_size(sleep_btn, 28, 28);
+    lv_obj_align(sleep_btn, LV_ALIGN_TOP_RIGHT, -116, 2);
+    lv_obj_set_style_radius(sleep_btn, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_opa(sleep_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sleep_btn, 0, 0);
+    s_sleep_icon_label = lv_label_create(sleep_btn);
+    lv_label_set_text(s_sleep_icon_label, LV_SYMBOL_POWER);
+    lv_obj_center(s_sleep_icon_label);
+    {
+        bool dark = (app_prefs_get_theme() == APP_THEME_DARK);
+        lv_obj_set_style_text_color(s_sleep_icon_label,
+                                    dark ? lv_color_white() : lv_color_black(), 0);
+    }
+    lv_obj_add_event_cb(sleep_btn, on_sleep_clicked, LV_EVENT_CLICKED, NULL);
+
+    // Mix-bus indicator — left of the sleep icon. Shows the active mix
+    // label ("Mix N"); tap opens the selector popup. Hidden until app_main
+    // tells us how many mixes the connected console exposes. Width is
+    // content-sized with a 90 px floor so long names ("STAGE LEFT MONITOR
+    // MIX") don't overflow; right edge is anchored, growth pushes left.
     s_mix_indicator = lv_button_create(scr);
     lv_obj_set_size(s_mix_indicator, LV_SIZE_CONTENT, 28);
     lv_obj_set_style_min_width(s_mix_indicator, 90, 0);
-    lv_obj_align(s_mix_indicator, LV_ALIGN_TOP_RIGHT, -118, 2);
+    lv_obj_align(s_mix_indicator, LV_ALIGN_TOP_RIGHT, -154, 2);
     s_mix_indicator_label = lv_label_create(s_mix_indicator);
     lv_label_set_text(s_mix_indicator_label, "Mix 1");
     lv_obj_center(s_mix_indicator_label);
@@ -1791,19 +1820,23 @@ void app_ui_init(const ms_client_iface_t *ms)
     lv_obj_add_flag(s_mix_indicator, LV_OBJ_FLAG_HIDDEN);
 
     // Settings-icon hit pads -- transparent rectangles behind each
-    // settings icon (MS / WiFi / gear only; mute-en and mix indicator
+    // settings icon (sleep / MS / WiFi / gear; mute-en and mix indicator
     // keep their own click areas). Each pad's x range goes from the
     // midpoint to its left neighbour to the midpoint to its right
     // neighbour (screen edge for gear); y fills 0..STATUS_H so tall
-    // taps still register. Positions use the design-time icon coords.
-    // For the leftmost settings icon (MS), the mix indicator is the
-    // left adjacent button -- its midpoint bounds MS even though the
-    // mix indicator itself doesn't get an extended pad.
+    // taps still register. For the leftmost icon (sleep), the mix
+    // indicator's right edge bounds it on the left.
+    // Icon screen positions on a 1024-wide screen:
+    //   sleep:  -116 -> x=880..908; midpts 875 and 912
+    //   MS:     -80  -> x=916..944; midpts 912 and 948
+    //   WiFi:   -44  -> x=952..980; midpts 948 and 984
+    //   gear:   -8   -> x=988..1016; midpt 984, right edge to screen
     {
         struct { int x; int w; lv_event_cb_t cb; } pads[] = {
-            { 911, 37, on_ms_clicked   },  // MS   (916..944; midpts 911 and 948)
-            { 948, 36, on_wifi_clicked },  // WiFi (952..980; midpts 948 and 984)
-            { 984, 40, on_gear_clicked },  // gear (988..1016; midpt 984 to screen edge)
+            { 875, 37, on_sleep_clicked },  // sleep (880..908; midpts 875 and 912)
+            { 912, 36, on_ms_clicked    },  // MS    (916..944; midpts 912 and 948)
+            { 948, 36, on_wifi_clicked  },  // WiFi  (952..980; midpts 948 and 984)
+            { 984, 40, on_gear_clicked  },  // gear  (988..1016; midpt 984 to screen edge)
         };
         for (size_t i = 0; i < sizeof(pads) / sizeof(pads[0]); ++i) {
             lv_obj_t *pad = lv_obj_create(scr);
@@ -2020,6 +2053,13 @@ static void on_gear_clicked(lv_event_t *e)
 {
     (void) e;
     settings_open();
+}
+
+static void on_sleep_clicked(lv_event_t *e)
+{
+    (void) e;
+    ESP_LOGI(TAG, "user-initiated sleep");
+    app_power_force_sleep();
 }
 
 static void on_close_clicked(lv_event_t *e)
