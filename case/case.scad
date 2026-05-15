@@ -9,14 +9,18 @@
 // Render with (one command per part):
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o front.stl --export-format binstl \
 //       -D 'part="front"' case.scad
-//   & "C:\Program Files\OpenSCAD\openscad.exe" -o front_flush.stl --export-format binstl \
-//       -D 'part="front_flush"' case.scad
+//   & "C:\Program Files\OpenSCAD\openscad.exe" -o front_snap.stl --export-format binstl \
+//       -D 'part="front_snap"' case.scad
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o back.stl --export-format binstl \
 //       -D 'part="back"'  case.scad
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o back_plain.stl --export-format binstl \
 //       -D 'part="back_plain"' case.scad
 //   & "C:\Program Files\OpenSCAD\openscad.exe" -o back_logo.stl --export-format binstl \
 //       -D 'part="logo"'  case.scad
+// The flush variant is ARCHIVED — see comment block above the FLUSH-BEZEL
+// section. To render it for revival work:
+//   & "C:\Program Files\OpenSCAD\openscad.exe" -o front_flush.stl --export-format binstl \
+//       -D 'part="front_flush"' case.scad
 // back.stl + back_logo.stl are emitted at native coordinates — load both into
 // the slicer (back as the main part, back_logo as an additional part) and
 // assign each a different filament for a flush two-tone back face.
@@ -37,7 +41,9 @@ $fn = 64;
 // ---------------------------------------------------------------------------
 // PART SELECTOR
 // ---------------------------------------------------------------------------
-part = "assembly";        // "front" | "front_flush" | "back" | "assembly"
+part = "assembly";        // "front" | "front_snap" | "back" | "assembly"
+                          //   front_flush is ARCHIVED — render explicitly
+                          //   via -D 'part="front_flush"' to revive.
 
 // ---------------------------------------------------------------------------
 // MEASURED PARAMETERS (2026-05-01).
@@ -220,6 +226,37 @@ flush_glass_clear_right = 0.0;
 
 // ---------------------------------------------------------------------------
 // FLUSH-BEZEL VARIANT (alternate front shell).
+//
+// **ARCHIVED 2026-05-14** — preserved in source but no longer dispatched.
+//
+// Why: the printed prototype (2026-05-13) surfaced three problems that
+// individually are small but together kill the variant for stage use:
+//
+//   1. The LCD ribbon cable at the top edge of the screen interferes with
+//      the inner case wall: it either shows in the gap between the case
+//      and the cover glass, or pushes that wall outward as the assembly
+//      is closed. The wrap-around `front` variant doesn't share this
+//      because its inner lip overhangs that region and hides the cable.
+//
+//   2. `flush_stiffener_ribs` (added 2026-05-13) reduced the long-wall
+//      flex visibly but not enough. A real fix would need to thicken the
+//      top/bottom walls (a major outer-geometry change), which isn't
+//      justified for a cosmetic variant.
+//
+//   3. The cover glass shows slight separation from its own printed black
+//      mask at the four corners. Cosmetic only, but the variant's whole
+//      selling point was visual sleekness — and the corners undermined
+//      that on the prototype.
+//
+// What stays committed: the full source for this variant (parameters,
+// modules, modeled clearances) plus the final-iteration STL/3MF in
+// case/front_flush.{stl,3mf}, so the variant can be revived without
+// re-deriving the geometry. Removed: the `"front_flush"` dispatch entry,
+// so no default export targets this. Use `-D 'part="front_flush"'` on
+// the openscad command line if you want to render it from source.
+//
+// ---------------------------------------------------------------------------
+// FLUSH-BEZEL VARIANT — original design rationale (preserved verbatim)
 //
 // Sits flush with the cover-glass front instead of wrapping over it. The
 // existing `front` part is unchanged; this is an additional `front_flush`
@@ -659,6 +696,155 @@ module front_shell_flush() {
 }
 
 // ---------------------------------------------------------------------------
+// FRONT SHELL — SNAP-FIT VARIANT
+//
+// Same outer shell as `front` (wrap-around) but with retention ribs that
+// hold the PCB front-to-back via a snap-fit:
+//
+//   * Front ribs are small ledges along the inner walls at z = post_bot_z
+//     (PCB front face). The PCB rests against their lower face.
+//
+//   * Back ribs sit behind the PCB. They taper out of the wall in the
+//     direction of insertion (PCB pushed up from the back-cover opening
+//     toward the screen), so the case wall flexes outward as the PCB
+//     slides past, then snaps back to lock the PCB in place.
+//
+// With the ribs holding the PCB, the M3 standoffs that previously had to
+// be aligned at the corner mount holes are no longer required for PCB
+// retention. The corner blocks + heat-set inserts remain unchanged in
+// this variant — standoffs still serve as back-cover screw anchors
+// (their PCB-clamping role just becomes optional).
+//
+// Print orientation: face-down, same as the wrap-around variant. The
+// PCB-facing chamfer on the back rib is sized for ~45 deg slope so the
+// rib's retention surface prints without support. The insertion ramp
+// uses a gentler ~27 deg slope so the PCB slides up easily during
+// assembly.
+//
+// Back-rib XY positions were audited against the Elecrow STEP file on
+// 2026-05-14 (audit script in .copilot/) — all 12 rib positions clear
+// of back-side PCB components.
+// ---------------------------------------------------------------------------
+
+// Front-side retention rib: rectangular ledge against PCB front.
+snap_front_rib_thk    = 1.5;   // Z extent (-8 down to -6.5)
+snap_front_rib_depth  = 2.0;   // protrusion into cavity from inner wall.
+                                // Long-wall constraint: screen-frame inner
+                                // edge at Y = +/-71.5; inner case wall at
+                                // Y = +/-73.9; depth 2.0 keeps rib tip at
+                                // Y = +/-71.9, clear of the frame by 0.4
+                                // mm. Short walls have more room (6.4 mm
+                                // dead space) but use the same value for
+                                // uniformity.
+snap_front_rib_width  = 8.0;   // length along the wall direction
+
+// Back-side retention rib: tapered barb that snaps past the PCB on
+// insertion and retains it afterwards. Cross-section in (depth, Z):
+//
+//   wall ----- + z_ret = -9.8
+//              | \           <- chamfer (~45 deg, FDM-printable overhang)
+//              |  \
+//              |   + z_chamfer = -11.3, depth = 1.5
+//              |   |         <- flat tip (small Z section for tolerance)
+//              |   + z_flat = -11.6, depth = 1.5
+//              |  /
+//              | /           <- insertion ramp (~27 deg, gentle slope)
+//              |/
+//   wall ----- + z_bot = -14.5
+//
+snap_back_rib_z_ret    = -9.8;  // retention face Z at wall (PCB back at
+                                 //   -9.5, so 0.3 mm Z tolerance pocket)
+snap_back_rib_chamfer  = 1.5;   // chamfer Z extent (45 deg at full depth)
+snap_back_rib_flat     = 0.3;   // small flat at the barb tip
+snap_back_rib_ramp     = 2.9;   // insertion ramp Z extent (~27 deg)
+snap_back_rib_depth    = 1.5;   // max protrusion into cavity
+snap_back_rib_width    = 6.0;   // length along the wall direction
+// Total rib Z extent: -9.8 .. -14.5.
+
+// Rib XY positions. Matches the audited-clear flush_stiffener_ribs
+// layout; front and back ribs share positions on this first cut.
+snap_long_rib_xs       = [-70, -25, +25, +70];   // top + bottom walls
+snap_short_rib_ys      = [-40, +40];             // left + right walls
+
+module front_rib_block() {
+    // Local frame: wall at Y=0, rib extends in +Y (into cavity).
+    // Width along X. Z anchored so rib's BOTTOM face is at post_bot_z
+    // (= -8 = PCB front face) — PCB rests on this lower face.
+    rib_thk   = snap_front_rib_thk;
+    rib_depth = snap_front_rib_depth;
+    rib_w     = snap_front_rib_width;
+    translate([0, rib_depth / 2, post_bot_z + rib_thk / 2])
+        cube([rib_w, rib_depth, rib_thk], center = true);
+}
+
+module back_rib_block() {
+    // Local frame: wall at Y=0, rib extends in +Y (into cavity). Width
+    // along X. Cross-section is a 2D polygon (depth, Z) that's extruded
+    // along the rib width, then rotated so the extrusion direction
+    // becomes case-X.
+    rib_w     = snap_back_rib_width;
+    rib_depth = snap_back_rib_depth;
+    z_ret     = snap_back_rib_z_ret;
+    z_chamfer = z_ret     - snap_back_rib_chamfer;
+    z_flat    = z_chamfer - snap_back_rib_flat;
+    z_bot     = z_flat    - snap_back_rib_ramp;
+
+    // Slight -0.01 mm overlap into wall on the two wall-side vertices so
+    // the rib unions cleanly with the shell.
+    rotate([90, 0, 90])
+        linear_extrude(height = rib_w, center = true)
+            polygon([
+                [-0.01,    z_ret],     // wall, retention face top
+                [rib_depth, z_chamfer], // chamfer end, max depth
+                [rib_depth, z_flat],    // flat-tip end
+                [-0.01,    z_bot]      // wall, ramp end
+            ]);
+}
+
+// Per-wall rib placement. The rib block modules above are authored as if
+// the wall is at Y=0 with the rib protruding in +Y. For each of the four
+// inner walls we translate to the wall position and rotate so the rib
+// protrudes inward into the cavity.
+//
+//   Top wall    (Y = +inner_H/2):  rotate Z by 180  (+Y of block -> -Y of case)
+//   Bottom wall (Y = -inner_H/2):  identity         (+Y of block -> +Y of case)
+//   Left wall   (X = -inner_W/2):  rotate Z by  +90 (+Y of block -> +X of case)
+//   Right wall  (X = +inner_W/2):  rotate Z by  -90 (+Y of block -> -X of case)
+
+module front_retention_ribs() {
+    for (rx = snap_long_rib_xs) {
+        translate([rx, +inner_H / 2, 0]) rotate([0, 0, 180]) front_rib_block();
+        translate([rx, -inner_H / 2, 0])                    front_rib_block();
+    }
+    for (ry = snap_short_rib_ys) {
+        translate([-inner_W / 2, ry, 0]) rotate([0, 0,  90]) front_rib_block();
+        translate([+inner_W / 2, ry, 0]) rotate([0, 0, -90]) front_rib_block();
+    }
+}
+
+module back_retention_ribs() {
+    for (rx = snap_long_rib_xs) {
+        translate([rx, +inner_H / 2, 0]) rotate([0, 0, 180]) back_rib_block();
+        translate([rx, -inner_H / 2, 0])                    back_rib_block();
+    }
+    for (ry = snap_short_rib_ys) {
+        translate([-inner_W / 2, ry, 0]) rotate([0, 0,  90]) back_rib_block();
+        translate([+inner_W / 2, ry, 0]) rotate([0, 0, -90]) back_rib_block();
+    }
+}
+
+module front_shell_snap() {
+    // Wrap-around front shell + retention ribs. Corner blocks and post
+    // inserts (and therefore the standoff + back-cover-screw chain) are
+    // inherited from front_shell() unchanged.
+    union() {
+        front_shell();
+        front_retention_ribs();
+        back_retention_ribs();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BACK COVER
 // ---------------------------------------------------------------------------
 
@@ -794,7 +980,8 @@ module back_cover(engrave = true) {
 // ---------------------------------------------------------------------------
 
 if      (part == "front")       front_shell();
-else if (part == "front_flush") front_shell_flush();
+else if (part == "front_snap")  front_shell_snap();
+else if (part == "front_flush") front_shell_flush();   // archived — see header
 else if (part == "back")        back_cover();
 else if (part == "back_plain")  back_cover(engrave = false);
 else if (part == "logo")        back_cover_logo_solid();
