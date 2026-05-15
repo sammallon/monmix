@@ -1,0 +1,5 @@
+build-windows/
+build-linux/
+_deps/
+*.bmp
+*.log

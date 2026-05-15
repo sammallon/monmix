@@ -1,0 +1,18 @@
+# Native sim build dirs (one per host so MSVC's S:\… cache and gcc's
+# /mnt/s/… cache don't clobber each other).
+pc_sim/build-windows/
+pc_sim/build-linux/
+
+# CMake/FetchContent caches for prebuilt SDL2 + LVGL.
+pc_sim/_deps/
+
+# Sim-side runtime state (file-backed NVS, SD mirror) used by mocks/
+# when the hardware-port round lands. Pre-emptively ignored.
+pc_sim/pc_sim_state/
+
+# Local scratchpad probe / repro scripts. Convention matches esp_ui.
+repro_*.py
+
+# Local secrets — only ever created when the hardware-port round adds a
+# secrets.h.template; the .h itself stays uncommitted.
+main/secrets.h
