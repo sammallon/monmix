@@ -195,6 +195,29 @@ front_opening_extend_right = 0.5;
 sd_cutout_shift_back  = 0.4;
 sd_cutout_extend_back = 0.4;
 
+// Flush-variant glass pocket clearance — per side. The pocket is built
+// from the glass dimensions plus a clearance on each side; making one
+// side smaller fills the gap on that side without moving the pocket
+// elsewhere.
+//
+// Observed 2026-05-13: 1.1 mm gap at top of screen and 1.2 mm gap at
+// right, with USB cluster oriented to +X. Bottom and left gaps not
+// noted (treated as ~0). Setting nominal top/right clearance to 0 mm
+// brings the pocket wall up against the cover-glass edge in the model;
+// print-fit expansion (~0.05-0.2 mm per side empirically) leaves a
+// hairline visible gap rather than the gross 1.1/1.2 mm gap. Bottom
+// and left clearances stay at 0.5 mm so the LCD frame still slides up
+// through the pocket easily on assembly.
+//
+// Risk: a future print with significantly less expansion than this one
+// would have the frame binding on top/right edges; mitigation is to
+// either bump these clearances up slightly (0.1-0.2 mm) or sand 0.1 mm
+// off the pocket wall on the binding side.
+flush_glass_clear_top   = 0.0;
+flush_glass_clear_bot   = 0.5;
+flush_glass_clear_left  = 0.5;
+flush_glass_clear_right = 0.0;
+
 // ---------------------------------------------------------------------------
 // FLUSH-BEZEL VARIANT (alternate front shell).
 //
@@ -233,11 +256,13 @@ flush_top_fillet               = 1.0;
 flush_glass_W                  = 235.0;
 flush_glass_H                  = 143.0;
 
-// Glass-pocket clearance (per side). Loose enough that the LCD frame
-// slides up through the pocket during back-cover-off assembly without
-// scraping; tight enough that the visible gap around the glass reads as
-// a hairline rather than a moat.
-flush_glass_pocket_clearance   = 0.5;
+// Glass-pocket clearance is asymmetric — per-side values declared in the
+// PRINT-FIT CORRECTIONS section above so they group with the other
+// empirical adjustments. The pocket is built by adding each side's
+// clearance to the cover-glass extent on that side, with the pocket
+// centred on the resulting (asymmetric) midpoint. Loose enough that the
+// LCD frame slides up through the pocket without scraping; tight enough
+// that the visible gap around the glass reads as a hairline.
 
 // Glass pocket Z extent. The pocket sits between the metal-frame top
 // plane and the glass top plane; nothing else lives in this Z range
@@ -248,13 +273,17 @@ flush_surround_top_z           =  0;             // = glass top
 // Corner-block top truncation for the flush variant. The shared
 // corner_blocks() module raises blocks to z=0 to support the wrap-around
 // front face. With no front face, the top of the block would project
-// into the glass-pocket Z range; truncate so the blocks live entirely
-// below the metal-frame top plane.
+// into the glass-pocket Z range; raise the block only to the glass-
+// surround bottom plane so the block + surround form a continuous solid
+// from the insert face (z = -8) up to the case front (z = 0) at each
+// corner.
 //
 // post_bot_z = -post_length = -8; insert occupies z=-8..-3 (m3_insert_h=5).
-// Default -3.5 keeps 0.5 mm of plastic over the insert top and parks the
-// block top 1 mm below the metal-frame top plane (z=-2.5).
-flush_block_top_z              = -3.5;
+// Setting top to flush_surround_bot_z (-2.5) puts 0.5 mm of plastic over
+// the insert top (was previously -3.5, which left the bore opening into
+// open air above the truncated block — a 1 mm gap above the block before
+// the glass_surround took over).
+flush_block_top_z              = flush_surround_bot_z;
 
 // ---------------------------------------------------------------------------
 // DERIVED.
@@ -498,22 +527,28 @@ module glass_surround() {
     // (cavity is sized for the PCB; glass is smaller than the PCB).
     //
     // Sits in the Z range between the metal-frame top plane and the glass
-    // top plane (z = -glass_proud .. 0). The inner pocket is sized to the
-    // glass + flush_glass_pocket_clearance per side, so the LCD frame
-    // slides up through the pocket during back-cover-off assembly.
+    // top plane (z = -glass_proud .. 0). The inner pocket is sized
+    // asymmetrically via the per-side `flush_glass_clear_*` parameters
+    // (top/bottom/left/right), then centred on the resulting midpoint so
+    // each pocket wall is exactly `clear_<side>` from the matching glass
+    // edge. The LCD frame slides up through the pocket during back-
+    // cover-off assembly, so each clearance must be ≥ 0 nominally (with
+    // print expansion providing the actual sliding clearance).
     //
     // Doubles as the forward-push stop for the panel: the frame top
     // bears against the ring's lower face if the assembly is pushed
     // toward the screen.
-    pocket_W = flush_glass_W + 2 * flush_glass_pocket_clearance;
-    pocket_H = flush_glass_H + 2 * flush_glass_pocket_clearance;
-    h        = abs(flush_surround_top_z - flush_surround_bot_z);
-    cz       = (flush_surround_top_z + flush_surround_bot_z) / 2;
+    pocket_W  = flush_glass_W + flush_glass_clear_left + flush_glass_clear_right;
+    pocket_H  = flush_glass_H + flush_glass_clear_top  + flush_glass_clear_bot;
+    pocket_cx = frame_cx + (flush_glass_clear_right - flush_glass_clear_left) / 2;
+    pocket_cy = frame_cy + (flush_glass_clear_top   - flush_glass_clear_bot)  / 2;
+    h         = abs(flush_surround_top_z - flush_surround_bot_z);
+    cz        = (flush_surround_top_z + flush_surround_bot_z) / 2;
 
     difference() {
         translate([0, 0, cz])
             cube([inner_W, inner_H, h], center = true);
-        translate([0, 0, cz])
+        translate([pocket_cx, pocket_cy, cz])
             cube([pocket_W, pocket_H, h + 0.02], center = true);
     }
 }
@@ -550,12 +585,74 @@ module corner_blocks_flush() {
         }
 }
 
+module flush_stiffener_ribs() {
+    // Vertical buttresses along the inside of each sidewall, sitting in
+    // the dead space between the metal display-frame edge and the inner
+    // case wall, in the Z range above the PCB front (z = -8) and below
+    // the glass-surround bottom (z = -2.5). Stiffens the long sidewalls
+    // (top/bottom of screen) which were observed to flex outward away
+    // from the device on a printed sample; the short sidewalls flex
+    // less but get a couple of ribs too.
+    //
+    // Ribs are vertical extrusions in the print orientation (mouth-down),
+    // so they print as local thickenings of the inner wall with no
+    // overhangs or support.
+    //
+    // Component-clearance audit (2026-05-13):
+    //  - ESP32-C6 daughter module sits on the BACK of the PCB
+    //    (z = [-12.1, -9.5]) and never enters the rib Z range.
+    //  - SD-card cutout is on the top wall but at z = [-10.5, -9.0],
+    //    also below the rib Z range.
+    //  - USB-C cutouts cross the right wall at z = [-13.9, -8.5];
+    //    short-edge rib at z = [-7.5, -2.5] sits above them.
+    //  - USB-C2 internal recess at z = [-13.9, -8.5] likewise below.
+    //  - Front-side PCB components other than the LCD assembly are
+    //    not modelled here; the rib X/Y positions are chosen to clear
+    //    documented features but assume nothing else protrudes into
+    //    the perimeter dead space above the PCB.
+    rib_thk      = 2.5;
+    rib_z_top    = flush_surround_bot_z - 0.01;
+    rib_z_bot    = post_bot_z + 0.5;
+    rib_h        = abs(rib_z_top - rib_z_bot);
+    rib_cz       = (rib_z_top + rib_z_bot) / 2;
+
+    inset_top    = inner_H / 2 - (outer_H / 2 - frame_off_top);
+    inset_bot    = inner_H / 2 - (outer_H / 2 - frame_off_bottom);
+    inset_left   = inner_W / 2 - (outer_W / 2 - frame_off_left);
+    inset_right  = inner_W / 2 - (outer_W / 2 - frame_off_right);
+
+    // Long-edge rib X positions. Spaced between corner blocks
+    // (|x| < ~117) and clear of the SD-card cutout at x ≈ -105 on the
+    // top wall (SD cutout is Z-disjoint from the ribs but keeping the
+    // X spacing wide is cheap insurance).
+    long_rib_xs  = [-70, -25, +25, +70];
+
+    // Short-edge rib Y positions. Clear of both USB-C cutouts on the
+    // right wall: USB1 centred at y = -10 (range [-14.5, -5.5]) and
+    // USB2 centred at y = +10.5 (range [+6, +15]).
+    short_rib_ys = [-40, +40];
+
+    for (rx = long_rib_xs) {
+        translate([rx, inner_H / 2 - inset_top / 2, rib_cz])
+            cube([rib_thk, inset_top, rib_h], center = true);
+        translate([rx, -inner_H / 2 + inset_bot / 2, rib_cz])
+            cube([rib_thk, inset_bot, rib_h], center = true);
+    }
+    for (ry = short_rib_ys) {
+        translate([-inner_W / 2 + inset_left / 2, ry, rib_cz])
+            cube([inset_left, rib_thk, rib_h], center = true);
+        translate([+inner_W / 2 - inset_right / 2, ry, rib_cz])
+            cube([inset_right, rib_thk, rib_h], center = true);
+    }
+}
+
 module front_shell_flush() {
     difference() {
         union() {
             shell_body_flush();
             corner_blocks_flush();
             glass_surround();
+            flush_stiffener_ribs();
         }
         post_inserts();
     }
