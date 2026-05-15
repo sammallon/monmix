@@ -121,8 +121,12 @@ corner_r_back  = 2.5;      // back-cover vertical-edge & back-face fillet
                            // (clamped to back_cover_t/2 — 4 mm would inflate the BB)
 front_taper   = 1.5;       // mm of bezel-cutout expansion from glass to outer face
 side_taper    = 1.0;       // mm of side-port expansion from inside to outside
-screen_overhang = 1.0;     // case lip extends this far inward over the black
+screen_overhang = 1.5;     // case lip extends this far inward over the black
                            // glass border, beyond the active-area edge.
+                           // Bumped from 1.0 to 1.5 (2026-05-14) for
+                           // production PETG print: +0.5 mm on each side
+                           // gives +1 mm horizontal and +1 mm vertical
+                           // total opening clearance around the active area.
 
 // Corner blocks — rectangular, hugging the inner case-wall corner. Each block
 // extends from the wall inward and contains a heat-set M3 insert at the PCB
