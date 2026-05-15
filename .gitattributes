@@ -1,0 +1,5 @@
+# Third-party reference material under docs/raw/ comes from upstream
+# (npm wrapper source, Bitfocus Companion source, jeffmikels openapi
+# mirror) with LF line endings. We don't intend to edit these so
+# preserve their original bytes verbatim — bypass autocrlf.
+docs/raw/** -text
