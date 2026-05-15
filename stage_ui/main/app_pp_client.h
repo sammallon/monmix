@@ -32,12 +32,16 @@ typedef struct {
     void (*trigger_next)(void);
     void (*trigger_previous)(void);
 
+    // Drop + recreate. Called from the PP-config panel after the user
+    // changes host/port and applies. Mock impl just resets its sim state
+    // and notifies; real backend tears the chunked stream down and
+    // reconnects.
+    void (*reconnect)(void);
+
     app_pp_conn_state_t (*get_state)(void);
     const char         *(*get_host)(void);
     int                 (*get_port)(void);
 
-    // One subscriber slot is plenty for now — app_pp_ui is the only
-    // caller. Multi-subscriber notify lives in app_pp_state instead.
     void (*register_on_change)(app_pp_on_change_t cb, void *ctx);
 } pp_client_iface_t;
 

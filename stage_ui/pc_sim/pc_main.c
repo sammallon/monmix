@@ -29,9 +29,13 @@
 #include "drivers/sdl/lv_sdl_keyboard.h"
 #include "drivers/sdl/lv_sdl_mousewheel.h"
 
+#include "app_display.h"
 #include "app_pp_client.h"
 #include "app_pp_state.h"
 #include "app_pp_ui.h"
+#include "app_power.h"
+#include "app_prefs.h"
+#include "app_wifi.h"
 
 #define WIN_W   1024
 #define WIN_H    600
@@ -67,17 +71,9 @@ static void sigterm_handler(int sig) {
     g_quit = 1;
 }
 
-static void apply_dark_theme(lv_display_t *disp) {
-    lv_theme_t *t = lv_theme_default_init(
-        disp,
-        lv_palette_main(LV_PALETTE_BLUE),
-        lv_palette_main(LV_PALETTE_GREY),
-        /*dark=*/true,
-        LV_FONT_DEFAULT);
-    lv_display_set_theme(disp, t);
-    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x101010), 0);
-    lv_obj_set_style_bg_opa  (lv_screen_active(), LV_OPA_COVER, 0);
-}
+// Theme apply now lives in mock_app_display (which calls real lv_theme
+// API + sets the screen bg). pc_main only kicks it off via the
+// app_display iface.
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -108,7 +104,10 @@ int main(int argc, char **argv) {
     lv_sdl_keyboard_create();
     lv_sdl_mousewheel_create();
 
-    apply_dark_theme(disp);
+    // Initial theme seed via app_display iface so all subsequent
+    // toggles route through the same path.
+    app_prefs_init();
+    app_display_apply_theme(app_prefs_get_theme());
 
     app_pp_state_init();
     app_pp_ui_init(app_pp_client());
@@ -119,7 +118,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stdout, "stage_ui sim running. Click slide buttons / next-preview / SET. ^C to quit.\n");
+    // Sleep / blank state machine. Wire AFTER the client starts so its
+    // get_state() returns CONNECTED rather than BOOT for the initial
+    // degraded check.
+    app_power_init(app_pp_client());
+
+    fprintf(stdout, "stage_ui sim running. Click slide buttons / next-preview / icons. ^C to quit.\n");
 
     // Drive LVGL at ~50 Hz. lv_tick_inc gives the engine real-time so
     // animations / timers work; lv_timer_handler runs pending callbacks

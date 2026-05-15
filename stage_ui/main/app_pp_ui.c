@@ -1,6 +1,8 @@
 #include "app_pp_ui.h"
 
 #include "app_pp_state.h"
+#include "app_pp_ui_overlay.h"
+#include "app_pp_ui_settings.h"
 
 #include "lvgl.h"
 
@@ -38,6 +40,8 @@ static lv_obj_t *s_countdown_lbl;
 static lv_obj_t *s_prev_btn;
 static lv_obj_t *s_next_btn;
 static lv_obj_t *s_settings_btn;
+static lv_obj_t *s_wifi_btn;
+static lv_obj_t *s_pp_btn;
 static lv_obj_t *s_current_panel;
 static lv_obj_t *s_current_lbl;
 static lv_obj_t *s_next_bar_lbl;
@@ -65,9 +69,15 @@ static void on_next_preview_clicked(lv_event_t *e) {
 }
 static void on_settings_clicked(lv_event_t *e) {
     (void)e;
-    // Settings overlay lands in Round 4. For the skeleton, log so the
-    // tap registers as wired-up.
-    fprintf(stdout, "[app_pp_ui] settings tapped (overlay TBD)\n");
+    app_pp_ui_settings_open_general();
+}
+static void on_wifi_clicked(lv_event_t *e) {
+    (void)e;
+    app_pp_ui_settings_open_wifi();
+}
+static void on_pp_clicked(lv_event_t *e) {
+    (void)e;
+    app_pp_ui_settings_open_pp();
 }
 
 // ─── State -> widget refresh ──────────────────────────────────────────
@@ -154,33 +164,62 @@ static lv_obj_t *build_header(lv_obj_t *parent) {
     lv_obj_align(s_countdown_lbl, LV_ALIGN_LEFT_MID, 200, 0);
     lv_label_set_text(s_countdown_lbl, "");
 
-    // ⚙ button — far right
+    // Right cluster: ⚙ + 📶 + ▤ (settings / wifi / propresenter).
+    // Each opens its modal config panel. LVGL ships symbol glyphs for
+    // settings + wifi; LV_SYMBOL_LIST (three stacked horizontal lines)
+    // stands in for the slide-deck mental model on the PP button.
+    const int ICON_W = 56;
+    const int ICON_H = HEADER_H - 12;
+    const int ICON_PAD = 4;
+    int x = 4;
+
+    s_pp_btn = lv_button_create(bar);
+    lv_obj_set_size(s_pp_btn, ICON_W, ICON_H);
+    lv_obj_align(s_pp_btn, LV_ALIGN_RIGHT_MID, -(x), 0);
+    lv_obj_add_event_cb(s_pp_btn, on_pp_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *pp_lbl = lv_label_create(s_pp_btn);
+    lv_label_set_text(pp_lbl, LV_SYMBOL_LIST);
+    lv_obj_set_style_text_font(pp_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_center(pp_lbl);
+    x += ICON_W + ICON_PAD;
+
+    s_wifi_btn = lv_button_create(bar);
+    lv_obj_set_size(s_wifi_btn, ICON_W, ICON_H);
+    lv_obj_align(s_wifi_btn, LV_ALIGN_RIGHT_MID, -(x), 0);
+    lv_obj_add_event_cb(s_wifi_btn, on_wifi_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *wifi_lbl = lv_label_create(s_wifi_btn);
+    lv_label_set_text(wifi_lbl, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(wifi_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_center(wifi_lbl);
+    x += ICON_W + ICON_PAD;
+
     s_settings_btn = lv_button_create(bar);
-    lv_obj_set_size(s_settings_btn, 56, HEADER_H - 12);
-    lv_obj_align(s_settings_btn, LV_ALIGN_RIGHT_MID, -8, 0);
+    lv_obj_set_size(s_settings_btn, ICON_W, ICON_H);
+    lv_obj_align(s_settings_btn, LV_ALIGN_RIGHT_MID, -(x), 0);
     lv_obj_add_event_cb(s_settings_btn, on_settings_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *sgear = lv_label_create(s_settings_btn);
-    lv_label_set_text(sgear, "SET");
-    lv_obj_set_style_text_font(sgear, &lv_font_montserrat_14, 0);
+    lv_label_set_text(sgear, LV_SYMBOL_SETTINGS);
+    lv_obj_set_style_text_font(sgear, &lv_font_montserrat_20, 0);
     lv_obj_center(sgear);
+    x += ICON_W + ICON_PAD;
 
-    // Next button — to the left of settings
+    // Next + Prev buttons to the left of the icon cluster.
     s_next_btn = lv_button_create(bar);
-    lv_obj_set_size(s_next_btn, 96, HEADER_H - 12);
-    lv_obj_align(s_next_btn, LV_ALIGN_RIGHT_MID, -76, 0);
+    lv_obj_set_size(s_next_btn, 96, ICON_H);
+    lv_obj_align(s_next_btn, LV_ALIGN_RIGHT_MID, -(x), 0);
     lv_obj_add_event_cb(s_next_btn, on_next_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *nlbl = lv_label_create(s_next_btn);
-    lv_label_set_text(nlbl, "Next >");
+    lv_label_set_text(nlbl, "Next " LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_font(nlbl, &lv_font_montserrat_18, 0);
     lv_obj_center(nlbl);
+    x += 96 + ICON_PAD;
 
-    // Prev button — to the left of Next
     s_prev_btn = lv_button_create(bar);
-    lv_obj_set_size(s_prev_btn, 96, HEADER_H - 12);
-    lv_obj_align(s_prev_btn, LV_ALIGN_RIGHT_MID, -180, 0);
+    lv_obj_set_size(s_prev_btn, 96, ICON_H);
+    lv_obj_align(s_prev_btn, LV_ALIGN_RIGHT_MID, -(x), 0);
     lv_obj_add_event_cb(s_prev_btn, on_prev_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_t *plbl = lv_label_create(s_prev_btn);
-    lv_label_set_text(plbl, "< Prev");
+    lv_label_set_text(plbl, LV_SYMBOL_LEFT " Prev");
     lv_obj_set_style_text_font(plbl, &lv_font_montserrat_18, 0);
     lv_obj_center(plbl);
 
@@ -277,6 +316,7 @@ static lv_obj_t *build_footer(lv_obj_t *parent) {
 
 void app_pp_ui_init(const pp_client_iface_t *client) {
     s_client = client;
+    app_pp_ui_settings_init(client);
 }
 
 void app_pp_ui_mount(lv_obj_t *parent) {

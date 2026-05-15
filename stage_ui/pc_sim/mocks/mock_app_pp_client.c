@@ -151,6 +151,20 @@ static void mock_trigger_previous(void) {
     if (s_advance_timer) lv_timer_reset(s_advance_timer);
 }
 
+static void mock_reconnect(void) {
+    // Drop + restart sim state. Pumps a CONNECTING blip so the UI
+    // status icon visibly transitions.
+    fprintf(stdout, "[mock_pp] reconnect\n");
+    s_state = APP_PP_CONN_CONNECTING;
+    fire_change();
+    // Step to a different slide so the user gets a visible signal that
+    // something happened.
+    s_idx = 0;
+    push_slide_pair();
+    s_state = APP_PP_CONN_CONNECTED;
+    fire_change();
+}
+
 static app_pp_conn_state_t mock_get_state(void) { return s_state; }
 static const char         *mock_get_host (void) { return "mock-pp.local"; }
 static int                 mock_get_port (void) { return 49850; }
@@ -165,6 +179,7 @@ static const pp_client_iface_t s_iface = {
     .stop               = mock_stop,
     .trigger_next       = mock_trigger_next,
     .trigger_previous   = mock_trigger_previous,
+    .reconnect          = mock_reconnect,
     .get_state          = mock_get_state,
     .get_host           = mock_get_host,
     .get_port           = mock_get_port,

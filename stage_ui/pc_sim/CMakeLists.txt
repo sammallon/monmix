@@ -78,10 +78,16 @@ endif()
 set(SHARED_MAIN_SRC
     ${MAIN_DIR}/app_pp_state.c
     ${MAIN_DIR}/app_pp_ui.c
+    ${MAIN_DIR}/app_pp_ui_overlay.c
+    ${MAIN_DIR}/app_pp_ui_settings.c
+    ${MAIN_DIR}/app_prefs.c
+    ${MAIN_DIR}/app_power.c
 )
 
 set(MOCK_SRC
     mocks/mock_app_pp_client.c
+    mocks/mock_app_display.c
+    mocks/mock_app_wifi.c
 )
 
 add_executable(stage_ui_sim
