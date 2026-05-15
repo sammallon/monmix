@@ -8,7 +8,7 @@
 //
 //   pip install cadquery
 //   python -c "import cadquery as cq; \
-//     shp = cq.importers.importStep(r'..\..\elecrow-ref\3D file\ESP32-P4-10_1-inch-20251230.stp'); \
+//     shp = cq.importers.importStep(r'..\elecrow-ref\3D file\ESP32-P4-10_1-inch-20251230.stp'); \
 //     cq.exporters.export(shp, 'elecrow_device.stl', tolerance=0.1, angularTolerance=0.4)"
 //
 // Render examples:

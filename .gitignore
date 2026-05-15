@@ -1,0 +1,44 @@
+# Umbrella .gitignore for the monmix workspace. Each sub-project keeps its
+# own .gitignore for project-specific rules (esp_ui/.gitignore covers the
+# IDF build, secrets, dev-loop scratch, etc.); this file only handles
+# umbrella-level concerns.
+
+# ---------------------------------------------------------------------------
+# Upstream clones — kept locally as references, NOT vendored.
+# Re-clone from upstream rather than pulling into this repo (size + license
+# clarity). The slave build flow expects esp-hosted-mcu/ to be a working
+# clone of github.com/espressif/esp-hosted-mcu, and case/preview_assembly.scad
+# references elecrow-ref/ as a working clone of the CrowPanel reference repo.
+# ---------------------------------------------------------------------------
+/elecrow-ref/
+/esp-hosted-mcu/
+
+# ---------------------------------------------------------------------------
+# Runtime state, snapshots, scratch files at the umbrella root.
+# ---------------------------------------------------------------------------
+/pc_sim_state/
+/host_performs_slave_ota.zip
+/rename_popup.bmp
+
+# ---------------------------------------------------------------------------
+# Agent-tool scratch directories at any level.
+# .copilot — GitHub Copilot CLI session/state
+# .claude  — Anthropic Claude Code session/state
+# .scratch — ad-hoc working dirs (jar dumps, protobuf research, etc.)
+# ---------------------------------------------------------------------------
+.copilot/
+.claude/
+.scratch/
+
+# ---------------------------------------------------------------------------
+# Generic build / dependency artefacts emitted by any sub-project.
+# ---------------------------------------------------------------------------
+build/
+managed_components/
+__pycache__/
+*.pyc
+
+# ---------------------------------------------------------------------------
+# One-off reproducer scripts: convention is repro_*.py is local-only.
+# ---------------------------------------------------------------------------
+repro_*.py
