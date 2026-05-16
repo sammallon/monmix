@@ -110,6 +110,13 @@ CONFIG_LV_USE_SNAPSHOT=y
 # doesn't communicate at a glance from a few feet away.
 CONFIG_LV_FONT_MONTSERRAT_48=y
 
+# Slide-text fonts for the stage display. 36 is the current-slide size
+# (renders a hymn stanza at ~30 chars/line across 1024 px); 24 is the
+# next-slide preview and the timer strip. Each font costs ~30-40 KB of
+# flash for the ASCII range.
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+
 # Bump console UART to 921600 — at 115200 a full-screen screenshot takes
 # ~140 s to base64-stream off-device, which kills the dev-loop. 921600 is
 # rock-solid on the CH340K bridge and brings it to ~18 s (or ~2 s with

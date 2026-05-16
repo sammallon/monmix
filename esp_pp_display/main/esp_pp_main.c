@@ -67,7 +67,11 @@ void app_main(void)
         return;
     }
 
-    app_ui_init();
+    // Resolve the PP client iface early -- app_ui needs it for the
+    // connection-status indicator subscription.
+    const app_pp_client_iface_t *pp = app_pp_client_tcp();
+
+    app_ui_init(pp);
     app_ui_set_status("Connecting WiFi...");
 
     // Backlight stayed at 0 through display+UI bring-up so the user never
@@ -80,7 +84,6 @@ void app_main(void)
     // Spawn the PP client — its connect attempts will fail until WiFi is
     // up, but it backs off cleanly and reconnects when the network arrives.
     // No need to gate on app_wifi_wait_connected.
-    const app_pp_client_iface_t *pp = app_pp_client_tcp();
     pp->start();
 
     // Phase 2 of WiFi: block until associated or retries exhausted.

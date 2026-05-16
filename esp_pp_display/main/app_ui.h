@@ -1,12 +1,13 @@
 #pragma once
 
-// Phase A stub: bring up a splash screen with a status line. Full stage-
-// display UI (current/next slide, timer, stage message) lands in Phase C.
+#include "app_pp_client.h"
 
-// Build the root UI under lvgl_port_lock. Returns once the splash is
-// visible. Safe to call once after app_display_init has succeeded.
-void app_ui_init(void);
+// Build the stage display under lvgl_port_lock. Wires observers to
+// app_pp_state, the PP client iface (for conn-state icon), and app_wifi
+// (for wifi-state icon). Safe to call once after app_display_init.
+void app_ui_init(const app_pp_client_iface_t *pp);
 
-// Replace the status line text. Safe to call from any task — internally
-// takes lvgl_port_lock around the LVGL touch. NULL is treated as "".
+// Replace the boot status line (only visible until the first PP update
+// arrives). Used by the boot path to show "Connecting WiFi..." etc.
+// Once the stage layout takes over, this is a no-op.
 void app_ui_set_status(const char *text);
