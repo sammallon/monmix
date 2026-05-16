@@ -65,6 +65,12 @@ typedef struct {
     int             mix_offset;
     int             mix_count;
 
+    // P11: profile-filtered routed-mix mask from /console/mixTargets.
+    // Defaults to all-true (mix_routed_known=false) so the picker doesn't
+    // briefly hide every mix during the connect window.
+    bool            mix_routed[24];
+    bool            mix_routed_known;
+
     struct {
         app_ms_on_change_t cb;
         void              *ctx;
@@ -374,6 +380,40 @@ static void ws_evt(struct mg_connection *c, int ev, void *ev_data) {
     }
 }
 
+static void mix_targets_evt(struct mg_connection *c, int ev, void *ev_data) {
+    if (ev == MG_EV_CONNECT) {
+        mg_printf(c, "GET /console/mixTargets HTTP/1.0\r\nHost: %s:%d\r\n\r\n",
+                  g_ms.host, g_ms.port);
+    } else if (ev == MG_EV_ERROR) {
+        printf("ms_real: mixTargets GET error: %s\n", (const char *)ev_data);
+    } else if (ev == MG_EV_HTTP_MSG) {
+        struct mg_http_message *hm = (struct mg_http_message *)ev_data;
+        struct mg_str body = hm->body;
+        bool fresh[24] = {0};
+        int routed = 0;
+        // Iterate $.targets[i].id; mg_json_get_num returns false when the
+        // index is past the array end, which is how we know to stop.
+        for (int i = 0; i < 24; ++i) {
+            char idpath[40];
+            snprintf(idpath, sizeof(idpath), "$.targets[%d].id", i);
+            double id_val = 0;
+            if (!mg_json_get_num(body, idpath, &id_val)) break;
+            int mix_idx = (int) id_val;
+            if (mix_idx >= 0 && mix_idx < 24) {
+                fresh[mix_idx] = true;
+                routed++;
+            }
+        }
+        memcpy(g_ms.mix_routed, fresh, sizeof(fresh));
+        g_ms.mix_routed_known = true;
+        printf("ms_real: mix routing %d/%d in profile\n", routed, g_ms.mix_count);
+        for (size_t i = 0; i < g_ms.observer_count; ++i) {
+            g_ms.observers[i].cb(g_ms.observers[i].ctx);
+        }
+        c->is_draining = 1;
+    }
+}
+
 static void info_evt(struct mg_connection *c, int ev, void *ev_data) {
     if (ev == MG_EV_CONNECT) {
         // mg_http_connect opens the TCP socket but doesn't issue the
@@ -406,6 +446,13 @@ static void info_evt(struct mg_connection *c, int ev, void *ev_data) {
                 printf("ms_real: mix offset=%d count=%d\n",
                        g_ms.mix_offset, g_ms.mix_count);
                 app_ui_set_mix_count(g_ms.mix_count);
+                // P11: chain a mixTargets fetch right after info lands so
+                // the routed-mix mask is populated before the picker is
+                // first opened. Async — picker default-opens-all until the
+                // response lands (sub-second on live MS).
+                char mt_url[128];
+                snprintf(mt_url, sizeof(mt_url), "%s/console/mixTargets", g_ms.http_base);
+                mg_http_connect(&g_ms.mgr, mt_url, mix_targets_evt, NULL);
             }
             free(name);
         }
@@ -600,8 +647,12 @@ static const char *m_get_mix_name(int idx) {
     snprintf(buf, sizeof(buf), "Mix %d", idx + 1);
     return buf;
 }
-static bool m_is_mix_routed(int idx)   { (void)idx; return true; }
-static void m_fetch_mix_routing(void)  {}
+static bool m_is_mix_routed(int idx) {
+    if (!g_ms.mix_routed_known) return true;
+    if (idx < 0 || idx >= 24)   return true;
+    return g_ms.mix_routed[idx];
+}
+static void m_fetch_mix_routing(void)  {}  // pc_sim refetches from info_evt's async path
 static bool m_is_mix_list_ready(void)  { return g_ms.ws_open && g_ms.mix_count > 0; }
 static void m_resubscribe(void)        { if (g_ms.ws_open) { g_ms.subscribed = false; subscribe_all(); } }
 static void m_reconnect(void) {

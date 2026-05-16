@@ -149,6 +149,16 @@ static struct {
     bool                    routability_known;
     int                     total_channels;  // from fetch_channel_routability(total)
 
+    // P11: profile-filtered routed-mix mask from /console/mixTargets. MS's
+    // info.isActive on Si Expression returns true for all mix buses
+    // regardless of the active user profile, so mixTargets is the only
+    // signal. mix_routed_known defaults false; ws_is_mix_routed returns
+    // true pre-fetch so the picker doesn't briefly hide everything during
+    // boot. Re-fetched on every WS connect because profile switches in
+    // MS bounce the WS, and that's our trigger for refreshing the mask.
+    bool                    mix_routed[MAX_MIX_BUSES];
+    bool                    mix_routed_known;
+
     // #30 metering. UI-driven flag (set_meter_enabled toggles it), persisted
     // across reconnects so the on-connect handler resubscribes if the user
     // had meter mode on. Param ids parallel the order we sent in subscribe
@@ -178,6 +188,9 @@ static struct {
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+// Forward decls used by mongoose event handlers before the iface block.
+static void ws_fetch_mix_routing(void);
 
 static char *dup_cstr(const char *s) {
     size_t n = strlen(s) + 1;
@@ -707,6 +720,12 @@ static void ws_evt(struct mg_connection *c, int ev, void *ev_data, void *fn_data
         ESP_LOGI(TAG, "ws open to %s", g.ws_url);
         g.ws_open = true;
         set_state(APP_MS_STATE_CONNECTED);
+        // P11: refresh routed-mix mask before subscribing. Profile switches
+        // in MS trigger WS reconnect, and this is our only signal that the
+        // mask may have changed (MS doesn't broadcast profile changes).
+        // Inline blocking HTTP fetch — adds ~50-200 ms to the connect path,
+        // acceptable as a one-time cost per connect.
+        if (g.mix_count > 0) ws_fetch_mix_routing();
         if (!g.subscribed) subscribe_all();
         if (g.mix_count > 0) g.mix_list_received = true;
     } else if (ev == MG_EV_WS_MSG) {
@@ -986,8 +1005,123 @@ static const char *ws_get_mix_name(int idx) {
     return g.mix_names[idx];
 }
 
-static bool ws_is_mix_routed     (int idx)     { (void)idx; return true; }   // TODO: P11 mixTargets
-static void ws_fetch_mix_routing (void)        {}                            // TODO: P11
+// P11: profile-filtered routed-mask read. Defaults true pre-fetch so the
+// picker doesn't briefly hide all mixes between layout-arrival and the
+// /console/mixTargets response landing.
+static bool ws_is_mix_routed(int idx) {
+    if (!g.mix_routed_known)                    return true;
+    if (idx < 0 || idx >= MAX_MIX_BUSES)        return true;
+    return g.mix_routed[idx];
+}
+
+// P11: blocking REST GET of /console/mixTargets — the profile-aware list
+// of mix buses the current MS user view exposes. Returns true on 200 +
+// parseable {"targets":[{"id":N,…}]}. Replaces the earlier per-mix
+// info.isActive sweep, which on this Si console always returns true
+// regardless of profile.
+//
+// Response is up to a few KB on a full-profile fetch (14 mix targets +
+// matrix + LR + Mono), so use a heap-allocated 16 KB buffer scoped to
+// this call. esp_http_client's event-driven body delivery copies chunks
+// into the sink; cap and one-byte NUL terminator keep parsing safe.
+#define MIX_TARGETS_BUF_LEN 16384
+typedef struct {
+    char   *buf;
+    size_t  cap;
+    size_t  len;
+} mt_sink_t;
+
+static esp_err_t mt_http_event(esp_http_client_event_t *evt)
+{
+    mt_sink_t *sink = (mt_sink_t *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && sink->buf) {
+        size_t room = sink->cap - 1 - sink->len;
+        if (room > 0) {
+            size_t n = (size_t) evt->data_len < room ? (size_t) evt->data_len : room;
+            memcpy(sink->buf + sink->len, evt->data, n);
+            sink->len += n;
+        }
+    }
+    return ESP_OK;
+}
+
+static bool fetch_mix_targets(bool routed_out[MAX_MIX_BUSES])
+{
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%u/console/mixTargets",
+             app_config_ms_host(), (unsigned) app_config_ms_port());
+
+    mt_sink_t sink = { .buf = malloc(MIX_TARGETS_BUF_LEN),
+                       .cap = MIX_TARGETS_BUF_LEN, .len = 0 };
+    if (!sink.buf) return false;
+
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = mt_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = 3000,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) { free(sink.buf); return false; }
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200 || sink.len == 0) {
+        ESP_LOGW(TAG, "mixTargets fetch failed: err=%d status=%d len=%u",
+                 err, status, (unsigned) sink.len);
+        free(sink.buf);
+        return false;
+    }
+    sink.buf[sink.len] = '\0';
+
+    cJSON *root = cJSON_Parse(sink.buf);
+    free(sink.buf);
+    if (!root) return false;
+    cJSON *targets = cJSON_GetObjectItem(root, "targets");
+    bool ok = cJSON_IsArray(targets);
+    if (ok) {
+        memset(routed_out, 0, sizeof(bool) * MAX_MIX_BUSES);
+        cJSON *t;
+        cJSON_ArrayForEach(t, targets) {
+            cJSON *jid = cJSON_GetObjectItem(t, "id");
+            if (cJSON_IsNumber(jid)) {
+                int mix_idx = (int) jid->valuedouble;
+                if (mix_idx >= 0 && mix_idx < MAX_MIX_BUSES) {
+                    routed_out[mix_idx] = true;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+// P11: one-shot fetch of the profile-filtered mix list. Called from
+// app_main right after set_mix_layout so saved-index validation sees
+// the routed mask before WS subscribes wire it up live. Also called
+// from MG_EV_WS_OPEN for per-reconnect refresh (profile switch in MS
+// triggers WS reconnect; this picks up the new mask without a reboot).
+static void ws_fetch_mix_routing(void)
+{
+    if (g.mix_count <= 0) return;
+    bool fresh[MAX_MIX_BUSES] = {0};
+    if (!fetch_mix_targets(fresh)) {
+        // Keep prior mask on transient failure (network blip during reconnect).
+        // First-boot failure leaves mix_routed_known=false so ws_is_mix_routed
+        // defaults to "all routed" -- safer than hiding every mix.
+        return;
+    }
+    int routed = 0;
+    for (int i = 0; i < g.mix_count && i < MAX_MIX_BUSES; ++i) {
+        g.mix_routed[i] = fresh[i];
+        if (fresh[i]) routed++;
+    }
+    g.mix_routed_known = true;
+    ESP_LOGI(TAG, "mix routing: %d/%d in profile", routed, g.mix_count);
+    notify_subscribers();
+}
+
 static bool ws_is_mix_list_ready (void)        { return g.mix_list_received; }
 static void ws_resubscribe       (void)        { if (g.ws_open) { g.subscribed = false; subscribe_all(); } }
 // Force the worker onto a new ws_url after a runtime host/port change:
@@ -1007,8 +1141,10 @@ static void ws_reconnect         (void)        {
     if (strcmp(prev_url, g.ws_url) != 0) {
         g.routability_known = false;
         g.total_channels    = 0;
+        g.mix_routed_known  = false;
         memset(g.strip_names, 0, sizeof(g.strip_names));
         memset(g.routable,    0, sizeof(g.routable));
+        memset(g.mix_routed,  0, sizeof(g.mix_routed));
         g.console_attached  = false;
     }
     if (g.ws_conn) g.ws_conn->is_draining = 1;

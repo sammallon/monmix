@@ -62,6 +62,17 @@ def _check_expect(stdout: str, stderr: str, returncode: int, expect: dict, fails
     for s in expect.get("stderr_not_contains", []):
         if s in stderr:
             fails.append(f"stderr has forbidden: {s!r}")
+    # Optional structured assertion: a callable(stdout, stderr) -> list[str].
+    # Each returned string becomes a failure message. Used when the assertion
+    # requires cross-line correlation (e.g. counts in two log lines must match)
+    # that plain substring matching can't express.
+    vfn = expect.get("verify")
+    if callable(vfn):
+        try:
+            extra = vfn(stdout, stderr) or []
+        except Exception as e:
+            extra = [f"verify() raised: {e!r}"]
+        fails.extend(extra)
 
 
 def run_one(test: dict) -> tuple[bool, str]:

@@ -3160,6 +3160,7 @@ static void build_mix_picker_popup(void)
     for (int i = 0; i < s_mix_count; ++i) {
         if (!has_routed_query || s_ms->is_mix_routed(i)) routed_n++;
     }
+    ESP_LOGI(TAG, "mix picker: %d/%d routed", routed_n, s_mix_count);
 
     // 4-column grid; cols × rows sized to fit the routed mix count.
     const int btn_w  = 110;

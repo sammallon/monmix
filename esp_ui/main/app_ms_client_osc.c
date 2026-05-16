@@ -33,6 +33,7 @@
 #include <stdint.h>
 
 #include "cJSON.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -261,6 +262,11 @@ static struct {
     char                    mix_names[MAX_MIX_BUSES][32];
     bool                    mix_list_received;
 
+    // P11: profile-filtered routed-mix mask from /console/mixTargets.
+    // Same shape as ws backend; see app_ms_client_ws.c for the rationale.
+    bool                    mix_routed[MAX_MIX_BUSES];
+    bool                    mix_routed_known;
+
     struct {
         app_ms_on_change_t cb;
         void              *ctx;
@@ -351,6 +357,10 @@ static void filter_rebuild(void) {
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+// Forward decl: called from info_evt's MS-info handler so the routed-mix
+// mask refreshes on every /console/information arrival, not just at boot.
+static void osc_fetch_mix_routing(void);
 
 static void notify_subscribers(void) {
     for (size_t i = 0; i < g.subscriber_count; ++i) {
@@ -572,6 +582,12 @@ static void info_evt(struct mg_connection *c, int ev, void *ev_data, void *fn_da
                             ESP_LOGI(TAG, "mix layout: offset=%d count=%d",
                                      g.mix_offset, g.mix_count);
                             notify_subscribers();
+                            // P11: refresh routed-mix mask. Boot path also
+                            // calls osc_fetch_mix_routing from esp_ui_main,
+                            // but if /console/information lands after that
+                            // (deferred-info case) the mix_count was 0 at
+                            // boot and the boot fetch no-op'd; do it here.
+                            osc_fetch_mix_routing();
                         }
                     }
                 }
@@ -1148,8 +1164,102 @@ static const char *osc_get_mix_name(int idx) {
     return g.mix_names[idx];
 }
 
-static bool osc_is_mix_routed     (int idx)     { (void)idx; return true; }   // TODO: P11 mixTargets
-static void osc_fetch_mix_routing (void)        {}                            // TODO: P11
+static bool osc_is_mix_routed(int idx) {
+    if (!g.mix_routed_known)             return true;
+    if (idx < 0 || idx >= MAX_MIX_BUSES) return true;
+    return g.mix_routed[idx];
+}
+
+// P11: REST GET /console/mixTargets. Identical to the ws backend's
+// fetch_mix_targets (see app_ms_client_ws.c for rationale). Uses
+// esp_http_client (synchronous) rather than mg_http_connect because
+// esp_ui_main's boot-time validation reads is_mix_routed immediately
+// after fetch_mix_routing returns -- async fetch would race.
+#define MIX_TARGETS_BUF_LEN 16384
+typedef struct {
+    char   *buf;
+    size_t  cap;
+    size_t  len;
+} mt_sink_t;
+
+static esp_err_t mt_http_event(esp_http_client_event_t *evt) {
+    mt_sink_t *sink = (mt_sink_t *) evt->user_data;
+    if (evt->event_id == HTTP_EVENT_ON_DATA && sink && sink->buf) {
+        size_t room = sink->cap - 1 - sink->len;
+        if (room > 0) {
+            size_t n = (size_t) evt->data_len < room ? (size_t) evt->data_len : room;
+            memcpy(sink->buf + sink->len, evt->data, n);
+            sink->len += n;
+        }
+    }
+    return ESP_OK;
+}
+
+static bool fetch_mix_targets(bool routed_out[MAX_MIX_BUSES]) {
+    char url[160];
+    snprintf(url, sizeof(url), "http://%s:%u/console/mixTargets",
+             app_config_ms_host(), (unsigned) app_config_ms_port());
+
+    mt_sink_t sink = { .buf = malloc(MIX_TARGETS_BUF_LEN),
+                       .cap = MIX_TARGETS_BUF_LEN, .len = 0 };
+    if (!sink.buf) return false;
+
+    esp_http_client_config_t cfg = {
+        .url           = url,
+        .event_handler = mt_http_event,
+        .user_data     = &sink,
+        .timeout_ms    = 3000,
+    };
+    esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+    if (!cli) { free(sink.buf); return false; }
+
+    esp_err_t err = esp_http_client_perform(cli);
+    int status   = esp_http_client_get_status_code(cli);
+    esp_http_client_cleanup(cli);
+    if (err != ESP_OK || status != 200 || sink.len == 0) {
+        ESP_LOGW(TAG, "mixTargets fetch failed: err=%d status=%d len=%u",
+                 err, status, (unsigned) sink.len);
+        free(sink.buf);
+        return false;
+    }
+    sink.buf[sink.len] = '\0';
+
+    cJSON *root = cJSON_Parse(sink.buf);
+    free(sink.buf);
+    if (!root) return false;
+    cJSON *targets = cJSON_GetObjectItem(root, "targets");
+    bool ok = cJSON_IsArray(targets);
+    if (ok) {
+        memset(routed_out, 0, sizeof(bool) * MAX_MIX_BUSES);
+        cJSON *t;
+        cJSON_ArrayForEach(t, targets) {
+            cJSON *jid = cJSON_GetObjectItem(t, "id");
+            if (cJSON_IsNumber(jid)) {
+                int mix_idx = (int) jid->valuedouble;
+                if (mix_idx >= 0 && mix_idx < MAX_MIX_BUSES) {
+                    routed_out[mix_idx] = true;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return ok;
+}
+
+static void osc_fetch_mix_routing(void) {
+    if (g.mix_count <= 0) return;
+    bool fresh[MAX_MIX_BUSES] = {0};
+    if (!fetch_mix_targets(fresh)) return;
+    int routed = 0;
+    for (int i = 0; i < g.mix_count && i < MAX_MIX_BUSES; ++i) {
+        g.mix_routed[i] = fresh[i];
+        if (fresh[i]) routed++;
+    }
+    g.mix_routed_known = true;
+    ESP_LOGI(TAG, "mix routing: %d/%d in profile", routed, g.mix_count);
+    notify_subscribers();
+}
+
 static bool osc_is_mix_list_ready (void)        { return g.mix_list_received; }
 static void osc_resubscribe       (void)        {
     // Heartbeat covers the subscribe; refresh the filter (the tracked-id
