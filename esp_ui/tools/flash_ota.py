@@ -30,7 +30,11 @@ from pathlib import Path
 
 DEFAULT_BIN = Path(__file__).resolve().parent.parent / "build" / "esp_ui.bin"
 NETCON_PORT = 4242
-HTTP_BIND_PORT = 0  # 0 = ephemeral
+# Fixed HTTP port for the firmware-serving listener. Pinned (rather than
+# ephemeral) so router firewall rules can be scoped to this one port instead
+# of having to allow any high TCP port. Override with --http-port if it
+# collides with something else on the host machine.
+HTTP_BIND_PORT = 18080
 
 
 def detect_local_ip(target_host: str) -> str:
@@ -54,7 +58,7 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
-def start_http_server(bin_path: Path) -> tuple[socketserver.TCPServer, int, str]:
+def start_http_server(bin_path: Path, http_port: int) -> tuple[socketserver.TCPServer, int, str]:
     """Serve bin_path's directory; return (server, port, basename).
 
     The device fetches `http://<our_ip>:<port>/<basename>`.
@@ -62,7 +66,7 @@ def start_http_server(bin_path: Path) -> tuple[socketserver.TCPServer, int, str]
     dirname = bin_path.parent
     basename = bin_path.name
     os.chdir(dirname)  # SimpleHTTPRequestHandler serves from cwd
-    server = socketserver.TCPServer(("0.0.0.0", HTTP_BIND_PORT), QuietHandler)
+    server = socketserver.TCPServer(("0.0.0.0", http_port), QuietHandler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, port, basename
@@ -149,6 +153,10 @@ def main() -> int:
                     help="APP_NET_TOKEN from secrets.h (or env MONMIX_NET_TOKEN)")
     ap.add_argument("--bin", default=str(DEFAULT_BIN),
                     help=f"Firmware .bin path (default: {DEFAULT_BIN})")
+    ap.add_argument("--http-port", type=int, default=HTTP_BIND_PORT,
+                    help=f"TCP port to bind the firmware-serving HTTP server on "
+                         f"(default {HTTP_BIND_PORT}; routers expect this port "
+                         f"for cross-subnet OTA fetches)")
     args = ap.parse_args()
 
     if not args.token:
@@ -161,7 +169,7 @@ def main() -> int:
         return 2
 
     print(f"[host] firmware: {bin_path} ({bin_path.stat().st_size:,} bytes)")
-    server, http_port, basename = start_http_server(bin_path)
+    server, http_port, basename = start_http_server(bin_path, args.http_port)
     local_ip = detect_local_ip(args.host)
     url = f"http://{local_ip}:{http_port}/{basename}"
     print(f"[host] serving at {url}")
