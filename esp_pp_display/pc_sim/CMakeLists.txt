@@ -36,6 +36,20 @@ else()
     set(SDL2_LIBS     PkgConfig::SDL2)
 endif()
 
+# cJSON for pp_client_real.c parsing. On the tablet this lands via the
+# espressif/cjson registry component; on PC we vendor the upstream
+# sources directly.
+FetchContent_Declare(
+    cjson
+    URL      https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz
+    URL_HASH SHA256=3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5
+)
+FetchContent_GetProperties(cjson)
+if(NOT cjson_POPULATED)
+    FetchContent_Populate(cjson)
+endif()
+set(CJSON_DIR ${cjson_SOURCE_DIR})
+
 # LVGL static lib configured by our lv_conf.h (NOT IDF Kconfig).
 file(GLOB_RECURSE LVGL_SRC CONFIGURE_DEPENDS ${LVGL_DIR}/src/*.c)
 add_library(lvgl STATIC ${LVGL_SRC})
@@ -69,10 +83,16 @@ set(MOCK_SRC
     mocks/mock_freertos.c
 )
 
+set(SIM_SRC
+    pp_client_real.c
+    ${CJSON_DIR}/cJSON.c
+)
+
 add_executable(esp_pp_sim
     pc_main.c
     ${REUSED_MAIN_SRC}
     ${MOCK_SRC}
+    ${SIM_SRC}
 )
 
 # Stubs first so #include "esp_log.h" etc. resolve to our shims.
@@ -81,6 +101,7 @@ target_include_directories(esp_pp_sim PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${MAIN_DIR}
     ${SDL2_INCLUDES}
+    ${CJSON_DIR}
 )
 
 target_link_libraries(esp_pp_sim PRIVATE lvgl ${SDL2_LIBS})

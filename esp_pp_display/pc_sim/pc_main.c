@@ -32,6 +32,7 @@
 #include "app_pp_client.h"
 #include "app_wifi.h"
 #include "app_ui.h"
+#include "pp_client_real.h"
 
 extern void mock_pp_set_conn_state(app_pp_conn_state_t s);
 extern void mock_wifi_set_state(app_wifi_state_t s);
@@ -144,11 +145,34 @@ static void tick_running_timer_if_needed(uint32_t now_ms)
 
 int main(int argc, char *argv[])
 {
-    (void) argc; (void) argv;
+    const char *pp_host = NULL;
+    uint16_t    pp_port = 63306;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--pp-host") == 0 && i + 1 < argc) {
+            pp_host = argv[++i];
+        } else if (strcmp(argv[i], "--pp-port") == 0 && i + 1 < argc) {
+            pp_port = (uint16_t) atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            fprintf(stderr,
+                "usage: esp_pp_sim [--pp-host HOST] [--pp-port PORT]\n"
+                "  default: mock mode (keyboard-driven sample data)\n"
+                "  with --pp-host: live ProPresenter mode (read-only display)\n");
+            return 0;
+        }
+    }
+
+    bool real_mode = (pp_host != NULL);
     fprintf(stderr, "esp_pp_display PC sim -- 1024x600 stage display\n");
-    fprintf(stderr, "  Keys: 1-5 slide, N next-slide toggle, M stage msg,\n");
-    fprintf(stderr, "        T timer state, W wifi toggle, P pp toggle,\n");
-    fprintf(stderr, "        ESC / Q quit\n");
+    if (real_mode) {
+        fprintf(stderr, "  mode: live PP at %s:%u\n", pp_host, pp_port);
+        fprintf(stderr, "  Keys: ESC/Q quit\n");
+        fprintf(stderr, "        (slide/timer/msg data comes from PP; drive PP itself to see changes)\n");
+    } else {
+        fprintf(stderr, "  mode: mock (no PP host; use --pp-host HOST to connect to live PP)\n");
+        fprintf(stderr, "  Keys: 1-5 slide, N next-slide toggle, M stage msg,\n");
+        fprintf(stderr, "        T timer state, W wifi toggle, P pp toggle,\n");
+        fprintf(stderr, "        ESC / Q quit\n");
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -161,18 +185,28 @@ int main(int argc, char *argv[])
         fprintf(stderr, "lv_sdl_window_create failed\n");
         return 1;
     }
-    lv_sdl_window_set_title(disp, "esp_pp_display sim");
+    lv_sdl_window_set_title(disp, real_mode ? "esp_pp_display sim (LIVE)" : "esp_pp_display sim (mock)");
     lv_sdl_mouse_create();
     lv_sdl_keyboard_create();
 
     // Subsystems used by app_ui.
     app_pp_state_init();
-    const app_pp_client_iface_t *pp = app_pp_client_tcp();
+    const app_pp_client_iface_t *pp = real_mode
+        ? pp_client_real(pp_host, pp_port)
+        : app_pp_client_tcp();
+    if (!pp) {
+        fprintf(stderr, "PP client init failed\n");
+        return 1;
+    }
     app_ui_init(pp);
 
-    // Seed with sample data so the layout is populated on first frame.
-    load_slide(0);
-    apply_timer_state();
+    // In mock mode, seed with sample data so the layout is populated on
+    // first frame. In live mode, the data comes from PP via the read
+    // thread; until the first broadcast arrives the labels are empty.
+    if (!real_mode) {
+        load_slide(0);
+        apply_timer_state();
+    }
 
     uint32_t last_tick = SDL_GetTicks();
     bool running = true;
@@ -183,6 +217,9 @@ int main(int argc, char *argv[])
             if (ev.type == SDL_KEYDOWN) {
                 SDL_Keycode k = ev.key.keysym.sym;
                 if (k == SDLK_ESCAPE || k == SDLK_q) { running = false; break; }
+                // In live mode, suppress the mock-data shortcuts so the
+                // user doesn't fight with PP's broadcasts.
+                if (real_mode) continue;
                 if (k >= SDLK_1 && k <= SDLK_5) {
                     load_slide(k - SDLK_1);
                 } else if (k == SDLK_n) {
@@ -209,7 +246,7 @@ int main(int argc, char *argv[])
         uint32_t dt  = now - last_tick;
         last_tick    = now;
         lv_tick_inc(dt);
-        tick_running_timer_if_needed(now);
+        if (!real_mode) tick_running_timer_if_needed(now);
         uint32_t next_ms = lv_timer_handler();
         SDL_Delay(next_ms < 5 ? 5 : (next_ms > 30 ? 30 : next_ms));
     }
