@@ -18,6 +18,8 @@
 #include "freertos/task.h"
 
 #include "app_netconsole.h"
+#include "app_display.h"
+#include "app_prefs.h"
 #include "app_ui.h"
 
 static const char *TAG = "app_ota";
@@ -41,9 +43,18 @@ typedef struct {
 
 #define OTA_PROGRESS_THROTTLE_MS  500    // limit progress spam
 
+// Mitigation for the OTA-time flicker: under flash-write + TCP load
+// the LVGL task is starved enough that the DSI panel briefly scans
+// stale/uninitialised framebuffer regions, showing bright artifacts.
+// Dimming the backlight while the download is in flight makes the
+// artifacts much less visible without hiding the progress overlay.
+// 15 % is the smallest value where the LVGL widgets are still legible.
+#define OTA_BACKLIGHT_PCT  15
+
 static void ota_task(void *arg)
 {
     ota_args_t *args = (ota_args_t *) arg;
+    uint8_t saved_brightness = app_prefs_get_brightness_pct();
 
     esp_http_client_config_t http_cfg = {
         .url               = args->url,
@@ -57,7 +68,9 @@ static void ota_task(void *arg)
 
     app_netconsole_send_line("OTA_BEGIN url=%s", args->url);
     app_ui_ota_show();
-    ESP_LOGI(TAG, "begin url=%s", args->url);
+    // Dim AFTER the overlay is up so the user sees the transition.
+    app_display_set_backlight_pct(OTA_BACKLIGHT_PCT);
+    ESP_LOGI(TAG, "begin url=%s (backlight dimmed to %d%%)", args->url, OTA_BACKLIGHT_PCT);
 
     esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
     if (err != ESP_OK || handle == NULL) {
@@ -95,6 +108,7 @@ static void ota_task(void *arg)
     if (err != ESP_OK || !esp_https_ota_is_complete_data_received(handle)) {
         app_netconsole_send_line("OTA_ERROR perform %s", esp_err_to_name(err));
         app_ui_ota_done(false, esp_err_to_name(err));
+        app_display_set_backlight_pct(saved_brightness);   // restore on failure
         ESP_LOGE(TAG, "perform failed: %s", esp_err_to_name(err));
         esp_https_ota_abort(handle);
         goto done;
@@ -105,12 +119,16 @@ static void ota_task(void *arg)
     if (err != ESP_OK) {
         app_netconsole_send_line("OTA_ERROR finish %s", esp_err_to_name(err));
         app_ui_ota_done(false, esp_err_to_name(err));
+        app_display_set_backlight_pct(saved_brightness);
         ESP_LOGE(TAG, "finish failed: %s", esp_err_to_name(err));
         goto done;
     }
 
     app_netconsole_send_line("OTA_FINISH ok rebooting");
     app_ui_ota_done(true, "Update complete, restarting...");
+    // Restore on success too -- the user sees a clean "restart" message
+    // at full brightness for ~800 ms before the reboot blanks the panel.
+    app_display_set_backlight_pct(saved_brightness);
     ESP_LOGI(TAG, "OTA finished; rebooting");
     // Give the client time to see the line + the LVGL overlay to redraw.
     vTaskDelay(pdMS_TO_TICKS(800));
@@ -123,6 +141,7 @@ done:
         // begin/perform failed before we could call app_ui_ota_done;
         // emit a generic failure marker so the overlay dismisses.
         app_ui_ota_done(false, "Update failed (begin/abort)");
+        app_display_set_backlight_pct(saved_brightness);
     }
     free(args);
     atomic_store(&s_in_progress, false);
