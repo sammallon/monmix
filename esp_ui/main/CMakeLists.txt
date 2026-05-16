@@ -18,6 +18,8 @@ idf_component_register(
         "app_prefs.c"
         "app_power.c"
         "app_time.c"
+        "app_netconsole.c"
+        "app_ota.c"
         "images/splash_logo.c"
         "fonts/font_monmix_level.c"
     INCLUDE_DIRS
@@ -38,10 +40,14 @@ idf_component_register(
         console
         mbedtls
         esp_http_client
+        esp_https_ota
+        app_update
         esp_timer
         esp_rom
+        lwip
 )
 # Mongoose now does the WS pipe + offline-mixer attach POST. esp_http_client
 # stays for app_ms_info.c's pre-WS /console/information probe (it runs
 # before the WS task is up; quicker to keep one focused REST call than to
-# block the WS task on the boot fetch).
+# block the WS task on the boot fetch). esp_https_ota + app_update wire
+# the network-OTA path; lwip for the netconsole TCP socket.

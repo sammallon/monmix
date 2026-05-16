@@ -27,9 +27,14 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # per-channel widget/state arrays (#42).
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 
-# Custom partition table (4 MB app + 8 MB FAT for fonts/assets/NVS overflow).
+# Custom partition table. Layout in `partitions.csv`: dual OTA app slots
+# (4 MB each), nvs, phy_init, otadata, coredump, and a (currently unused)
+# storage region for future use. App rollback is enabled so a bad OTA
+# image that crashes during boot reverts to the prior slot.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_APP_ROLLBACK_ENABLE=y
 
 # FreeRTOS at 1 kHz for snappier UI tick & touch event delivery.
 CONFIG_FREERTOS_HZ=1000

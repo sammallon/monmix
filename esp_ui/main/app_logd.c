@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
@@ -45,6 +46,17 @@ static int                s_seq      = 0;
 static size_t             s_bytes    = 0;
 static bool               s_trace_on = true;
 static volatile uint32_t  s_dropped  = 0;
+
+// Subscriber table. Small (4 slots is plenty -- typical usage: 1 for
+// net-console, leaves headroom). Iterated from the worker task only,
+// guarded by a mutex for register/unregister races against iteration.
+#define LOGD_MAX_SUBSCRIBERS 4
+typedef struct {
+    app_logd_subscriber_t cb;
+    void                 *ctx;
+} logd_sub_t;
+static logd_sub_t           s_subs[LOGD_MAX_SUBSCRIBERS];
+static SemaphoreHandle_t    s_subs_mtx = NULL;
 
 // ─────────────────────────────────────────────────────────────────────────
 // File / sequence management
@@ -188,6 +200,17 @@ static void logger_task(void *arg)
             fwrite(item.buf, 1, item.len, s_file);
             s_bytes += item.len;
             unflushed++;
+            // Fan out to subscribers. Held under the subs mutex so a
+            // concurrent subscribe/unsubscribe can't observe the iteration
+            // mid-flight. Subscribers are documented non-blocking.
+            if (s_subs_mtx && xSemaphoreTake(s_subs_mtx, 0) == pdTRUE) {
+                for (int i = 0; i < LOGD_MAX_SUBSCRIBERS; ++i) {
+                    if (s_subs[i].cb) {
+                        s_subs[i].cb(item.buf, item.len, s_subs[i].ctx);
+                    }
+                }
+                xSemaphoreGive(s_subs_mtx);
+            }
         }
         TickType_t now = xTaskGetTickCount();
         bool time_due = (now - last_flush) >= pdMS_TO_TICKS(FLUSH_INTERVAL_MS);
@@ -326,4 +349,43 @@ void app_logd_set_trace(bool on)
 bool app_logd_get_trace(void)
 {
     return s_trace_on;
+}
+
+// Subscriber registration. Returns false if the table is full. ctx
+// distinguishes multiple registrations of the same callback. Safe to
+// call from any task -- guarded by the same mutex the worker takes
+// when iterating, so a registration arriving mid-iteration just waits
+// one log line.
+bool app_logd_subscribe(app_logd_subscriber_t cb, void *ctx)
+{
+    if (!cb) return false;
+    if (!s_subs_mtx) {
+        s_subs_mtx = xSemaphoreCreateMutex();
+        if (!s_subs_mtx) return false;
+    }
+    bool added = false;
+    xSemaphoreTake(s_subs_mtx, portMAX_DELAY);
+    for (int i = 0; i < LOGD_MAX_SUBSCRIBERS; ++i) {
+        if (s_subs[i].cb == NULL) {
+            s_subs[i].cb  = cb;
+            s_subs[i].ctx = ctx;
+            added = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_subs_mtx);
+    return added;
+}
+
+void app_logd_unsubscribe(app_logd_subscriber_t cb, void *ctx)
+{
+    if (!cb || !s_subs_mtx) return;
+    xSemaphoreTake(s_subs_mtx, portMAX_DELAY);
+    for (int i = 0; i < LOGD_MAX_SUBSCRIBERS; ++i) {
+        if (s_subs[i].cb == cb && s_subs[i].ctx == ctx) {
+            s_subs[i].cb  = NULL;
+            s_subs[i].ctx = NULL;
+        }
+    }
+    xSemaphoreGive(s_subs_mtx);
 }

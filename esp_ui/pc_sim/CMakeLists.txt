@@ -129,6 +129,7 @@ set(MOCK_SRC
     mocks/mock_app_display.c
     mocks/mock_app_logd.c
     mocks/mock_app_ms_client.c
+    mocks/mock_app_ota.c
     mocks/mock_app_storage.c
     mocks/mock_app_time.c
     mocks/mock_app_wifi.c

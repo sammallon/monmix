@@ -5299,6 +5299,178 @@ void app_ui_mcfg_apply(const char *host, const char *port_str)
     on_mcfg_save(NULL);
 }
 
+// ─────────────────────────────────────────────────────────────────
+// OTA progress overlay
+// ─────────────────────────────────────────────────────────────────
+// Modal full-screen scrim shown while a network OTA is in flight. The
+// scrim catches touches (so the user can't fiddle with faders during
+// the update) and shows progress + a status label. On success the
+// device reboots; on failure the overlay auto-dismisses after a few
+// seconds so the UI returns to normal.
+
+static lv_obj_t *s_ota_scrim;
+static lv_obj_t *s_ota_card;
+static lv_obj_t *s_ota_status_label;
+static lv_obj_t *s_ota_progress_bar;
+
+static void ota_build_overlay_locked(void)
+{
+    if (s_ota_scrim) return;
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_t *scrim = lv_obj_create(scr);
+    lv_obj_set_size(scrim, lv_obj_get_width(scr), lv_obj_get_height(scr));
+    lv_obj_set_pos(scrim, 0, 0);
+    lv_obj_set_style_radius(scrim, 0, 0);
+    lv_obj_set_style_border_width(scrim, 0, 0);
+    lv_obj_set_style_pad_all(scrim, 0, 0);
+    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(scrim, LV_OPA_80, 0);
+    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
+    s_ota_scrim = scrim;
+
+    lv_obj_t *card = lv_obj_create(scrim);
+    lv_obj_set_size(card, 540, 240);
+    lv_obj_center(card);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x4080E0), 0);
+    lv_obj_set_style_pad_all(card, 24, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    s_ota_card = card;
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Updating firmware");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *status = lv_label_create(card);
+    lv_label_set_text(status, "Preparing...");
+    lv_obj_align(status, LV_ALIGN_CENTER, 0, -10);
+    s_ota_status_label = status;
+
+    lv_obj_t *bar = lv_bar_create(card);
+    lv_obj_set_size(bar, 440, 16);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_bar_set_range(bar, 0, 1000);
+    lv_bar_set_value(bar, 0, LV_ANIM_OFF);
+    s_ota_progress_bar = bar;
+}
+
+static void ota_show_async(void *unused)
+{
+    (void) unused;
+    ota_build_overlay_locked();
+    lv_obj_remove_flag(s_ota_scrim, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_ota_scrim);
+    if (s_ota_status_label) lv_label_set_text(s_ota_status_label, "Preparing...");
+    if (s_ota_progress_bar) lv_bar_set_value(s_ota_progress_bar, 0, LV_ANIM_OFF);
+}
+
+// Payload for the async update so we don't fight with the OTA task
+// over a shared global. Allocated by the caller, freed in the async
+// callback.
+typedef struct {
+    int done;
+    int total;
+} ota_update_args_t;
+
+static void ota_update_async(void *arg)
+{
+    ota_update_args_t *a = (ota_update_args_t *) arg;
+    if (!s_ota_scrim) ota_build_overlay_locked();
+    if (s_ota_progress_bar && a->total > 0) {
+        int permille = (int) (((int64_t) a->done * 1000) / a->total);
+        if (permille < 0)    permille = 0;
+        if (permille > 1000) permille = 1000;
+        lv_bar_set_value(s_ota_progress_bar, permille, LV_ANIM_OFF);
+    }
+    if (s_ota_status_label) {
+        char buf[64];
+        if (a->total > 0) {
+            snprintf(buf, sizeof(buf), "%d / %d KB",
+                     a->done / 1024, a->total / 1024);
+        } else {
+            snprintf(buf, sizeof(buf), "%d KB downloaded", a->done / 1024);
+        }
+        lv_label_set_text(s_ota_status_label, buf);
+    }
+    free(a);
+}
+
+typedef struct {
+    bool success;
+    char msg[80];
+} ota_done_args_t;
+
+static void ota_done_dismiss_cb(lv_timer_t *t)
+{
+    (void) t;
+    if (s_ota_scrim) lv_obj_add_flag(s_ota_scrim, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ota_done_async(void *arg)
+{
+    ota_done_args_t *a = (ota_done_args_t *) arg;
+    if (!s_ota_scrim) ota_build_overlay_locked();
+    if (s_ota_status_label) {
+        lv_label_set_text(s_ota_status_label, a->msg);
+    }
+    if (s_ota_progress_bar && a->success) {
+        lv_bar_set_value(s_ota_progress_bar, 1000, LV_ANIM_OFF);
+    }
+    if (s_ota_card) {
+        lv_obj_set_style_border_color(s_ota_card,
+            a->success ? lv_color_hex(0x40C040) : lv_color_hex(0xE04040), 0);
+    }
+    if (!a->success) {
+        // Auto-dismiss the error overlay after 5 s so the user can
+        // get back to using the panel. Success path doesn't need a
+        // dismiss -- the device reboots.
+        lv_timer_t *t = lv_timer_create(ota_done_dismiss_cb, 5000, NULL);
+        lv_timer_set_repeat_count(t, 1);
+    }
+    free(a);
+}
+
+void app_ui_ota_show(void)
+{
+    if (lvgl_port_lock(0)) {
+        ota_show_async(NULL);
+        lvgl_port_unlock();
+    } else {
+        lv_async_call(ota_show_async, NULL);
+    }
+}
+
+void app_ui_ota_update(int done, int total)
+{
+    ota_update_args_t *a = (ota_update_args_t *) calloc(1, sizeof(*a));
+    if (!a) return;
+    a->done  = done;
+    a->total = total;
+    if (lvgl_port_lock(0)) {
+        ota_update_async(a);
+        lvgl_port_unlock();
+    } else {
+        lv_async_call(ota_update_async, a);
+    }
+}
+
+void app_ui_ota_done(bool success, const char *msg)
+{
+    ota_done_args_t *a = (ota_done_args_t *) calloc(1, sizeof(*a));
+    if (!a) return;
+    a->success = success;
+    snprintf(a->msg, sizeof(a->msg), "%s", msg ? msg : (success ? "Updated, restarting..." : "Update failed"));
+    if (lvgl_port_lock(0)) {
+        ota_done_async(a);
+        lvgl_port_unlock();
+    } else {
+        lv_async_call(ota_done_async, a);
+    }
+}
+
 static void on_chpick_save_yes(lv_event_t *e)
 {
     (void)e;

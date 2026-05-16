@@ -10,6 +10,7 @@
 
 #include "app_display.h"
 #include "app_ms_client.h"
+#include "app_ota.h"
 #include "app_prefs.h"
 #include "app_wifi.h"
 
@@ -275,6 +276,17 @@ static void tick_cb(lv_timer_t *t)
     uint32_t inactive      = lv_display_get_inactive_time(NULL);
     uint32_t last_touch_ms = (now > inactive) ? (now - inactive) : 0;
     bool deg               = degraded_state();
+
+    // Suppress all phase transitions while a network OTA is in flight.
+    // The OTA overlay owns the screen + the firmware is being written;
+    // a degraded-window sleep here would blank the panel mid-update.
+    // Touch activity is kept fresh so the post-OTA wake clock isn't
+    // immediately tripped by stale inactivity.
+    if (app_ota_in_progress()) {
+        lv_display_trigger_activity(NULL);
+        s_was_degraded = deg;
+        return;
+    }
 
     // Mid-sleep degradation arms the auto-wake gate so the eventual
     // recovery wakes the panel. Covers "user manually slept while

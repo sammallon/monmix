@@ -70,3 +70,20 @@ void app_ui_settings_dump_tiles(void);
 // regression to drive the bug repro without driving overlay taps. Caller
 // must hold lvgl_port_lock.
 void app_ui_mcfg_apply(const char *host, const char *port_str);
+
+// OTA progress overlay. Built lazily on first show. Safe to call from
+// any task -- internally uses lvgl_port_lock + lv_async_call. The OTA
+// task in app_ota.c calls these as the OTA progresses:
+//
+//   show()                      OTA started; modal full-screen scrim
+//                               appears with title + indeterminate
+//                               "preparing" label.
+//   update(done, total)         Replaces the label and drives a bar.
+//                               total <= 0 leaves the bar indeterminate.
+//   done(success, msg)          Replaces the label with msg (the device
+//                               reboots after this on success; on
+//                               failure the overlay auto-dismisses after
+//                               a few seconds).
+void app_ui_ota_show(void);
+void app_ui_ota_update(int done, int total);
+void app_ui_ota_done(bool success, const char *msg);

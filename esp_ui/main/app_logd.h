@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // Disk-logger for runtime forensics. Each call emits one timestamped line
 // to a rolling text file on the SD card (`/sdcard/monmix-NNNN.log`).
@@ -36,3 +37,14 @@ void app_logd_emit(const char *tag, char lvl, const char *fmt, ...) __attribute_
 // log noise becomes a problem.
 void app_logd_set_trace(bool on);
 bool app_logd_get_trace(void);
+
+// Log-line subscriber. Receives every formatted line (including the
+// rolling `[ts] [tag] L ` prefix and trailing newline) that app_logd
+// emits. Called from app_logd's worker task, NOT from arbitrary
+// emit-call contexts -- so the callback can do moderate work without
+// risking a deadlock with the caller. Must still be non-blocking;
+// network senders that can't write immediately should drop the line
+// or queue it themselves.
+typedef void (*app_logd_subscriber_t)(const char *line, size_t len, void *ctx);
+bool app_logd_subscribe  (app_logd_subscriber_t cb, void *ctx);
+void app_logd_unsubscribe(app_logd_subscriber_t cb, void *ctx);

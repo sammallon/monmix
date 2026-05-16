@@ -19,6 +19,8 @@
 #include "app_ms_client.h"
 #include "app_ms_info.h"
 #include "app_ms_setup.h"
+#include "app_netconsole.h"
+#include "app_ota.h"
 #include "app_power.h"
 #include "app_prefs.h"
 #include "app_config.h"
@@ -277,6 +279,14 @@ void app_main(void)
     // websocket subsystem itself handles reconnect once WiFi is up. Spawns
     // the heartbeat task too so console_attached starts ticking.
     ms->start();
+
+    // Network admin console (port 4242). Required for OTA-over-network +
+    // remote log streaming. Spawns its own task that waits for WiFi
+    // associate before binding. Also schedules the OTA rollback-cancel
+    // timer (60 s post-boot grace period before marking the running
+    // image valid; covers boot-time panics that would otherwise leave
+    // a bad firmware sticky).
+    app_netconsole_init();
 
     // Register the deferred-info handler. notify_subscribers fires on WS
     // state changes AND on console_attached transitions, so this single
