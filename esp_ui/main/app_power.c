@@ -278,10 +278,32 @@ static void tick_cb(lv_timer_t *t)
 
     // Mid-sleep degradation arms the auto-wake gate so the eventual
     // recovery wakes the panel. Covers "user manually slept while
-    // healthy, then situation deteriorated overnight, then came back"
-    // -- which is exactly what the auto-wake-on-MS-reconnect feature
-    // is supposed to cover.
-    if (s_phase == APP_POWER_PHASE_SLEEP && deg && !s_auto_wake_armed) {
+    // healthy, then situation deteriorated overnight, then came back."
+    // Only externally-observable degradation counts -- MS being non-
+    // CONNECTED while WE hold it down (s_ms_stopped_for_sleep) is
+    // self-induced and uninformative. The only post-stop signal that
+    // tells us "something changed without our involvement" is WiFi
+    // dropping, since the C6/ESP-Hosted state lives outside the MS
+    // worker. console_attached is cached by the stopped MS client so
+    // it can't change underneath us either. Treating any-deg as
+    // mid-sleep-degraded would arm immediately on every manual sleep
+    // (because the act of stopping MS makes get_state non-CONNECTED)
+    // and the probe would then auto-wake ~30 s later -- exactly the
+    // behavior the user said NOT to do for healthy-manual-sleep.
+    if (s_phase == APP_POWER_PHASE_SLEEP &&
+        !s_auto_wake_armed &&
+        s_ms_stopped_for_sleep &&
+        app_wifi_get_state() != APP_WIFI_STATE_CONNECTED) {
+        ESP_LOGI(TAG, "mid-sleep wifi degraded; arming auto-wake");
+        s_auto_wake_armed = true;
+    }
+    // If MS is NOT stopped (e.g., manual sleep with the future
+    // option of keeping MS up), the original general edge applies.
+    // No code path takes that today but keeping the gate readable.
+    if (s_phase == APP_POWER_PHASE_SLEEP &&
+        !s_auto_wake_armed &&
+        !s_ms_stopped_for_sleep &&
+        deg) {
         s_auto_wake_armed = true;
     }
 

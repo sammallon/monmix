@@ -1,67 +1,80 @@
 """M7 (new model): manual sleep while healthy stays asleep.
 
-Auto-wake-on-MS-reconnect arms only if the device was degraded at
-sleep entry, OR becomes degraded during sleep. A manual sleep
-button-press while everything is healthy must NOT spuriously wake
-the panel just because the MS restart probe sees MS active --
-that would defeat the manual sleep affordance.
+Requirement #4 from the user: "auto-wake when MS connection becomes
+active again", but EXPLICITLY exempting the manual-sleep-healthy case.
+A user who taps the power icon while everything is fine has said
+"go dark", not "wake me up on the next MS twitch". Tap to wake is
+the only escape from that state.
 
-Setup: --power-scale 120 keeps the test fast. Tap the top-bar power
-icon while healthy, then wait long enough for the probe interval
-to pass (1+ scaled probe cycle = 300+ ms). Assert SLEEP persists.
+Tricky: stopping MS during sleep (the 48ea146 graceful-shutdown path)
+makes ms->get_state() report non-CONNECTED, which would naively trip
+the "degraded mid-sleep -> arm auto-wake" clause. The implementation
+guards against that -- only externally-observable degradation (wifi
+drop) arms the gate while MS is self-stopped. This test pins that
+behavior down.
 
-Then verify that MS *going* degraded during sleep arms the gate so
-recovery wakes: flip MS off, then back on. Final state should be
-AWAKE -- demonstrates that the gate works in both directions
-(initial-armed at entry vs armed-mid-sleep).
+Setup: --power-scale 120 makes the 30 s probe interval = 250 ms scaled.
+Test waits past one probe cycle (and then some) without any state
+change, asserts the device stayed in SLEEP, AND uses a verify hook
+to assert NO auto-wake log line appeared anywhere in the window.
 """
+
+
+def _verify(stdout, _stderr):
+    errors = []
+    # No auto-wake should have fired between the manual sleep and quit.
+    # The marker enter_awake prints when it restarts MS is also a tell.
+    forbidden = [
+        "auto-wake: MS connection became active",
+        "wake: restarting MS client",
+        "mid-sleep wifi degraded; arming auto-wake",
+    ]
+    for f in forbidden:
+        if f in stdout:
+            errors.append(
+                f"saw {f!r} -- manual-sleep-healthy spuriously auto-woke")
+    return errors
+
 
 TEST = {
     "name": "power_manual_sleep_healthy_stays_asleep",
-    "description": "Manual sleep healthy -> stays asleep until tap; later degradation arms wake.",
+    "description": "Manual sleep while healthy stays asleep (no spurious wake).",
     "args": ["--power-scale", "120"],
     "script": (
         "echo healthy-baseline\n"
         "power_phase\n"
-        # Manual sleep (top-bar button).
+        # Manual sleep via top-bar power icon.
         "tap 894 16\n"
         "sleep 100\n"
         "power_phase\n"
-        # Wait past one probe cycle (250 ms scaled) without a state
-        # change. SLEEP must persist -- no spurious wake.
-        "echo wait-one-probe\n"
-        "sleep 400\n"
-        "power_phase\n"
-        # Now flip MS off mid-sleep. This arms auto-wake under the
-        # mid-sleep-degraded clause.
-        "echo arm-via-mid-sleep-degrade\n"
-        "power_ms_state off\n"
-        "sleep 100\n"
-        # MS recovers. Edge detector should fire wake.
-        "echo recover-ms\n"
-        "power_ms_state on\n"
-        "sleep 400\n"
+        # Wait past multiple probe cycles (probe interval = 250 ms
+        # scaled; 1000 ms covers ~4 probes). Nothing should wake the
+        # panel during this window because auto-wake isn't armed and
+        # the probe is gated on auto_wake_armed.
+        "echo wait-multiple-probes\n"
+        "sleep 1000\n"
         "power_phase\n"
         "quit\n"
     ),
     "expect": {
         "exit_code": 0,
         "stdout_contains": [
-            # Boot healthy.
             "OK power_phase=AWAKE eff_to_ms=0",
-            # Manual sleep marker (auto_wake_armed=0 because healthy).
             "I (app_power) entering sleep (manual=1 auto_wake_armed=0)",
-            # Still SLEEP one probe cycle later.
-            "OK echo wait-one-probe",
             "OK power_phase=SLEEP",
-            # Auto-wake fires AFTER mid-sleep degradation + recovery.
-            "I (app_power) auto-wake: MS connection became active",
-            "OK power_phase=AWAKE eff_to_ms=0",
+            "OK echo wait-multiple-probes",
         ],
         "stdout_not_contains": [
             "LV_ASSERT",
-            "Assertion failed",
+            # Critically: device must still be asleep at quit time.
+            # If a spurious auto-wake fires, power_phase reports AWAKE
+            # after the probe and this string appears.
+            "OK power_phase=AWAKE eff_to_ms=0\nOK quit",
+            # The probe itself shouldn't have fired -- it's gated on
+            # auto_wake_armed.
+            "sleep probe: restarting MS",
         ],
+        "verify": _verify,
     },
     "hw_compatible": False,
 }
