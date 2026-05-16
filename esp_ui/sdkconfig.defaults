@@ -36,6 +36,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_ROLLBACK_ENABLE=y
 
+# Network OTA pulls firmware over plain HTTP from a build host on the
+# trusted stage LAN -- the netconsole token gates who can trigger an
+# update. Without this, esp_https_ota rejects any URL without TLS.
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+CONFIG_OTA_ALLOW_HTTP=y
+
 # FreeRTOS at 1 kHz for snappier UI tick & touch event delivery.
 CONFIG_FREERTOS_HZ=1000
 
