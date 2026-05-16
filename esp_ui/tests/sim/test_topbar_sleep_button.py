@@ -1,37 +1,30 @@
-"""Top-bar sleep button forces immediate sleep without warning.
+"""Top-bar sleep button forces immediate SLEEP without warning.
 
-Pilot follow-up 2026-05-09: a one-tap "blank now" affordance for
-when the user wants the panel dark immediately (e.g. on stage between
-sets) without waiting for the inactivity timer or messing with the
-config overlay. Skips the WARNING phase by design -- the user's
-intent is "off NOW", not "remind me in 30s". Tapping the resulting
-blank panel routes through the existing wake-menu so it's reversible.
+Pilot follow-up from 2026-05-09: a one-tap "blank now" affordance
+for when the user wants the panel dark immediately (e.g. on stage
+between sets) without waiting for the inactivity timer. Skips the
+WARNING phase by design.
+
+Under the new connectivity-driven sleep model, tapping the blank
+overlay wakes directly to AWAKE (no wake menu).
 
 Layout: sleep icon at TOP_RIGHT -116, size 28x28 -> screen rect
-(880..908, 2..30). Tap center (894, 16). Mute-en hit pad puts a
-clickable region behind it spanning 875..912 to give the icon a
-generous hit zone.
+(880..908, 2..30). Tap center (894, 16).
 """
 
 TEST = {
     "name": "topbar_sleep_button",
-    "description": "Tapping the top-bar power icon forces SLEEP phase immediately.",
+    "description": "Top-bar power icon: AWAKE -> SLEEP -> AWAKE (tap to wake).",
     "args": ["--power-scale", "120"],
     "script": (
-        # Dismiss the boot wake menu by committing 1h. Boot now starts
-        # in WAKE_MENU rather than AWAKE so the test's first phase
-        # assertion needs an explicit pick first.
-        "power_set_user_timeout_ms 3600000\n"
         "echo before-tap\n"
         "power_phase\n"
-        # Tap the sleep icon. Should land in SLEEP without going through
-        # WARNING first (force_sleep skips the countdown).
+        # Manual sleep button.
         "tap 894 16\n"
         "sleep 100\n"
         "echo after-tap\n"
         "power_phase\n"
-        # Sanity: a tap on the blank screen wakes via the WAKE_MENU,
-        # confirming the path remains reversible.
+        # Tap on blank overlay should wake.
         "tap 500 300\n"
         "sleep 100\n"
         "echo after-wake-tap\n"
@@ -41,26 +34,23 @@ TEST = {
     "expect": {
         "exit_code": 0,
         "stdout_contains": [
-            # Boot lands in AWAKE (1h scaled to 30s).
-            "OK power_phase=AWAKE eff_to_ms=30000",
-            # Tap fires the user-initiated sleep log line + force_sleep.
+            # Healthy boot -> AWAKE with no timeout.
+            "OK power_phase=AWAKE eff_to_ms=0",
+            # Manual sleep skips WARN and goes straight to SLEEP.
             "I (app_ui) user-initiated sleep",
-            "I (app_power) entering sleep",
-            # Critically: WARN is skipped. SLEEP arrives directly.
+            "I (app_power) entering sleep (manual=1",
             "OK power_phase=SLEEP",
-            # Tap on blank routes to wake menu, proving reversibility.
-            "OK power_phase=WAKE_MENU",
+            # Tap on blank goes directly to AWAKE (no wake menu).
+            "OK power_phase=AWAKE eff_to_ms=0",
         ],
         "stdout_not_contains": [
             "LV_ASSERT",
-            # The hit-pad layout previously routed (894, 16) to the MS
-            # icon -- if it lands there we'd see the MS panel open
-            # instead of sleep firing. Watch for that wrong path.
+            # Manual sleep MUST skip the WARNING phase.
             "OK power_phase=WARNING",
+            # No wake menu in the new model.
+            "WAKE_MENU",
         ],
     },
-    # HW parity: same coords on the panel. WAKE_MENU verification is
-    # sim-only because the device doesn't surface the phase via stdout.
     "hw_compatible": True,
     "hw_script": (
         "sleep 3500\n"

@@ -1,37 +1,29 @@
-"""M7 power save: in degraded state the timeout is relative to last
-interaction, not absolute from awake-start.
+"""M7 (new model): in degraded state with continued user activity, the
+60 s timeout is relative to last touch -- taps reset the clock and
+the panel stays awake. Matches the pilot fix from 2026-05-09 where
+the user was actively typing in the WiFi config and the screen
+blanked under them at the 60 s mark.
 
-Pilot bug 2026-05-09: while the user was actively typing in the WiFi
-config panel trying to recover the link, the screen blanked at the
-60 s degraded cap regardless of taps. With the fix, taps reset the
-inactivity clock so the panel stays awake as long as the user is
-interacting.
+Setup: --power-scale 120 makes the 60 s cap = 500 ms. The script
+flips to degraded, then taps every 150 ms for ~750 ms (well past
+the 500 ms cap). Without the relative-timeout behavior the screen
+would have blanked partway through; with it, AWAKE persists.
 
-Test setup mirrors test_power_save_degraded: --power-scale 120 means
-the 60 s cap becomes 500 ms. The script flips to degraded then taps
-every ~150 ms for ~700 ms (well past 500 ms). Without the fix, the
-phase would be SLEEP at the end of the tap stream. With the fix it
-stays AWAKE because each tap resets `inactive`.
+After the tap stream stops, the script idles past the cap to verify
+SLEEP does eventually fire (so we're confirming relativity, not just
+blanket no-sleep).
 """
 
 TEST = {
     "name": "power_save_degraded_active",
-    "description": "Tapping in degraded state keeps the screen awake (relative timeout).",
+    "description": "Taps in degraded state keep AWAKE (relative cap).",
     "args": ["--power-scale", "120"],
     "script": (
-        # Boot lands in WAKE_MENU; commit 1h to dismiss it, then
-        # exercise the degraded-relative timeout.
-        "power_set_user_timeout_ms 3600000\n"
         "echo flip-degraded\n"
         "power_degraded on\n"
         "sleep 50\n"
         "power_phase\n"
         "echo tap-stream-start\n"
-        # Five taps spread over ~750 ms. Each `tap` injects a touch
-        # event which resets LVGL's inactivity timer; the next tick
-        # sees inactive=0 and stays in AWAKE. Without the relative-
-        # timeout fix, elapsed = (now - awake_started) would have
-        # crossed the 500 ms cap by the second or third tap.
         "tap 100 100\n"
         "sleep 150\n"
         "tap 110 110\n"
@@ -44,8 +36,7 @@ TEST = {
         "sleep 150\n"
         "echo tap-stream-end\n"
         "power_phase\n"
-        # Now stop tapping. After ~600 ms of idle (well past the
-        # 500 ms cap) the panel should blank.
+        # No more taps -> sleep window expires (~600 ms past last tap).
         "sleep 700\n"
         "power_phase\n"
         "quit\n"
@@ -53,14 +44,13 @@ TEST = {
     "expect": {
         "exit_code": 0,
         "stdout_contains": [
-            # Just after going degraded: cap kicks in.
             "OK power_phase=AWAKE eff_to_ms=500",
-            # End of tap stream (~750 ms post-degraded). With taps
-            # resetting inactive, still AWAKE.
             "OK echo tap-stream-end",
+            # Still AWAKE at end-of-tap-stream even though >500 ms has
+            # passed since degraded entry.
             "OK power_phase=AWAKE eff_to_ms=500",
-            # After a 700 ms idle without taps, sleep fires.
-            "I (app_power) entering sleep (effective_timeout=500ms)",
+            # 700 ms past the last tap -- sleep eventually fires.
+            "I (app_power) entering sleep",
             "OK power_phase=SLEEP eff_to_ms=500",
         ],
         "stdout_not_contains": [
@@ -68,6 +58,5 @@ TEST = {
             "Assertion failed",
         ],
     },
-    # PC sim only -- needs --power-scale CLI flag.
     "hw_compatible": False,
 }

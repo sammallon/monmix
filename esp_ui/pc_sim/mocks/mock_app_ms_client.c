@@ -15,6 +15,8 @@
 #include "app_state.h"
 
 static app_ms_state_t s_state = APP_MS_STATE_BOOT;
+static bool         s_state_overridden;   // honor test-set state across start/stop
+static bool         s_console_attached = true;
 static app_ms_on_change_t s_cb;
 static void *s_cb_ctx;
 static int s_mix_idx     = 0;
@@ -25,13 +27,16 @@ static char s_strip_name_buf[64];
 static void fire_change(void) { if (s_cb) s_cb(s_cb_ctx); }
 
 static bool m_start(void) {
-    s_state = APP_MS_STATE_CONNECTED;
-    fprintf(stdout, "[mock_ms] start() -> CONNECTED\n");
+    if (!s_state_overridden) s_state = APP_MS_STATE_CONNECTED;
+    fprintf(stdout, "[mock_ms] start() -> %s\n",
+            s_state == APP_MS_STATE_CONNECTED ? "CONNECTED" : "(test-overridden)");
     fire_change();
     return true;
 }
 static void m_stop(void) {
-    s_state = APP_MS_STATE_DISCONNECTED;
+    if (!s_state_overridden) s_state = APP_MS_STATE_DISCONNECTED;
+    fprintf(stdout, "[mock_ms] stop() -> %s\n",
+            s_state == APP_MS_STATE_DISCONNECTED ? "DISCONNECTED" : "(test-overridden)");
     fire_change();
 }
 static void m_set_level(int id, float level) {
@@ -64,6 +69,22 @@ static void m_fetch_mix_routing(void)       {}
 static bool m_is_mix_list_ready(void)       { return s_mix_count > 0; }
 static void m_resubscribe(void)             {}
 static void m_reconnect(void)               { m_stop(); m_start(); }
+static bool m_is_console_attached(void)     { return s_console_attached; }
+
+// Test hooks. Driven via pc_main REPL commands so scripts can step
+// the M7 state machine through degraded/healthy transitions without
+// needing a real MS server.
+void mock_app_ms_set_state(app_ms_state_t s) {
+    s_state_overridden = true;
+    s_state = s;
+    fprintf(stdout, "[mock_ms] state=%d\n", (int) s);
+    fire_change();
+}
+void mock_app_ms_set_console_attached(bool attached) {
+    s_console_attached = attached;
+    fprintf(stdout, "[mock_ms] console_attached=%d\n", (int) attached);
+    fire_change();
+}
 
 static void m_set_master_level(float l)     { fprintf(stdout, "[mock_ms] master level=%.3f\n", l); }
 static void m_set_master_mute (bool mute)   { fprintf(stdout, "[mock_ms] master mute=%d\n", (int)mute); }
@@ -108,7 +129,7 @@ static const ms_client_iface_t s_iface = {
     .is_channel_routable         = m_is_channel_routable,
     .set_meter_enabled           = m_set_meter_enabled,
     .set_level_format            = m_set_level_format,
-    .is_console_attached         = NULL,
+    .is_console_attached         = m_is_console_attached,
     .shutdown_graceful           = m_shutdown_graceful,
 };
 

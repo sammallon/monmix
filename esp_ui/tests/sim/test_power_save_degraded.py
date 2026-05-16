@@ -1,42 +1,36 @@
-"""M7 power save: degraded-state cap. When wifi/MS/console drops,
-the effective timeout is forced to min(user, 60 s). Verified by
-flipping the mock wifi state to FAILED and watching the eff_to_ms
-field drop from 30000 (1 h scaled) to 500 (60 s scaled).
+"""M7 (new model): in degraded state, the device sleeps after 60 s of
+no activity. With --power-scale 120 that's a 500 ms window.
 
-Also verifies that going BACK to healthy doesn't re-light the panel
-on its own -- the user gets the resume cadence they expect, with no
-panel flash mid-blink.
+Healthy state (boot default in the mock) → no sleep ever. The script
+keeps healthy for a settling window, asserts AWAKE persists, then
+flips to degraded and waits past the cap. SLEEP must fire.
 """
 
 TEST = {
     "name": "power_save_degraded",
-    "description": "Degraded wifi caps the effective timeout to 60 s scaled.",
+    "description": "Degraded for >60 s scaled drives the panel to SLEEP.",
     "args": ["--power-scale", "120"],
     "script": (
-        # Boot lands in WAKE_MENU now; commit 1h up front so the test
-        # exercises the post-pick AWAKE state.
-        "power_set_user_timeout_ms 3600000\n"
-        "echo healthy-eff\n"
+        # Boot lands directly in AWAKE under the connectivity-driven
+        # model. Healthy = eff_to_ms = 0 (no timeout); degraded = 500.
+        "echo healthy-baseline\n"
         "power_phase\n"
         "echo flip-degraded\n"
         "power_degraded on\n"
         "sleep 50\n"
         "power_phase\n"
-        "echo wait-degraded-blank\n"
+        # Wait past the 500 ms scaled cap. Sleep should fire mid-wait.
+        "echo wait-past-cap\n"
         "sleep 700\n"
-        "power_phase\n"
-        "echo flip-healthy\n"
-        "power_degraded off\n"
-        "sleep 50\n"
         "power_phase\n"
         "quit\n"
     ),
     "expect": {
         "exit_code": 0,
         "stdout_contains": [
-            "OK power_phase=AWAKE eff_to_ms=30000",
+            "OK power_phase=AWAKE eff_to_ms=0",
             "OK power_phase=AWAKE eff_to_ms=500",
-            "I (app_power) entering sleep (effective_timeout=500ms)",
+            "I (app_power) entering sleep",
             "OK power_phase=SLEEP eff_to_ms=500",
         ],
         "stdout_not_contains": [

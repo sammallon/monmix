@@ -15,16 +15,18 @@
 
 static const char *TAG = "app_power";
 
-// Nominal real-world durations. All are run through pwr_scale at use
-// time so tests can shorten them without per-test patching.
-#define DEFAULT_TIMEOUT_MS    (60u * 60u * 1000u)   // 1 hour
-#define WARN_MS               (30u * 1000u)         // 30 s
-#define DEGRADED_CAP_MS       (60u * 1000u)         // 60 s
-#define WAKE_MENU_TIMEOUT_MS  (30u * 1000u)         // 30 s
+// Nominal real-world durations. Run through pwr_scale at use time so
+// tests can shorten them without per-test patching.
+#define DEGRADED_CAP_MS        (60u * 1000u)   // total degraded budget
+#define WARN_MS                (30u * 1000u)   // pre-blank warning window
+// How often to attempt ms->start() while asleep (only when auto-wake
+// is armed). The MS client's internal connect-retry takes over once
+// started, so this just needs to be frequent enough that the user
+// doesn't wait noticeably after the rig comes back up.
+#define MS_RESTART_PROBE_MS    (30u * 1000u)
 
-// Periodic tick. 100 ms is fine-grained enough that the warning
-// countdown updates smoothly (visible 1 Hz drop) without dominating
-// CPU 0 with timer overhead.
+// 100 ms tick gives smooth (visible 1 Hz) WARN-countdown updates
+// without dominating CPU 0.
 #define TICK_MS                100
 
 static uint32_t s_scale_num = 1;
@@ -40,48 +42,43 @@ static uint32_t pwr_scale(uint32_t nominal_ms)
 
 static const ms_client_iface_t *s_ms;
 
-// Currently selected user timeout (real ms, pre-scale). Starts at the
-// 1 h default; the wake menu's pick replaces it.
-static uint32_t s_user_timeout_ms = DEFAULT_TIMEOUT_MS;
-
 static app_power_phase_t s_phase = APP_POWER_PHASE_AWAKE;
 static lv_timer_t       *s_tick_timer;
 static uint32_t          s_phase_entered_at_ms;
-// Absolute lv_tick at which the current AWAKE period began. The user
-// picked a duration; this stamp + that duration is the wall-clock-like
-// deadline. Touches during AWAKE do NOT reset this (the user's intent
-// was "stay awake for X, period"); only an explicit duration pick from
-// the wake menu (via warn-tap or post-sleep) restarts it. Re-stamped
-// also on transition INTO a degraded state so the cap window starts
-// fresh from the link drop.
-static uint32_t          s_awake_started_at_ms;
 static bool              s_was_degraded;
 
-// Saved brightness pref so unblanking restores the user's last
-// chosen value.
+// Saved brightness pref so unblanking restores the user's last chosen
+// value.
 static uint8_t           s_saved_brightness_pct;
 
 // Tracks whether enter_sleep stopped the MS client, so enter_awake
-// knows to bring it back up. The boot path leaves this false because
-// app_main starts MS itself; only the sleep-induced stop sets it.
+// (or the probe path) knows MS needs to be brought back up. Boot
+// leaves this false because app_main starts MS itself; sleep paths
+// set it.
 static bool              s_ms_stopped_for_sleep;
 
-// Lazily built overlays. All live on the active screen; their
-// foreground ordering is enforced by lv_obj_move_foreground at each
-// phase entry.
+// Auto-wake gate. True when the device should auto-wake on a degraded
+// ─> healthy edge. Armed when sleep entry happened while degraded OR
+// when degradation occurs mid-sleep; a manual sleep that happened
+// healthy and stayed healthy does NOT auto-wake (the user said "go
+// dark"). The auto-sleep path always arms because auto-sleep only
+// fires while already degraded.
+static bool              s_auto_wake_armed;
+static uint32_t          s_last_ms_probe_ms;
+
+// Lazily built overlays; live on the active screen; foreground
+// ordering enforced by lv_obj_move_foreground at each phase entry.
 static lv_obj_t *s_warn_overlay;
 static lv_obj_t *s_warn_count_label;
 static lv_obj_t *s_blank_overlay;
-static lv_obj_t *s_wake_menu;
 
 static void enter_awake(void);
 static void enter_warn(void);
-static void enter_sleep(void);
-static void enter_wake_menu(void);
+static void enter_sleep_internal(bool manual);
 
-// True when the system can't actually drive a mix -- no WiFi, MS WS
-// not connected, or MS connected but physical console not attached.
-// Treated as a cap on the effective timeout.
+// True when the system can't actually drive a mix -- WiFi missing,
+// MS WS not connected, or MS connected but physical console not
+// attached.
 static bool degraded_state(void)
 {
     if (app_wifi_get_state() != APP_WIFI_STATE_CONNECTED) return true;
@@ -93,17 +90,11 @@ static bool degraded_state(void)
 
 uint32_t app_power_get_effective_timeout_ms(void)
 {
-    uint32_t base = pwr_scale(s_user_timeout_ms);
-    if (degraded_state()) {
-        uint32_t cap = pwr_scale(DEGRADED_CAP_MS);
-        if (cap < base) base = cap;
-    }
-    return base;
-}
-
-uint32_t app_power_get_user_timeout_ms(void)
-{
-    return s_user_timeout_ms;
+    // Healthy = no timeout (panel stays on); degraded = the 60 s cap.
+    // Exposed for tests and surface UI to display "X s before sleep"
+    // hints in degraded mode.
+    if (!degraded_state()) return 0;
+    return pwr_scale(DEGRADED_CAP_MS);
 }
 
 app_power_phase_t app_power_get_phase(void)
@@ -120,13 +111,8 @@ void app_power_set_time_scale(uint32_t numerator, uint32_t denominator)
 
 void app_power_kick(void)
 {
-    // Force the awake clock to restart from now. This is for callers
-    // that explicitly want to grant a fresh duration -- it's the
-    // equivalent of an in-app "I'm here" signal. Touches DON'T call
-    // this; the absolute-from-wake design forbids touch-resets.
-    // Tests use it to reset between phases without driving the wake
-    // menu.
-    s_awake_started_at_ms = lv_tick_get();
+    // Force the LVGL activity counter to reset (same effect as a
+    // touch). Tests use it to clear inactivity between phases.
     lv_display_trigger_activity(NULL);
 }
 
@@ -150,7 +136,7 @@ static void build_warn_overlay(void)
     s_warn_overlay = ov;
 
     lv_obj_t *title = lv_label_create(ov);
-    lv_label_set_text(title, "Display sleeping soon");
+    lv_label_set_text(title, "Connection lost - sleeping soon");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_t *cnt = lv_label_create(ov);
@@ -176,132 +162,11 @@ static void build_blank_overlay(void)
     lv_obj_set_style_bg_color(ov, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
     lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-    // Make the overlay receive touch (so a tap on a blank screen
-    // wakes the device rather than punching through to a fader).
+    // Overlay catches taps so a tap on a blank screen wakes the
+    // device rather than punching through to a fader underneath.
     lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(ov, LV_OBJ_FLAG_HIDDEN);
     s_blank_overlay = ov;
-}
-
-typedef struct {
-    int          hours;
-    const char  *label;
-} wake_choice_t;
-
-static const wake_choice_t s_choices[] = {
-    {  1, "1h"  },
-    {  2, "2h"  },
-    {  4, "4h"  },
-    {  8, "8h"  },
-    { 12, "12h" },
-    { 24, "24h" },
-};
-
-static void on_wake_menu_pick(lv_event_t *e)
-{
-    int hours = (int)(intptr_t) lv_event_get_user_data(e);
-    if (hours <= 0) hours = 1;
-    if (hours > 24) hours = 24;     // hard cap
-    s_user_timeout_ms = (uint32_t) hours * 3600u * 1000u;
-    ESP_LOGI(TAG, "wake-menu pick: %d h", hours);
-    enter_awake();
-}
-
-// "Sleep" cancel option in the wake menu -- when the panel woke
-// accidentally (touched in a bag, brushed by a guitar strap during
-// teardown) the user wants a one-tap return to dark, not a 30 s
-// auto-revert wait. Routes back to enter_sleep, which re-mounts the
-// blank overlay and drops the backlight.
-static void on_wake_menu_sleep(lv_event_t *e)
-{
-    (void) e;
-    ESP_LOGI(TAG, "wake-menu cancel: returning to sleep");
-    enter_sleep();
-}
-
-static void build_wake_menu(void)
-{
-    if (s_wake_menu) return;
-    lv_obj_t *scr = lv_screen_active();
-
-    // Full-screen scrim that absorbs every tap not landing on the
-    // duration card. Without this the centered card was non-modal --
-    // taps anywhere outside the buttons leaked through to the gear,
-    // top-bar sleep button, faders, etc., letting the user dodge the
-    // picker entirely. The whole point of the boot picker is that
-    // the user always knows their awake duration because they
-    // actively chose it. Semi-transparent dark background dims the
-    // underlying UI so the user reads "modal: pick something".
-    lv_obj_t *scrim = lv_obj_create(scr);
-    int32_t sw = lv_obj_get_width(scr);
-    int32_t sh = lv_obj_get_height(scr);
-    lv_obj_set_size(scrim, sw, sh);
-    lv_obj_set_pos(scrim, 0, 0);
-    lv_obj_set_style_radius(scrim, 0, 0);
-    lv_obj_set_style_border_width(scrim, 0, 0);
-    lv_obj_set_style_pad_all(scrim, 0, 0);
-    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(scrim, LV_OPA_70, 0);
-    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
-    // lv_obj_create defaults already set CLICKABLE, but call it
-    // explicitly so the modal contract is documented in source: this
-    // scrim catches every tap that misses the duration card.
-    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(scrim, LV_OBJ_FLAG_HIDDEN);
-    s_wake_menu = scrim;
-
-    // Visible card carrying the title + duration buttons + Sleep cancel.
-    // Created as a child of the scrim so the foreground/hidden flags
-    // toggled on s_wake_menu drag the card with them. Panel grew from
-    // 280 to 360 to fit the Sleep cancel row at the bottom.
-    lv_obj_t *ov = lv_obj_create(scrim);
-    lv_obj_set_size(ov, 540, 360);
-    lv_obj_center(ov);
-    lv_obj_set_style_radius(ov, 12, 0);
-    lv_obj_set_style_border_width(ov, 2, 0);
-    lv_obj_set_style_pad_all(ov, 20, 0);
-    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *title = lv_label_create(ov);
-    lv_label_set_text(title, "Stay awake for:");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
-
-    const int btn_w = 140;
-    const int btn_h = 70;
-    const int gap   = 16;
-    const int cols  = 3;
-    const int n     = sizeof(s_choices) / sizeof(s_choices[0]);
-    for (int i = 0; i < n; ++i) {
-        int row = i / cols;
-        int col = i % cols;
-        int x = col * (btn_w + gap) - ((cols - 1) * (btn_w + gap)) / 2;
-        int y = 40 + row * (btn_h + gap);
-        lv_obj_t *btn = lv_button_create(ov);
-        lv_obj_set_size(btn, btn_w, btn_h);
-        lv_obj_align(btn, LV_ALIGN_TOP_MID, x, y);
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, s_choices[i].label);
-        lv_obj_center(lbl);
-        lv_obj_add_event_cb(btn, on_wake_menu_pick, LV_EVENT_CLICKED,
-                            (void *)(intptr_t) s_choices[i].hours);
-        // Note: tag the user_data with the hour count, NOT a button
-        // index, so the picker doesn't break if rows/cols ever change.
-    }
-
-    // Sleep cancel row at the bottom, full-width minus the panel pad.
-    // Distinct dark-grey background so it doesn't look like another
-    // duration option, and the LV_SYMBOL_POWER glyph mirrors the
-    // top-bar sleep button so the user reads "this puts it back to
-    // sleep" at a glance.
-    int cancel_y = 40 + ((n + cols - 1) / cols) * (btn_h + gap);
-    lv_obj_t *cancel_btn = lv_button_create(ov);
-    lv_obj_set_size(cancel_btn, 460, 50);
-    lv_obj_align(cancel_btn, LV_ALIGN_TOP_MID, 0, cancel_y);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x303030), 0);
-    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
-    lv_label_set_text(cancel_lbl, LV_SYMBOL_POWER " Sleep");
-    lv_obj_center(cancel_lbl);
-    lv_obj_add_event_cb(cancel_btn, on_wake_menu_sleep, LV_EVENT_CLICKED, NULL);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -312,26 +177,19 @@ static void enter_awake(void)
 {
     s_phase = APP_POWER_PHASE_AWAKE;
     s_phase_entered_at_ms = lv_tick_get();
-    // The awake clock starts at every fresh AWAKE entry: boot, post-
-    // sleep wake-menu pick, post-warning wake-menu pick. That's the
-    // ONLY way the user-picked duration restarts -- in-AWAKE touches
-    // do nothing, so "stay awake for 4 h" really means 4 h from this
-    // pick.
-    s_awake_started_at_ms = s_phase_entered_at_ms;
+    s_auto_wake_armed = false;
     if (s_warn_overlay)  lv_obj_add_flag(s_warn_overlay,  LV_OBJ_FLAG_HIDDEN);
     if (s_blank_overlay) lv_obj_add_flag(s_blank_overlay, LV_OBJ_FLAG_HIDDEN);
-    if (s_wake_menu)     lv_obj_add_flag(s_wake_menu,     LV_OBJ_FLAG_HIDDEN);
-    // Restore backlight from saved pref. Defensive 0-clamp -- if a
-    // boot-stage pref read returned 0 (shouldn't happen post-init)
-    // we keep the panel readable.
+    // Restore backlight from saved pref. Defensive 0-clamp -- a boot-
+    // stage pref read of 0 (shouldn't happen post-init) would leave
+    // the panel unreadable.
     uint8_t pct = s_saved_brightness_pct;
     if (pct < 5) pct = app_prefs_get_brightness_pct();
     app_display_set_backlight_pct(pct);
 
-    // Bring MS back if sleep stopped it. Drop the lvgl_port_lock
-    // around start so the new worker's on_connect callbacks can
-    // grab it without us holding -- same pattern chpick uses for
-    // its stop/start cycle.
+    // Bring MS back if sleep stopped it. Drop lvgl_port_lock around
+    // start so the new worker's on_connect callbacks can grab it --
+    // same pattern chpick_apply_async uses.
     if (s_ms_stopped_for_sleep && s_ms && s_ms->start) {
         ESP_LOGI(TAG, "wake: restarting MS client");
         lvgl_port_unlock();
@@ -339,6 +197,9 @@ static void enter_awake(void)
         lvgl_port_lock(0);
         s_ms_stopped_for_sleep = false;
     }
+    // Reset LVGL inactivity so any post-wake "1 minute degraded
+    // window" starts from now, not whenever the last touch was.
+    lv_display_trigger_activity(NULL);
 }
 
 static void enter_warn(void)
@@ -354,38 +215,41 @@ static void enter_warn(void)
     }
 }
 
-static void enter_sleep(void)
+static void enter_sleep_internal(bool manual)
 {
     s_phase = APP_POWER_PHASE_SLEEP;
     s_phase_entered_at_ms = lv_tick_get();
     if (s_warn_overlay) lv_obj_add_flag(s_warn_overlay, LV_OBJ_FLAG_HIDDEN);
-    if (s_wake_menu)    lv_obj_add_flag(s_wake_menu,    LV_OBJ_FLAG_HIDDEN);
     build_blank_overlay();
     lv_obj_remove_flag(s_blank_overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_blank_overlay);
     s_saved_brightness_pct = app_prefs_get_brightness_pct();
-    // Real off, not the 5 % floor -- a visibly-lit panel overnight
-    // defeats the point of "sleep". The opaque overlay still
-    // captures touches so a tap wakes through to the wake menu; the
-    // user sees a dark panel until then. The pct-setter's floor
-    // stays in place for the user-facing surfaces (slider,
-    // set-bright); only this code path takes the LED all the way
-    // down.
+    // Real off, not the 5 % floor. The opaque overlay still captures
+    // touches so a tap wakes through; the LED path is fully dark.
+    // The pct-setter's floor stays in place for user-facing surfaces
+    // (slider, set-bright REPL); only this code path takes the LED
+    // all the way down.
     app_display_set_backlight_off();
-    ESP_LOGI(TAG, "entering sleep (effective_timeout=%ums)",
-             (unsigned) app_power_get_effective_timeout_ms());
 
-    // Gracefully release the MS connection: send /console/data/
-    // unsubscribe for every subscription, then close the WS with a
-    // proper 1000 NORMAL frame, then join the worker. Saves CPU on
-    // both ends (no broadcasts to a panel that can't show them) and
-    // keeps MS from holding zombie subscriptions overnight. enter_
-    // awake spawns the worker again on the wake-menu pick.
-    //
-    // Drop the LVGL lock around shutdown_graceful + stop -- the
-    // worker may be blocked waiting for the lock to deliver a
-    // broadcast through on_state_change, and holding it here would
-    // deadlock the join. Same pattern chpick_apply_async uses.
+    // Auto-wake arming. The rule: if the device was degraded at sleep
+    // entry (either auto-sleep, which only fires while degraded, OR
+    // manual sleep while degraded), arm auto-wake. A manual sleep
+    // while everything was healthy doesn't arm -- "go dark, stay
+    // dark until I tap". tick_cb may arm later if degradation
+    // happens mid-sleep.
+    s_auto_wake_armed = degraded_state();
+    s_last_ms_probe_ms = s_phase_entered_at_ms;
+
+    ESP_LOGI(TAG, "entering sleep (manual=%d auto_wake_armed=%d)",
+             (int) manual, (int) s_auto_wake_armed);
+
+    // Graceful release of the MS connection. Same pattern as the
+    // legacy 48ea146 commit: unsubscribe everything, send a 1000
+    // NORMAL close, join the worker. Saves CPU + bandwidth (no
+    // broadcasts to a panel that can't show them, no zombie subs
+    // on MS overnight). Lock dropped around the join so the worker's
+    // on_state_change handler can take lvgl_port_lock without
+    // deadlocking us.
     if (s_ms && !s_ms_stopped_for_sleep) {
         lvgl_port_unlock();
         if (s_ms->shutdown_graceful) s_ms->shutdown_graceful();
@@ -395,144 +259,113 @@ static void enter_sleep(void)
     }
 }
 
-static void enter_wake_menu(void)
-{
-    s_phase = APP_POWER_PHASE_WAKE_MENU;
-    s_phase_entered_at_ms = lv_tick_get();
-    if (s_blank_overlay) lv_obj_add_flag(s_blank_overlay, LV_OBJ_FLAG_HIDDEN);
-    build_wake_menu();
-    lv_obj_remove_flag(s_wake_menu, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(s_wake_menu);
-    // Re-enable backlight so the menu is actually visible.
-    uint8_t pct = s_saved_brightness_pct;
-    if (pct < 5) pct = app_prefs_get_brightness_pct();
-    app_display_set_backlight_pct(pct);
-    lv_display_trigger_activity(NULL);
-}
-
 void app_power_force_sleep(void)
 {
-    enter_sleep();
-}
-
-void app_power_set_user_timeout_ms(uint32_t ms)
-{
-    if (ms == 0) ms = DEFAULT_TIMEOUT_MS;
-    s_user_timeout_ms = ms;
-    // Semantically equivalent to a wake-menu pick: the user has chosen
-    // a duration. If we're currently in the boot wake-menu (or post-
-    // sleep wake-menu), commit the choice and transition to AWAKE so
-    // the panel goes live. Tests use this hook to dismiss the boot
-    // menu without faking a tap on a duration button.
-    if (s_phase == APP_POWER_PHASE_WAKE_MENU) {
-        enter_awake();
-    }
+    enter_sleep_internal(true);
 }
 
 // ─────────────────────────────────────────────────────────────────
-// Tick handler — runs on the LVGL task via lv_timer.
+// Tick handler -- runs on the LVGL task via lv_timer.
 // ─────────────────────────────────────────────────────────────────
 
 static void tick_cb(lv_timer_t *t)
 {
     (void) t;
-    uint32_t inactive = lv_display_get_inactive_time(NULL);
-    uint32_t now      = lv_tick_get();
-
-    // Watch degraded transitions. Reset s_awake_started_at_ms on
-    // either edge so the absolute timer gets a fresh window after
-    // a state change. The degraded path uses inactive (last-touch)
-    // not the awake-clock, so this reset is mostly for the going-
-    // healthy edge: a long degraded run (with touches keeping it
-    // alive) shouldn't immediately fire the absolute timeout on
-    // recovery. We don't trigger LVGL activity here -- doing so
-    // would corrupt the SLEEP-phase tap-to-wake detection (which
-    // also reads last_touch_ms via inactive).
-    bool deg = degraded_state();
-    if (deg != s_was_degraded) {
-        s_was_degraded = deg;
-        s_awake_started_at_ms = now;
-        // If we were already in WARNING due to a long idle and the
-        // connection just came back, demote to AWAKE so the user
-        // doesn't see a stale countdown.
-        if (s_phase == APP_POWER_PHASE_WARNING && !deg) {
-            enter_awake();
-            return;
-        }
-    }
-
-    uint32_t timeout    = app_power_get_effective_timeout_ms();
-    uint32_t warn_ms    = pwr_scale(WARN_MS);
-    uint32_t warn_start = (timeout > warn_ms) ? (timeout - warn_ms) : 0;
-    // Healthy: absolute from awake-start (the user-picked duration is a
-    // wall-clock contract). Degraded: relative to last touch -- while
-    // the user is actively interacting with the WiFi/MS config panels
-    // trying to recover the link, the screen must not blank under them.
-    uint32_t elapsed    = deg ? inactive : (now - s_awake_started_at_ms);
-    // last_touch_ms is the absolute lv_tick of the last input event.
-    // On no recent input it grows linearly with `now` (and stays
-    // anchored to the previous touch); on touch it jumps to ~now.
-    // Comparing to s_phase_entered_at_ms tells us "did the user touch
-    // *since* the current phase began?" -- the cancel-on-warn path
-    // uses this to avoid mistaking a pre-warn touch for a warn-dismiss.
+    uint32_t now           = lv_tick_get();
+    uint32_t inactive      = lv_display_get_inactive_time(NULL);
     uint32_t last_touch_ms = (now > inactive) ? (now - inactive) : 0;
+    bool deg               = degraded_state();
+
+    // Mid-sleep degradation arms the auto-wake gate so the eventual
+    // recovery wakes the panel. Covers "user manually slept while
+    // healthy, then situation deteriorated overnight, then came back"
+    // -- which is exactly what the auto-wake-on-MS-reconnect feature
+    // is supposed to cover.
+    if (s_phase == APP_POWER_PHASE_SLEEP && deg && !s_auto_wake_armed) {
+        s_auto_wake_armed = true;
+    }
 
     switch (s_phase) {
         case APP_POWER_PHASE_AWAKE:
-            // Healthy: absolute from awake-start; touches do nothing.
-            // Degraded: relative to last touch (computed above).
-            if (elapsed >= timeout) {
-                enter_sleep();
-            } else if (elapsed >= warn_start) {
-                enter_warn();
+            if (!deg) {
+                // Healthy: pin inactive=0 so the WARN/SLEEP paths
+                // never fire while the rig is functioning.
+                lv_display_trigger_activity(NULL);
+            } else {
+                // Degraded: 1-minute window from last touch. Split
+                // into normal AWAKE + WARN countdown so the user
+                // sees the countdown before the panel goes dark.
+                uint32_t cap        = pwr_scale(DEGRADED_CAP_MS);
+                uint32_t warn_ms    = pwr_scale(WARN_MS);
+                uint32_t warn_start = (cap > warn_ms) ? (cap - warn_ms) : 0;
+                if (inactive >= cap)        enter_sleep_internal(false);
+                else if (inactive >= warn_start) enter_warn();
             }
             break;
 
         case APP_POWER_PHASE_WARNING:
-            // Touch during warning. In healthy mode -> wake menu (the
-            // user picks a fresh absolute duration). In degraded mode
-            // -> just demote to AWAKE: the cap is 60 s either way and
-            // the menu choice (1h/2h/etc.) doesn't apply, the touch is
-            // simply "I'm here, keep the panel lit a bit longer".
+            // Touch dismisses warning -> AWAKE. If health recovers
+            // mid-warning, demote to AWAKE so the user doesn't see
+            // a stale countdown.
+            if (!deg) {
+                enter_awake();
+                break;
+            }
             if (last_touch_ms > s_phase_entered_at_ms) {
-                if (deg) {
-                    enter_awake();
-                    return;
+                enter_awake();
+                break;
+            }
+            {
+                uint32_t cap     = pwr_scale(DEGRADED_CAP_MS);
+                if (inactive >= cap) {
+                    enter_sleep_internal(false);
+                } else if (s_warn_count_label) {
+                    uint32_t remaining = (inactive < cap) ? (cap - inactive) : 0;
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "Sleeping in %us",
+                             (unsigned)((remaining + 999) / 1000));
+                    lv_label_set_text(s_warn_count_label, buf);
                 }
-                enter_wake_menu();
-            } else if (elapsed >= timeout) {
-                enter_sleep();
-            } else if (s_warn_count_label) {
-                uint32_t remaining = (elapsed < timeout) ? (timeout - elapsed) : 0;
-                char buf[32];
-                snprintf(buf, sizeof(buf), "Sleeping in %us",
-                         (unsigned)((remaining + 999) / 1000));
-                lv_label_set_text(s_warn_count_label, buf);
             }
             break;
 
         case APP_POWER_PHASE_SLEEP:
-            // A tap on the blank overlay -> wake menu. last_touch_ms
-            // > s_phase_entered_at_ms tells us the touch happened
-            // after sleep entry (vs being a leftover from the awake
-            // session that put us here).
+            // Touch wakes (any sleep type, armed or not).
             if (last_touch_ms > s_phase_entered_at_ms) {
-                enter_wake_menu();
+                enter_awake();
+                break;
             }
-            break;
-
-        case APP_POWER_PHASE_WAKE_MENU:
-            // Auto-return to sleep if the user doesn't pick a duration
-            // within the wake-menu window, so an accidental wake
-            // doesn't strand the panel running.
-            {
-                uint32_t in_phase = now - s_phase_entered_at_ms;
-                if (in_phase >= pwr_scale(WAKE_MENU_TIMEOUT_MS)) {
-                    enter_sleep();
+            // Auto-wake on degraded -> healthy edge, only when armed.
+            // The s_was_degraded latch is read here so we catch the
+            // transition rather than a steady "deg=false" state
+            // (which would also fire wake on every tick).
+            if (s_auto_wake_armed && s_was_degraded && !deg) {
+                ESP_LOGI(TAG, "auto-wake: MS connection became active");
+                enter_awake();
+                break;
+            }
+            // Auto-wake probe: restart MS periodically when armed so
+            // the iface gets a chance to re-establish. The MS
+            // client's internal reconnect-retry takes over once
+            // started; the resulting CONNECTED + console_attached
+            // transition flips degraded_state, and the edge detector
+            // above wakes us on the next tick.
+            if (s_auto_wake_armed && s_ms_stopped_for_sleep &&
+                (now - s_last_ms_probe_ms) >= pwr_scale(MS_RESTART_PROBE_MS)) {
+                s_last_ms_probe_ms = now;
+                if (app_wifi_get_state() == APP_WIFI_STATE_CONNECTED &&
+                    s_ms && s_ms->start) {
+                    ESP_LOGI(TAG, "sleep probe: restarting MS");
+                    lvgl_port_unlock();
+                    s_ms->start();
+                    lvgl_port_lock(0);
+                    s_ms_stopped_for_sleep = false;
                 }
             }
             break;
     }
+
+    s_was_degraded = deg;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -543,10 +376,10 @@ static void on_wifi_or_ms_change(void *ctx)
 {
     (void) ctx;
     // No-op for now. tick_cb watches degraded transitions on every
-    // 100 ms tick, which is fast enough that the reset arrives well
-    // before any user-visible blank. Keeping the observer registered
-    // (rather than removing the wiring) leaves room for an
-    // event-driven path here later without changing the public API.
+    // 100 ms tick which is fast enough that the wake arrives well
+    // before any user-visible delay. Keeping the observer registered
+    // (rather than removing the wiring) leaves room for an event-
+    // driven path here later without changing the public API.
 }
 
 void app_power_init(const ms_client_iface_t *ms)
@@ -554,51 +387,28 @@ void app_power_init(const ms_client_iface_t *ms)
     s_ms = ms;
     s_was_degraded = degraded_state();
     s_saved_brightness_pct = app_prefs_get_brightness_pct();
-    // Stamp the awake clock at boot so the first warning fires after
-    // (default_timeout - warn_ms) since boot, not since the LVGL tick
-    // started. The user's first interaction with the device is right
-    // after boot, so anchoring to boot is the right "wake" event.
     s_phase_entered_at_ms = lv_tick_get();
-    s_awake_started_at_ms = s_phase_entered_at_ms;
-    // Pin LVGL's inactivity baseline so the degraded-relative path
-    // sees inactive=0 at boot. Otherwise, booting straight into a
-    // degraded state could blank the panel before the user gets a
-    // chance to interact (lv_display_get_inactive_time returns time
-    // since the last activity tick, which without any touches is
-    // however long boot took).
+    // Pin LVGL's inactivity baseline so a degraded-at-boot state
+    // (WiFi still associating) doesn't immediately count toward the
+    // 60 s window. lv_display_get_inactive_time would otherwise
+    // report "uptime since LVGL init" until the first touch.
     lv_display_trigger_activity(NULL);
 
-    // Build overlays up front so the first phase transition doesn't
-    // block on widget creation while LVGL is mid-render. Hidden by
-    // default; phase entries flip the visibility flag.
     build_warn_overlay();
     build_blank_overlay();
-    build_wake_menu();
 
     // Drive the inactivity sweep at TICK_MS. The timer runs on the
     // LVGL task itself (no async hop needed) so phase transitions
     // can mutate widgets directly.
     s_tick_timer = lv_timer_create(tick_cb, TICK_MS, NULL);
 
-    // app_wifi_register_on_change is statically linked from app_wifi.c
-    // (the address is always non-NULL; GCC 12+ flags an `if(addr)` as
-    // an error). The ms-client function pointer is dispatched through
-    // a struct so the NULL guard there is real.
     app_wifi_register_on_change(on_wifi_or_ms_change, NULL);
     if (s_ms && s_ms->register_on_change) {
         s_ms->register_on_change(on_wifi_or_ms_change, NULL);
     }
-    ESP_LOGI(TAG, "init: default_timeout=%ums scale=%u/%u",
-             (unsigned) DEFAULT_TIMEOUT_MS,
+    ESP_LOGI(TAG, "init: connectivity-driven sleep, degraded_cap=%ums scale=%u/%u",
+             (unsigned) DEGRADED_CAP_MS,
              (unsigned) s_scale_num, (unsigned) s_scale_den);
-
-    // Surface the wake menu on every boot so the user explicitly picks
-    // a "stay awake for X" duration up front -- there's no boot-time
-    // persistence (user explicitly opted out), and the silent 1 h
-    // default surprised the pilot tester. The auto-revert in tick_cb
-    // routes back to SLEEP if the user doesn't pick within
-    // WAKE_MENU_TIMEOUT_MS, which means a powered-on-and-left device
-    // doesn't sit lit forever. Test path: app_power_set_user_timeout_ms
-    // commits a duration the same way a button tap would.
-    enter_wake_menu();
+    // Boot lands in AWAKE -- no duration prompt. Healthy state keeps
+    // the panel lit; degraded state starts its 60 s window.
 }

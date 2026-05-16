@@ -394,7 +394,7 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             // can grep for transitions instead of inferring from
             // screenshots.
             const char *names[] = {
-                "AWAKE", "WARNING", "SLEEP", "WAKE_MENU"
+                "AWAKE", "WARNING", "SLEEP"
             };
             app_power_phase_t ph = app_power_get_phase();
             const char *n = (ph >= 0 && (size_t)ph < sizeof(names)/sizeof(names[0]))
@@ -408,8 +408,11 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
             app_power_force_sleep();
             printf("OK power_force_sleep\n");
         } else if (sscanf(cmd, "power_set_user_timeout_ms %d", &x) == 1) {
-            app_power_set_user_timeout_ms((uint32_t) x);
-            printf("OK power_set_user_timeout_ms %d\n", x);
+            // No longer meaningful under the connectivity-driven sleep
+            // model -- accepted as a no-op so legacy test scripts that
+            // used this to dismiss the boot wake-menu still parse.
+            (void) x;
+            printf("OK power_set_user_timeout_ms %d (noop)\n", x);
         } else if (sscanf(cmd, "chan_id %d", &x) == 1) {
             // Print the MS channel id at app_state slot x. Used by
             // drag-to-reorder tests so they can assert the swap
@@ -444,6 +447,24 @@ static int run_script(FILE *script, uint32_t *prev_ticks) {
                                      : APP_WIFI_STATE_CONNECTED;
             mock_app_wifi_set_state(s);
             printf("OK power_degraded %s\n", text);
+        } else if (sscanf(cmd, "power_ms_state %15s", text) == 1) {
+            // Flip the mock MS connection state. "on" -> CONNECTED
+            // (healthy if console + wifi also up); "off" -> any non-
+            // CONNECTED value drives degraded. Drives the auto-wake-
+            // on-MS-reconnect test path.
+            extern void mock_app_ms_set_state(app_ms_state_t);
+            app_ms_state_t s = (strcmp(text, "on") == 0)
+                                   ? APP_MS_STATE_CONNECTED
+                                   : APP_MS_STATE_DISCONNECTED;
+            mock_app_ms_set_state(s);
+            printf("OK power_ms_state %s\n", text);
+        } else if (sscanf(cmd, "power_ms_console %15s", text) == 1) {
+            // Flip the mock console_attached flag. The same hook
+            // app_power_init's degraded_state reads. "off" simulates
+            // a powered-off mixer; "on" simulates it coming back.
+            extern void mock_app_ms_set_console_attached(bool);
+            mock_app_ms_set_console_attached(strcmp(text, "on") == 0);
+            printf("OK power_ms_console %s\n", text);
         } else if (strcmp(cmd, "quit") == 0) {
             // Flush MS before printing the OK marker so test stdout
             // captures the full unsubscribe sequence; the harness
