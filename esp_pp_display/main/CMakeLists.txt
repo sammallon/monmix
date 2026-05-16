@@ -1,0 +1,35 @@
+idf_component_register(
+    SRCS
+        "esp_pp_main.c"
+        "app_config.c"
+        "app_wifi.c"
+        "app_display.c"
+        "app_ui.c"
+        "app_storage.c"
+        "app_coredump.c"
+        "app_console.c"
+        "app_logd.c"
+        "app_prefs.c"
+        "app_time.c"
+        "app_pp_state.c"
+        "app_pp_client_tcp.c"
+    INCLUDE_DIRS
+        "."
+    PRIV_REQUIRES
+        nvs_flash
+        esp_event
+        esp_netif
+        esp_wifi
+        esp_lcd
+        esp_driver_i2c
+        esp_driver_ledc
+        esp_driver_sdmmc
+        sdmmc
+        fatfs
+        esp_partition
+        espcoredump
+        console
+        mbedtls
+        esp_timer
+        esp_rom
+)

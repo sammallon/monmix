@@ -1,0 +1,32 @@
+dependencies:
+  idf:
+    version: ">=6.0.1"
+
+  # LVGL + Espressif port. Pinned to 9.4.x: 9.5.0 introduced a hard
+  # LVGL-task deadlock on closing settings overlay and immediately
+  # touching a fader (verified in esp_ui 2026-05-05). Revisit when 9.6
+  # ships or a 9.5 patch addresses it.
+  lvgl/lvgl:
+    version: "~9.4.0"
+  espressif/esp_lvgl_port:
+    version: "^2.0.0"
+
+  # MIPI-DSI panel driver. CrowPanel Advanced 10.1" (Elecrow SKU
+  # DHE04310D) uses the EK79007 controller.
+  espressif/esp_lcd_ek79007:
+    version: "^2.0.0"
+
+  # Capacitive touch controller (GT911) over I2C.
+  espressif/esp_lcd_touch_gt911:
+    version: "*"
+
+  # Wi-Fi via the on-board ESP32-C6 co-processor.
+  espressif/esp_wifi_remote:
+    version: "*"
+  espressif/esp_hosted:
+    version: "*"
+
+  # cJSON moved out of esp-idf core in v6.0; pull it from the registry.
+  # Used in Phase B for parsing ProPresenter newline-JSON envelopes.
+  espressif/cjson:
+    version: "*"

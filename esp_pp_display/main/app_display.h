@@ -1,0 +1,32 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "app_prefs.h"
+
+// Brings up MIPI-DSI panel + GT911 touch + LVGL via esp_lvgl_port.
+bool app_display_init(void);
+
+// Re-apply the LVGL theme to the default display. Safe to call from any task
+// — internally takes lvgl_port_lock. Used by the prefs-change subscriber to
+// flip light/dark at runtime.
+void app_display_apply_theme(app_theme_t theme);
+
+// Apply rotation to the default display. Touch coords are remapped by LVGL
+// itself based on disp->rotation -- see lv_indev.c indev_pointer_proc -- so
+// the GT911 driver bridge needs no separate transform. Safe to call from
+// any task.
+void app_display_apply_rotation(app_display_rotation_t rot);
+
+// Drive the backlight LEDC PWM duty to the given percentage. Clamped to
+// 5..100 -- a fully-dark mis-tap leaves no non-touch recovery path.
+void app_display_set_backlight_pct(uint8_t pct);
+
+// Drive the backlight all the way off (LEDC duty 0). Bypasses the 5%
+// floor that protects against mis-tap-blank from the user-facing
+// surfaces (settings slider, set-bright REPL); the M7 sleep path is
+// the only deliberate caller and pairs the off-state with a touch-
+// capturing overlay that wakes the device. Pair every call with a
+// matching app_display_set_backlight_pct(...) on wake to restore.
+void app_display_set_backlight_off(void);

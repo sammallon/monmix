@@ -1,0 +1,148 @@
+# Target: ESP32-P4 (host), ESP32-C6 (Wi-Fi co-processor on the CrowPanel board).
+CONFIG_IDF_TARGET="esp32p4"
+
+# CrowPanel Advanced 10.1" ships with early-revision ESP32-P4 silicon (v1.3
+# observed). IDF v6.0.1 default min-rev is v3.01; the <v3.0 silicon family is
+# binary-incompatible with v3.x, so we have to opt into the pre-v3 path
+# (SELECTS_REV_LESS_V3) which then unlocks REV_MIN_100 (= v1.0).
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# 16 MB flash on the CrowPanel Advanced 10.1".
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# 32 MB external PSRAM, octal HSPI mode at 200 MHz (CrowPanel layout).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Allow large BSS-resident arrays to live in PSRAM via EXT_RAM_BSS_ATTR.
+# Without this, every static array competes for the ~440 KB internal SRAM
+# pool that also has to hold the FreeRTOS task stacks. Used by
+# s_mix_names (app_ms_client_ws.c) and a planned migration of the
+# per-channel widget/state arrays (#42).
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+# Custom partition table (4 MB app + 8 MB FAT for fonts/assets/NVS overflow).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# FreeRTOS at 1 kHz for snappier UI tick & touch event delivery.
+CONFIG_FREERTOS_HZ=1000
+
+# Wi-Fi via the on-board ESP32-C6 (esp_hosted SDIO transport).
+CONFIG_ESP_WIFI_REMOTE_ENABLED=y
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_HOST=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+
+# CrowPanel-specific: the ESP-Hosted Kconfig defaults the C6 reset GPIO to
+# 54 for the ESP32-P4 (matches Espressif's own dev board), but on the
+# CrowPanel Advanced 10.1" GPIO 54 is wired to the UART2 RX expansion pin.
+# The actual C6 EN line on this board is GPIO 32 (verified against the
+# schematic — net `C6_EN` connects U7.GPIO32 to IC1.EN through R77 pull-up
+# to C6_VDD_3V3 + C15 decoupling cap). With the wrong pin, ESP-Hosted's
+# in-driver reset path is a no-op and the C6 can only be recovered by USB
+# power-cycling the whole module.
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=32
+
+# ESP-Hosted's SDIO mempool needs DMA-capable INTERNAL RAM (PSRAM is
+# excluded from MALLOC_CAP_INTERNAL). At default queue sizes (20/20) the
+# 47 KiB pool itself fails to allocate. With queues=8 it allocates but
+# leaves so little contiguous DMA heap that the SDIO double-buffer's
+# separate 2 KiB aligned malloc later asserts. Disabling mempool entirely
+# trips the task watchdog (ESP-Hosted runs at prio 23 and starves main
+# with malloc/free per packet). Sweet spot: small mempool (4/4 → ~23 KiB)
+# AND keep mempool enabled so packet RX doesn't churn the heap.
+CONFIG_ESP_HOSTED_USE_MEMPOOL=y
+CONFIG_ESP_HOSTED_SDIO_TX_Q_SIZE=8
+CONFIG_ESP_HOSTED_SDIO_RX_Q_SIZE=8
+
+# Larger LWIP buffers — WS frames + JSON payloads need elbow room.
+CONFIG_LWIP_TCP_RCV_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
+
+# Per-UDP-socket recv mbox depth. Default 6 was the bottleneck behind
+# the OSC raw-PCB filter (mongoose's poll-based recv couldn't drain a
+# 12-burst before the mbox overflowed). 16 keeps headroom for any
+# socket-backed UDP path that still uses BSD recv (DNS replies, SNTP)
+# arriving during inbound bursts. Per-slot cost = pbuf pointer +
+# held-payload until drain, ~50-100 bytes; total ~1 KB more in the
+# worst case where every UDP socket sits full simultaneously.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+
+# Main task stack — UI init pulls in LVGL, sometimes deep.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# LVGL settings (consumed by the espressif/esp_lvgl_port managed component).
+CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_DRAW_BUF_ALIGN_64=y
+CONFIG_LV_USE_PERF_MONITOR=n
+CONFIG_LV_USE_MEM_MONITOR=n
+# Route lv_malloc/free through standard C malloc — which on this build
+# routes through the IDF heap (internal RAM first, PSRAM fallback). The
+# default LV_USE_BUILTIN_MALLOC backs LVGL with a fixed 64 KB pool that
+# fragments under widget create/destroy churn over a long session — a
+# 990-byte mask-buf alloc returned NULL inside lv_draw_sw_fill and
+# crashed the draw path with a NULL memset. The earlier
+# `CONFIG_LV_MEM_CUSTOM=y` line was an LVGL 8 option that LVGL 9
+# silently ignored.
+# CONFIG_LV_USE_BUILTIN_MALLOC is not set
+CONFIG_LV_USE_CLIB_MALLOC=y
+# CONFIG_LV_USE_BUILTIN_STRING is not set
+CONFIG_LV_USE_CLIB_STRING=y
+# CONFIG_LV_USE_BUILTIN_SPRINTF is not set
+CONFIG_LV_USE_CLIB_SPRINTF=y
+
+# Snapshot / screenshot support — backs the `screenshot` console command in
+# app_console.c. Costs a few KB of code; allocs a per-call PSRAM buffer
+# (~1.2 MB at 1024×600 RGB565) which is freed after the b64 stream.
+CONFIG_LV_USE_SNAPSHOT=y
+
+# Montserrat 48 backs the large icon glyph on the console-offline screen
+# (LV_SYMBOL_POWER over LV_SYMBOL_AUDIO). ~25 KB of flash for a font that
+# carries the symbol range; without it the offline page reads as 14 pt and
+# doesn't communicate at a glance from a few feet away.
+CONFIG_LV_FONT_MONTSERRAT_48=y
+
+# Bump console UART to 921600 — at 115200 a full-screen screenshot takes
+# ~140 s to base64-stream off-device, which kills the dev-loop. 921600 is
+# rock-solid on the CH340K bridge and brings it to ~18 s (or ~2 s with
+# zlib compression). Affects log output + console REPL only; flashing
+# baud (460800) is independent and unchanged. Host-side scripts
+# (repro_*.py, tools/fetch_b64.py, tools/fetch_screenshot.py) match.
+#
+# Disabling UART_DEFAULT and enabling UART_CUSTOM is required because the
+# DEFAULT path hardcodes baud=115200 (Kconfig prompt is gated behind the
+# CUSTOM choice).
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+
+# Compiler: optimize for performance. UI + WS hot path benefits.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Panic coredump → `coredump` partition (ELF, SHA256-checksummed). On the
+# next boot, app_coredump_flush_to_sd() copies it to the microSD card and
+# erases the partition. Decode host-side with `espcoredump.py info_corefile`.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
+# WDT panic — when a task starves IDLE0/1 past CONFIG_ESP_TASK_WDT_TIMEOUT_S,
+# trigger a panic + coredump + reboot instead of silently looping the WDT
+# print every N seconds. The coredump pipeline above picks up the wedged
+# stack for postmortem; the auto-reboot recovers the device without
+# requiring a power cycle (which the current pre-WDT-panic builds did).
+CONFIG_ESP_TASK_WDT_PANIC=y
+
+# Pull NTP server hint from DHCP option 42 when the network offers one.
+# app_ui's clock prefers the DHCP-supplied server and falls back to the
+# static pool entries when the lease has none (see start_clock_once).
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
+# Two SNTP slots: slot 0 is reserved for the DHCP-supplied server, slot 1
+# is the static fallback. Bumped from default 1 so both can coexist.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2

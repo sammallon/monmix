@@ -1,0 +1,67 @@
+# ESP-IDF build output
+build/
+
+# Managed components (resolved by idf.py reconfigure from idf_component.yml)
+managed_components/
+
+# Generated sdkconfig (sdkconfig.defaults is the committed source of truth)
+sdkconfig
+sdkconfig.old
+
+# Per-session dev artifacts — screenshots fetched via
+# tools/fetch_screenshot.py and tools/run_steps.py land in tmp/screenshots/,
+# log captures (build_log.txt, flash_log.txt, serial_log.txt,
+# serial_capture.txt, console_capture.txt, mcp_tee.log), coredumps pulled
+# off-device, and runtime monmix-NNNN.log files fetched via
+# tools/fetch_b64.py land in tmp/logs/.
+tmp/
+# Belt-and-braces: also ignore these patterns anywhere in the tree, in
+# case a tool or a stale invocation drops them outside tmp/.
+mcp_tee.log
+*_log.txt
+*_capture.txt
+coredump-*.elf
+monmix-*.log
+# Any PNG at the repo root is a generated screenshot artifact.
+# Subdirectories (docs/, etc.) can still hold committed images.
+/*.png
+prefs.json
+
+# Local forensic records of on-device incidents — kept for personal
+# reference but never pushed (may include local IPs / network details).
+forensics/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local Claude Code session data
+.claude/
+
+# Credentials — NEVER commit. Real values live in main/secrets.h
+# (a copy of main/secrets.h.template, gitignored below).
+main/secrets.h
+secrets.h
+*.env
+.env.local
+
+# Personal dev tooling — environment-specific (hardcoded local paths,
+# Microsoft-laptop conventions, etc.). Kept out of the public repo.
+.mcp.json
+eim_config.toml
+mcp_tee.py
+mcpstart.ps1
+repro_*.py
+sdkconfig.ci
+sitehook/
+verify_hook.py
+
+# Python bytecode (sitehook etc.)
+__pycache__/
+*.pyc

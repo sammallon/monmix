@@ -1,0 +1,96 @@
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef enum {
+    APP_WIFI_STATE_BOOT = 0,    // before init
+    APP_WIFI_STATE_CONNECTING,  // STA started, no IP yet
+    APP_WIFI_STATE_CONNECTED,   // got IP
+    APP_WIFI_STATE_FAILED,      // exhausted retries
+} app_wifi_state_t;
+
+typedef void (*app_wifi_on_change_t)(void *ctx);
+
+// Phase 1: bring up the radio transport (ESP-Hosted to the on-board C6 over
+// SDIO) so the SDMMC host controller is initialised. Returns immediately
+// after esp_wifi_start(); does NOT wait for an SSID. Required before
+// app_storage_init() because IDF v6's SDMMC host can only be init'd once
+// and ESP-Hosted is the canonical owner.
+void app_wifi_init_radio(void);
+
+// Phase 2: block until the STA either acquires an IP or exhausts retries.
+// Returns true on connect, false on permanent failure.
+bool app_wifi_wait_connected(void);
+
+// Apply the persisted DHCP/static-IP choice from app_prefs to the default
+// STA netif. Safe to call before or after esp_wifi_start. When static is on
+// and any of ip/netmask/gateway are empty or invalid the call falls back to
+// DHCP (so a half-filled form can't strand the device). DNS is best-effort.
+void app_wifi_apply_ip_config(void);
+
+// Live reconfigure: pick up the latest SSID/password/static-IP prefs and
+// trigger a clean disconnect+reconnect WITHOUT a reboot. Per memory
+// reference_c6_wedge_workaround the disconnect+connect path is the
+// known-working sequence to land a new wifi_config on a running C6.
+// Returns true if the dispatch succeeded; the caller still needs to watch
+// app_wifi_get_state() to see whether association lands.
+bool app_wifi_reconfigure(void);
+
+// Live status — safe to call from any task. The IP buffer must hold at
+// least 16 bytes ("xxx.xxx.xxx.xxx\0"); written even when state is not
+// CONNECTED (in which case it's set to "0.0.0.0").
+app_wifi_state_t app_wifi_get_state(void);
+const char      *app_wifi_get_ssid(void);
+void             app_wifi_format_ip(char *buf, size_t buflen);
+
+// Human-readable security mode of the current association (e.g. "Open",
+// "WPA2-PSK", "WPA2/WPA3-PSK"). Returns "—" when not connected. Polls
+// esp_wifi_sta_get_ap_info on demand; cheap.
+const char      *app_wifi_get_security_str(void);
+
+// Subscribe to state changes (transitions between the enum values above).
+// Each callback fires from the WiFi/IP event task — keep it short, defer
+// LVGL work via lv_async_call.
+void app_wifi_register_on_change(app_wifi_on_change_t cb, void *ctx);
+
+// SSID scan support for the Network settings UI. The scan runs through the
+// C6 (ESP-Hosted) and briefly disrupts the active connection; the watchdog
+// + auto-reconnect path puts it back together within seconds.
+//
+// Result format: each entry is a NUL-terminated SSID. Hidden APs (empty
+// SSID) are skipped from the result list since the user picks them by
+// typing the SSID anyway. The list pointer remains valid until the next
+// scan_start.
+typedef void (*app_wifi_scan_done_t)(void *ctx);
+
+#define APP_WIFI_SCAN_MAX_RESULTS 24
+
+typedef enum {
+    APP_WIFI_SCAN_STARTED,         // fresh scan kicked off; cb fires on done
+    APP_WIFI_SCAN_ALREADY_RUNNING, // scan was already in-flight; cb still bound
+    APP_WIFI_SCAN_FAILED,          // could not start and none in progress
+} app_wifi_scan_result_t;
+
+// Trigger an asynchronous scan. The done_cb fires from the WiFi event task
+// when results are ready; call app_wifi_scan_results to read them.
+// If a scan is already running the new cb replaces the old and the result
+// is APP_WIFI_SCAN_ALREADY_RUNNING -- callers should treat that the same as
+// STARTED and just wait for the cb.
+app_wifi_scan_result_t app_wifi_scan_start(app_wifi_scan_done_t done_cb, void *ctx);
+
+// Read the latest scan results. Returns the number of SSIDs filled in;
+// caller passes a `dst` of at least max_count strings each at least
+// 33 bytes. Safe to call from any task. Returns 0 if no scan completed.
+size_t app_wifi_scan_results(char (*dst)[33], size_t max_count);
+
+// Force a clean STA reassociate: disconnect, reconnect, block until got-IP
+// or timeout. Used by the WS watchdog when ESP-Hosted's per-association
+// state on the C6 needs to be cleared without rebooting. Marks the
+// disconnect as intentional so it does NOT count toward MAX_RETRIES and
+// the event handler skips the retry-backoff path.
+//
+// Safe to call from any task except the wifi event task itself. Returns
+// true if a fresh IP arrived within timeout_ms.
+bool app_wifi_force_reassociate(uint32_t timeout_ms);
